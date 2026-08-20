@@ -40,6 +40,7 @@ from . import blending, config, ik
 from .connection import ArmConnection, ArmError
 from .kinematics import (
     check_joint_limits,
+    check_workspace_bounds,
     forward_kinematics,
     manipulability,
     pose_coords,
@@ -276,7 +277,7 @@ class Arm:
             return FAILURE
 
         if self.get_single_joint() == 1:
-            execution = self._execute_single_joint(plan)
+            execution = self._execute_single_joint(plan, speed=speed)
         else:
             execution = self._execute(plan)
 
@@ -585,6 +586,8 @@ class Arm:
 
             # --- durations: explicit, or derived from distance/speed per segment
             if durations is not None:
+                if isinstance(durations, (int, float)):
+                    durations = [durations] * n_waypoints
                 durations = np.asarray(durations, dtype=float)
                 if len(durations) != n_waypoints:
                     plan.error = "need exactly one duration per waypoint"
@@ -795,7 +798,7 @@ class Arm:
         return ex
 
     
-    def _execute_single_joint(self, plan: Plan) -> Execution:
+    def _execute_single_joint(self, plan: Plan, speed: float | None = None) -> Execution:
         """
         Execute a path by moving exactly one joint at a time.
 
@@ -847,10 +850,29 @@ class Arm:
                     if abs(target_angle - current_angle) <= config.SINGLE_JOINT_TOL_DEG:
                         continue
 
-                    # Use the configured hardware ceiling for this joint.
-                    joint_speed = 20 #float(config.MAX_JOINT_SPEED_DPS[joint_idx])
+
+                    if speed is not None:
+                        joint_speed = float(speed)
+                    elif plan.segment_durations is not None:
+                        seg_duration = float(plan.segment_durations[waypoint_idx - 1]) / n_moving
+                        joint_speed = abs(target_angle - current_angle) / max(seg_duration, 1e-6)
+                    else:
+                        joint_speed = float(config.MAX_JOINT_SPEED_DPS[joint_idx])
+
+                    joint_speed = min(joint_speed, config.MAX_JOINT_SPEED_DPS[joint_idx])
+                    
+                    #Use the configured hardware ceiling for this joint.
+                    #joint_speed = 20 #float(config.MAX_JOINT_SPEED_DPS[joint_idx])
 
                     print("2", end='')
+
+                    candidate = current.copy()
+                    candidate[joint_idx] = target_angle
+                    tip_mm = forward_kinematics(candidate)[:3, 3]
+                    bounds_error = check_workspace_bounds(tip_mm)
+                    if bounds_error is not None:
+                        ex.error = f"J{joint_id} refused -- {bounds_error}"
+                        return ex
 
                     self.conn.send_angle(
                         joint_id,

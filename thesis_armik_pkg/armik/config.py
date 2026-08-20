@@ -78,6 +78,29 @@ SINGLE_JOINT_POLL_HZ = 25.0
 # Max seconds to wait for a single joint to reach its target before giving up.
 SINGLE_JOINT_TIMEOUT_S = 5.0
 
+
+# ---------------------------------------------------------------------------
+# Single-joint workspace safety
+# ---------------------------------------------------------------------------
+
+# Full 3D distance from the base origin the tip may reach, in mm. ~280 mm
+# matches the myCobot 280's published working radius -- verify against your
+# actual arm, same as everything else in this file.
+MAX_REACH_MM = 280.0
+
+# z of the base mounting plate, in mm, in the SAME frame get_coords() uses.
+# At or above this height, only the reach sphere is checked.
+BASE_Z_MM = 0.0
+
+# z of the physical table/ground, in mm, in the SAME frame get_coords() uses.
+# Only enforced when the tip is at or below it.
+GROUND_Z_MM = -60.0
+
+# Minimum horizontal distance (sqrt(x^2+y^2)) the tip must keep from the
+# vertical axis through the base whenever it's at or below GROUND_Z_MM.
+MIN_BASE_DIST_MM = 60.0
+
+
 # ---------------------------------------------------------------------------
 # Joint limits
 # ---------------------------------------------------------------------------

@@ -185,3 +185,34 @@ def check_joint_limits(q_deg) -> list[str]:
         if not lo <= a <= hi:
             out.append(f"J{i+1}={a:.2f} outside [{lo:.1f}, {hi:.1f}]")
     return out
+
+
+# --------------------------------
+# Single-joint aux
+# --------------------------------
+
+def check_workspace_bounds(xyz_mm) -> str | None:
+    """
+    Return a reason string if tip position [x, y, z] (mm) is outside the
+    safety envelope, else None.
+
+    z >= BASE_Z_MM (at/above the base plate): only the overall reach sphere
+        applies.
+    GROUND_Z_MM < z < BASE_Z_MM (between the floor and the base plate): must
+        clear the base column horizontally.
+    z <= GROUND_Z_MM (at/below the floor): unrestricted.
+    """
+    x, y, z = xyz_mm
+    if z >= config.BASE_Z_MM:
+        reach = float(np.linalg.norm(xyz_mm))
+        if reach > config.MAX_REACH_MM:
+            return f"tip would be {reach:.1f} mm from the base (max {config.MAX_REACH_MM:.1f} mm)"
+        return None
+    if z <= config.GROUND_Z_MM:
+        return None
+    base_dist = float(np.hypot(x, y))
+    if base_dist <= config.MIN_BASE_DIST_MM:
+        return (f"tip would be {base_dist:.1f} mm from the base axis while between "
+                f"ground (z={config.GROUND_Z_MM:.1f}) and base (z={config.BASE_Z_MM:.1f}) "
+                f"height (min {config.MIN_BASE_DIST_MM:.1f} mm)")
+    return None

@@ -194,7 +194,12 @@ class Arm:
             log.info("send_coords refused: %s", plan.error)
             return FAILURE
 
-        execution = self._execute(plan)
+        #execution = self._execute(plan)
+        if self.get_single_joint() == 1:
+            execution = self._execute_single_joint(plan, speed=speed)
+        else:
+            execution = self._execute(plan)
+        
         self.last_execution = execution
         if not execution.ok:
             self.last_error = execution.error
@@ -481,6 +486,9 @@ class Arm:
                 drift[name] = round(float(_mm_to_cm(d) if i < 3 else wrap180(d)), 3)
             plan.free_drift = drift
 
+            plan.segment_q = np.array([q0, q_wps[-1]])
+            plan.segment_durations = np.array([duration])
+            
             plan.q_waypoints = q_wps
             plan.ok = True
             return plan
@@ -815,7 +823,7 @@ class Arm:
         The first waypoint in plan.q_waypoints is the current configuration.
         """
 
-        print("A: Intro execute_single_joint")
+        #print("A: Intro execute_single_joint")
 
         ex = Execution()
         q_waypoints = plan.segment_q
@@ -829,27 +837,31 @@ class Arm:
 
             current = np.array(self.conn.get_angles(), dtype=float)
 
-            print("B: before for-loops")
+            #print("B: before for-loops")
 
             for waypoint_idx in range(1, len(q_waypoints)):
                 
-                print("Iteration #", waypoint_idx)
+                #print("Iteration #", waypoint_idx)
 
                 target = np.asarray(q_waypoints[waypoint_idx], dtype=float)
 
-                print("0", end='')
+                #print("0", end='')
+
+                n_moving = sum(
+                    1 for j in range(config.DOF)
+                    if abs(float(target[j]) - float(current[j])) > config.SINGLE_JOINT_TOL_DEG
+                )
 
                 for joint_idx in range(config.DOF):
                     joint_id = joint_idx + 1
                     target_angle = float(target[joint_idx])
                     current_angle = float(current[joint_idx])
                     
-                    print("1", end='')
+                    #print("1", end='')
 
                     # Nothing to do if this joint is already at the target.
                     if abs(target_angle - current_angle) <= config.SINGLE_JOINT_TOL_DEG:
                         continue
-
 
                     if speed is not None:
                         joint_speed = float(speed)
@@ -864,7 +876,7 @@ class Arm:
                     #Use the configured hardware ceiling for this joint.
                     #joint_speed = 20 #float(config.MAX_JOINT_SPEED_DPS[joint_idx])
 
-                    print("2", end='')
+                    #print("2", end='')
 
                     candidate = current.copy()
                     candidate[joint_idx] = target_angle
@@ -880,7 +892,7 @@ class Arm:
                         joint_speed,
                     )
 
-                    print("3", end='')
+                    #print("3", end='')
 
                     # Wait until the servo actually reaches the target.
                     self._wait_for_joint(
@@ -888,7 +900,7 @@ class Arm:
                         target_angle,
                     )
 
-                    print("4")
+                    #print("4")
 
                     # Record the commanded configuration.
                     current[joint_idx] = target_angle
@@ -896,10 +908,14 @@ class Arm:
                     ex.t_cmd.append(time.perf_counter() - t0)
                     ex.q_cmd.append(current.tolist())
 
-                    print("C: before SINGLE_JOINT_DELAY")
+                    #print("C: before SINGLE_JOINT_DELAY")
 
                     # Delay BEFORE starting the next joint.
                     time.sleep(config.SINGLE_JOINT_DELAY)
+                    
+                if waypoint_idx < len(q_waypoints) - 1:
+                    time.sleep(config.SINGLE_JOINT_DELAY_BETWEEN_POINTS)
+                    
 
             ex.duration_s = time.perf_counter() - t0
             ex.setpoints = len(ex.q_cmd)

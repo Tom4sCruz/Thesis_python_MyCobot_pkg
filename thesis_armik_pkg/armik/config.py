@@ -78,6 +78,12 @@ SINGLE_JOINT_POLL_HZ = 25.0
 # Max seconds to wait for a single joint to reach its target before giving up.
 SINGLE_JOINT_TIMEOUT_S = 5.0
 
+# Delay AFTER the arm fully reaches one waypoint (every joint needed for it
+# has arrived) and BEFORE starting toward the next waypoint, in single-joint
+# mode. Separate from SINGLE_JOINT_DELAY, which is the pause between
+# individual JOINTS while still reaching a single point -- this is the pause
+# between POINTS themselves once one is fully reached.
+SINGLE_JOINT_DELAY_BETWEEN_POINTS = 2  # seconds
 
 # ---------------------------------------------------------------------------
 # Single-joint workspace safety
@@ -86,7 +92,7 @@ SINGLE_JOINT_TIMEOUT_S = 5.0
 # Full 3D distance from the base origin the tip may reach, in mm. ~280 mm
 # matches the myCobot 280's published working radius -- verify against your
 # actual arm, same as everything else in this file.
-MAX_REACH_MM = 280.0
+MAX_REACH_MM = 400 #280.0
 
 # z of the base mounting plate, in mm, in the SAME frame get_coords() uses.
 # At or above this height, only the reach sphere is checked.
@@ -118,7 +124,7 @@ JOINT_LIMIT_MARGIN_DEG = 3.0
 
 # Conservative per-joint ceiling, deg/s. Measure these rather than trusting them.
 #MAX_JOINT_SPEED_DPS = [110.0, 110.0, 110.0, 130.0, 130.0, 150.0]
-MAX_JOINT_SPEED_DPS = [160.0] * 6
+MAX_JOINT_SPEED_DPS = [240.0, 240.0, 240.0, 300.0, 300.0, 350.0]
 
 # ---------------------------------------------------------------------------
 # pymycobot interface

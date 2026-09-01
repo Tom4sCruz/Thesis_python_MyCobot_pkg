@@ -40,7 +40,7 @@ PRESETS = [
     ("mild-tremor",     2.0, 0.0,  0.0),
     ("strong-tremor",   5.0, 0.0,  0.0),
     ("twitchy",         0.0, 2.0, 12.0),
-    ("tremor+twitch",   4.0, 1.5,  8.0),
+    ("tremor+twitch",   6.0, 2.5,  12.0),
 ]
 
 

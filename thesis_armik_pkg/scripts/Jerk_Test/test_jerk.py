@@ -28,7 +28,7 @@ import numpy as np
 from armik import Arm, config
 
 arm = Arm("/dev/ttyTHS1", 1000000)
-HOME = [0, 0, -90, 0, 0, 0]
+HOME = [0, 0, -90, 0, 0, -45]
 
 LINEAR = [(-20, 5), (-8, 15), (8, 12), (20, 5)]
 
@@ -46,7 +46,7 @@ PRESETS = [
 
 def get_CURVED(min_y=STARTING_Y, max_y=-STARTING_Y):
     def z(y):
-        return round(8 * np.sin(np.pi / 20 * y + np.pi) + 8, 2)
+        return round(5 * np.sin(np.pi / 20 * y + np.pi) + 5, 2)
 
     y = min_y
     res = []

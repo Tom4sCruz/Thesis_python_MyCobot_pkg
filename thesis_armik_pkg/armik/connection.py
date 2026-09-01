@@ -167,7 +167,14 @@ class ArmConnection:
 
 
     def get_angles(self, retries: int = 4) -> list[float]:
-        """Joint angles in degrees. Retries past the firmware's empty replies."""
+        """Joint angles in degrees. Retries past the firmware's empty replies.
+
+        The firmware sometimes answers a read with a bare status int (e.g. -1)
+        instead of a list -- often when the serial reply for a previous command
+        (a gripper move, say) has not been fully drained. That is not sized, so
+        it must be rejected before len(), or it raises TypeError instead of
+        being retried.
+        """
         with self._lock:
             for attempt in range(retries):
                 try:
@@ -175,9 +182,11 @@ class ArmConnection:
                 except Exception as exc:
                     log.debug("get_angles raised (attempt %d): %s", attempt, exc)
                     angles = None
-                if (angles and len(angles) == config.DOF
+                if (isinstance(angles, (list, tuple))
+                        and len(angles) == config.DOF
                         and all(a is not None for a in angles)):
                     return [float(a) for a in angles]
+                log.debug("get_angles bad reply (attempt %d): %r", attempt, angles)
                 time.sleep(0.05)
         raise ArmError(f"could not read joint angles after {retries} attempts")
 
@@ -192,7 +201,7 @@ class ArmConnection:
                     c = self._mc.get_coords()
                 except Exception:
                     c = None
-                if c and len(c) == 6:
+                if isinstance(c, (list, tuple)) and len(c) == 6:
                     return [float(v) for v in c]
                 time.sleep(0.05)
         raise ArmError("could not read coords from firmware")

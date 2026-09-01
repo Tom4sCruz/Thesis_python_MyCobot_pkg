@@ -77,14 +77,14 @@ EULER_CONVENTION = "xyz_fixed"
 # TOOL_RPY_DEG : orientation of the tool (gripper) frame vs the flange, same
 #   Euler convention as everything else (EULER_CONVENTION => R = Rz@Ry@Rx).
 #   The gripper here is bolted on rolled about the flange axis, so this is a
-#   pure z roll: (0, 0, -135). rpy_to_matrix(0, 0, -135) = Rz(-135), which does
+#   pure z roll: (0, 0, -45). rpy_to_matrix(0, 0, -45) = Rz(-45), which does
 #   NOT move the tool z axis, so TOOL_OFFSET_MM stays a straight-out offset.
 #   Nonzero here means get_coords()/send_coords() rx/ry/rz describe the GRIPPER
 #   frame (a level gripper reads rz ~= 0) and IK works in gripper-frame Euler.
 #
 # ALL ZERO == bare flange == byte-identical to before this constant existed.
 #
-# 90 mm and -135 deg are STARTING VALUES. Measure the real flange-face-to-tip
+# 90 mm and -45 deg are STARTING VALUES. Measure the real flange-face-to-tip
 # distance; confirm the roll sign/size on hardware (a level gripper should read
 # rz ~= 0 -- if not, try +135 / -45 / +45). DH-table validation is unaffected:
 # scripts/verify_fk.py deliberately compares the FLANGE against firmware FK.
@@ -93,7 +93,7 @@ EULER_CONVENTION = "xyz_fixed"
 # set_tool_reference()/set_end_type() -- this package bypasses firmware
 # kinematics on purpose and doing both would double-count the offset.
 TOOL_OFFSET_MM = (0.0, 0.0, 90.0)
-TOOL_RPY_DEG = (0.0, 0.0, -135.0)
+TOOL_RPY_DEG = (0, 0, 0) #(0.0, 0.0, -45.0)
 
 
 # ---------------------------------------------------------------------------

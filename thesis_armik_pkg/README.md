@@ -74,9 +74,15 @@ with Arm(port="/dev/ttyTHS1") as arm:
 
     if arm.send_coords(x=25) == 0:
         print(arm.last_error)                      # why it refused
+
+    arm.send_gripper(config.MAX_GRIPPER_DEG)       # open (0 = closed); 1/0
 ```
 
 Every coordinate is optional. Pass what you want held; omit the rest.
+
+`arm.send_gripper(deg)` wraps pymycobot's `set_gripper_value`: `deg` is an
+opening angle in `[0, config.MAX_GRIPPER_DEG]` (0 = closed), mapped linearly onto
+the firmware's 0–100. Returns `1`/`0` like `send_coords`.
 
 ### Partial constraints and minimal drift
 
@@ -110,8 +116,8 @@ else:
 
 | quantity | unit |
 |---|---|
-| `send_coords` / `get_coords` position | **centimetres** |
-| orientation (`rx`, `ry`, `rz`) | degrees |
+| `send_coords` / `get_coords` position | **centimetres**, at the tool tip |
+| orientation (`rx`, `ry`, `rz`) | degrees, in the **tool** frame (see `TOOL_RPY_DEG`) |
 | `speed` in `send_coords` | **cm/s** of tip travel |
 | joint angles | degrees |
 | everything inside the package | mm and degrees |
@@ -150,5 +156,10 @@ measured from the joint-1 axis instead of the table, set
 - **`DEG_PER_S_AT_SPEED_100` is a guess** until you measure it. It only affects
   the firmware speed field, not path geometry, but it makes reported velocities
   fictional until calibrated.
-- **Bare flange assumed.** Mount a gripper and every Cartesian target is off by
-  the tool length until you add the offset to the DH table.
+- **Tool tip is configurable.** `config.TOOL_OFFSET_MM` / `TOOL_RPY_DEG` define a
+  rigid flange→tip transform; every Cartesian number — position *and*
+  orientation — is then measured to that tip. With the shipped values `rx/ry/rz`
+  describe the **gripper** frame (rolled −135° from the flange, so a level
+  gripper reads `rz ≈ 0`). Both zero means the bare flange. Measure the real
+  offset and re-run `scripts/verify_fk.py` — it still validates the DH table
+  against the *flange*, so it is unaffected by the tool config.

@@ -370,6 +370,30 @@ class Arm:
             self.last_error = f"{type(exc).__name__}: {exc}"
             return FAILURE
 
+    def send_gripper(self, deg: float, speed: int = config.GRIPPER_DEFAULT_SPEED) -> int:
+        """
+        Open the gripper to `deg` degrees: 0 = closed, config.MAX_GRIPPER_DEG =
+        fully open. `deg` is mapped linearly onto pymycobot's 0-100 gripper
+        value -- there is no angular gripper command in the serial protocol.
+
+        Returns 1 on success, 0 on failure (reason in self.last_error).
+        Fire-and-forget: returns as soon as the command is sent, it does not
+        wait for the gripper to finish moving.
+        """
+        self.last_error = None
+        try:
+            d = float(deg)
+            if not 0.0 <= d <= config.MAX_GRIPPER_DEG:
+                raise ValueError(f"deg must be 0-{config.MAX_GRIPPER_DEG:g}, got {d:g}")
+            value = int(round(d / config.MAX_GRIPPER_DEG * 100.0))
+            value = max(0, min(100, value))
+            self.conn.set_gripper_value(value, speed)
+            return SUCCESS
+        except (ArmError, ValueError) as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            log.info("send_gripper refused: %s", exc)
+            return FAILURE
+
     def stop(self):
         return self.conn.stop()
 

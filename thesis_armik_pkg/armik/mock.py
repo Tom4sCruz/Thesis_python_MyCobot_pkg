@@ -23,6 +23,9 @@ class MockMyCobot:
         self._fresh_mode = 0   # pymycobot's documented default: queue mode
         # (timestamp, angles, speed) for every command received
         self.commands: list[tuple[float, list[float], int]] = []
+        # (timestamp, value, speed) for every gripper command received
+        self.gripper_commands: list[tuple[float, int, int]] = []
+        self._gripper_value = 0
 
     # -- state --------------------------------------------------------------
 
@@ -49,9 +52,11 @@ class MockMyCobot:
 
     def get_coords(self):
         """Mimics the firmware's FK by using ours -- fine for flow testing,
-        useless for validating the DH table (it would be circular)."""
-        from .kinematics import pose_coords
-        return [float(v) for v in pose_coords(self._angles)]
+        useless for validating the DH table (it would be circular). Uses the
+        bare FLANGE, like the real firmware, which knows nothing about
+        config.TOOL_OFFSET_MM."""
+        from .kinematics import flange_pose_coords
+        return [float(v) for v in flange_pose_coords(self._angles)]
 
     # -- motion -------------------------------------------------------------
 
@@ -64,6 +69,14 @@ class MockMyCobot:
         self.commands.append((time.perf_counter(), [joint_id, angle], speed))
         self._angles[joint_id - 1] = float(angle)
         return 1
+
+    def set_gripper_value(self, value, speed, gripper_type=None, is_torque=None):
+        self.gripper_commands.append((time.perf_counter(), int(value), int(speed)))
+        self._gripper_value = int(value)
+        return 1
+
+    def get_gripper_value(self, gripper_type=None):
+        return self._gripper_value
 
     def stop(self):
         return 1
@@ -85,3 +98,4 @@ class MockMyCobot:
 
     def reset_log(self):
         self.commands.clear()
+        self.gripper_commands.clear()

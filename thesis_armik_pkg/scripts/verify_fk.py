@@ -50,6 +50,12 @@ def main():
         print("NOTE: in mock mode the 'firmware' FK IS our FK, so the residual")
         print("      is trivially zero. This only checks the script runs.\n")
 
+    if config.TOOL_OFFSET_MM != (0.0, 0.0, 0.0) or config.TOOL_RPY_DEG != (0.0, 0.0, 0.0):
+        print("NOTE: a tool offset is configured (config.TOOL_OFFSET_MM /")
+        print("      TOOL_RPY_DEG). This script deliberately compares the bare")
+        print("      FLANGE against firmware FK, so the tool offset is excluded"
+              " here.\n")
+
     conn = ArmConnection(args.port, args.baud, mock=args.mock)
     if not conn.is_power_on():
         conn.power_on()
@@ -63,7 +69,10 @@ def main():
 
         q = conn.get_angles()
         fw = conn.get_coords_firmware()
-        ours = kinematics.pose_coords(q)
+        # Deliberately the bare FLANGE (not pose_coords, which now includes the
+        # tool offset): this script validates the DH table against firmware FK,
+        # and the firmware knows nothing about config.TOOL_OFFSET_MM.
+        ours = kinematics.flange_pose_coords(q)
 
         pos_err = float(np.linalg.norm(np.array(fw[:3]) - ours[:3]))
         print(f"    joints   : {[round(v, 2) for v in q]}")
@@ -88,7 +97,7 @@ def main():
     for conv in ("xyz_fixed", "zyx_fixed"):
         res = []
         for q, fw, _ in rows:
-            R_ours = kinematics.forward_kinematics(q)[:3, :3]
+            R_ours = kinematics.frame_chain(q)[-1][:3, :3]   # flange, not tool
             R_fw = kinematics.rpy_to_matrix(fw[3], fw[4], fw[5], convention=conv)
             dR = R_fw @ R_ours.T
             ang = np.rad2deg(np.arccos(np.clip((np.trace(dR) - 1) / 2, -1, 1)))
@@ -103,7 +112,7 @@ def main():
     print(f"    JOINT_1_HEIGHT_CM  = {config.JOINT_1_HEIGHT_CM:.3f} cm")
     print(f"    Z_RELATIVE_TO_JOINT1 = {config.Z_RELATIVE_TO_JOINT1}")
     zs_fw = np.array([r[1][2] for r in rows]) / 10.0
-    zs_ours = np.array([kinematics.pose_coords(r[0])[2] for r in rows]) / 10.0
+    zs_ours = np.array([kinematics.flange_pose_coords(r[0])[2] for r in rows]) / 10.0
     off = float(np.mean(zs_fw - zs_ours))
     print(f"    mean (firmware z - our z) = {off:+.3f} cm")
     if abs(off - config.JOINT_1_HEIGHT_CM) < 2.0:

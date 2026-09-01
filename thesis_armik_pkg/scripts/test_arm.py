@@ -123,9 +123,13 @@ def main():
     print("    NOTE: FK already includes the base height. z is measured from the")
     print("          table, so JOINT_1_HEIGHT_CM must NOT be added to it again.")
     if not args.mock:
+        # Compare the FLANGE z (frame_chain[-1]), not s[2] -- with a tool offset
+        # configured s[2] is the gripper tip and the firmware reports the flange.
+        from armik.kinematics import frame_chain
         fw = arm.conn.get_coords_firmware()
-        d = abs(fw[2] / 10.0 - s[2])
-        check(d < 1.0, f"our z agrees with firmware z within 1 cm ({d:.2f} cm)")
+        flange_z_cm = frame_chain(arm.get_angles())[-1][2, 3] / 10.0
+        d = abs(fw[2] / 10.0 - flange_z_cm)
+        check(d < 1.0, f"our flange z agrees with firmware z within 1 cm ({d:.2f} cm)")
         if d >= 1.0:
             print("    -> run scripts/verify_fk.py")
 

@@ -48,8 +48,12 @@ def frame_chain(q_deg: Sequence[float]) -> list[np.ndarray]:
 
 
 def forward_kinematics(q_deg: Sequence[float]) -> np.ndarray:
-    """End-effector pose as a 4x4 homogeneous transform (translation in mm)."""
-    return frame_chain(q_deg)[-1]
+    """Tool-tip pose as a 4x4 homogeneous transform (translation in mm).
+
+    Includes config.TOOL_OFFSET_MM / TOOL_RPY_DEG. With both zero this is the
+    bare flange (DH frame 6), bit-for-bit as before. Use frame_chain(q)[-1]
+    when you specifically need the flange (e.g. validating the DH table)."""
+    return frame_chain(q_deg)[-1] @ tool_transform()
 
 
 def geometric_jacobian(q_deg: Sequence[float]) -> np.ndarray:
@@ -60,7 +64,7 @@ def geometric_jacobian(q_deg: Sequence[float]) -> np.ndarray:
     constrained independently.
     """
     frames = frame_chain(q_deg)
-    p_e = frames[-1][:3, 3]
+    p_e = (frames[-1] @ tool_transform())[:3, 3]
     J = np.zeros((6, config.DOF))
     for i in range(config.DOF):
         z = frames[i][:3, 2]
@@ -120,9 +124,45 @@ def matrix_to_rpy(R: np.ndarray, convention: str | None = None) -> np.ndarray:
     return np.rad2deg([rx, ry, rz])
 
 
+# ---------------------------------------------------------------------------
+# Tool transform (flange -> commanded tip)
+# ---------------------------------------------------------------------------
+
+# Keyed on the actual constant values (not blindly memoised) so a script that
+# monkeypatches config.TOOL_OFFSET_MM at runtime still sees the change, while a
+# normal run pays the build cost once even though IK calls this tens of
+# thousands of times per move.
+_TOOL_TF_CACHE: dict[tuple, np.ndarray] = {}
+
+
+def tool_transform() -> np.ndarray:
+    """4x4 rigid transform from the bare flange (DH frame 6) to the commanded
+    tool tip, from config.TOOL_OFFSET_MM / config.TOOL_RPY_DEG. Exactly eye(4)
+    when both are zero. Treat the result as immutable."""
+    key = (tuple(float(v) for v in config.TOOL_OFFSET_MM),
+           tuple(float(v) for v in config.TOOL_RPY_DEG))
+    T = _TOOL_TF_CACHE.get(key)
+    if T is None:
+        off, rpy = key
+        T = np.eye(4)
+        T[:3, :3] = rpy_to_matrix(*rpy)
+        T[:3, 3] = off
+        T.flags.writeable = False
+        _TOOL_TF_CACHE[key] = T
+    return T
+
+
 def pose_coords(q_deg: Sequence[float]) -> np.ndarray:
-    """Joint angles -> [x, y, z, rx, ry, rz] in mm and degrees."""
+    """Joint angles -> [x, y, z, rx, ry, rz] in mm and degrees, at the tool tip
+    (config.TOOL_OFFSET_MM / TOOL_RPY_DEG)."""
     T = forward_kinematics(q_deg)
+    return np.concatenate([T[:3, 3], matrix_to_rpy(T[:3, :3])])
+
+
+def flange_pose_coords(q_deg: Sequence[float]) -> np.ndarray:
+    """Like pose_coords() but ALWAYS the bare flange (DH frame 6), ignoring the
+    tool offset. For validating the DH table against firmware FK."""
+    T = frame_chain(q_deg)[-1]
     return np.concatenate([T[:3, 3], matrix_to_rpy(T[:3, :3])])
 
 

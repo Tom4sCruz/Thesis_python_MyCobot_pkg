@@ -41,6 +41,7 @@ from .config import JOINT_1_HEIGHT_CM
 from .connection import ArmConnection, ArmError, dps_to_firmware_speed
 from .ik import IKFailure
 from .kinematics import (
+    flange_pose_coords,
     forward_kinematics,
     geometric_jacobian,
     manipulability,
@@ -48,6 +49,7 @@ from .kinematics import (
     pose_coords,
     rpy_to_matrix,
     task_jacobian,
+    tool_transform,
 )
 
 __version__ = "1.0.0"
@@ -70,6 +72,8 @@ __all__ = [
     "geometric_jacobian",
     "task_jacobian",
     "pose_coords",
+    "flange_pose_coords",
+    "tool_transform",
     "manipulability",
     "rpy_to_matrix",
     "matrix_to_rpy",

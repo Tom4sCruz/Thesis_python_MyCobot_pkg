@@ -63,6 +63,40 @@ EULER_CONVENTION = "xyz_fixed"
 
 
 # ---------------------------------------------------------------------------
+# Tool / end-effector offset (TCP)
+# ---------------------------------------------------------------------------
+#
+# Rigid transform from the bare flange (DH frame 6) to the point you actually
+# command -- the tip of the gripper. Once nonzero, EVERY Cartesian quantity in
+# this package is measured to that point: forward_kinematics, both Jacobians,
+# IK, get_coords(), send_coords()/send_path(), and the workspace safety checks.
+#
+# TOOL_OFFSET_MM : (dx, dy, dz) in the FLANGE frame, millimetres. Frame-6 +z
+#   points straight out of the flange face (DH row 6: alpha=0, d6=48.6), so a
+#   gripper mounted straight along the wrist axis is a pure +z translation.
+# TOOL_RPY_DEG : orientation of the tool (gripper) frame vs the flange, same
+#   Euler convention as everything else (EULER_CONVENTION => R = Rz@Ry@Rx).
+#   The gripper here is bolted on rolled about the flange axis, so this is a
+#   pure z roll: (0, 0, -135). rpy_to_matrix(0, 0, -135) = Rz(-135), which does
+#   NOT move the tool z axis, so TOOL_OFFSET_MM stays a straight-out offset.
+#   Nonzero here means get_coords()/send_coords() rx/ry/rz describe the GRIPPER
+#   frame (a level gripper reads rz ~= 0) and IK works in gripper-frame Euler.
+#
+# ALL ZERO == bare flange == byte-identical to before this constant existed.
+#
+# 90 mm and -135 deg are STARTING VALUES. Measure the real flange-face-to-tip
+# distance; confirm the roll sign/size on hardware (a level gripper should read
+# rz ~= 0 -- if not, try +135 / -45 / +45). DH-table validation is unaffected:
+# scripts/verify_fk.py deliberately compares the FLANGE against firmware FK.
+#
+# Do this ONLY here in Python. Do NOT also call the firmware's
+# set_tool_reference()/set_end_type() -- this package bypasses firmware
+# kinematics on purpose and doing both would double-count the offset.
+TOOL_OFFSET_MM = (0.0, 0.0, 90.0)
+TOOL_RPY_DEG = (0.0, 0.0, -135.0)
+
+
+# ---------------------------------------------------------------------------
 # Single-joint motion
 # ---------------------------------------------------------------------------
 
@@ -92,7 +126,11 @@ SINGLE_JOINT_DELAY_BETWEEN_POINTS = 2  # seconds
 # Full 3D distance from the base origin the tip may reach, in mm. ~280 mm
 # matches the myCobot 280's published working radius -- verify against your
 # actual arm, same as everything else in this file.
-MAX_REACH_MM = 400 #280.0
+#
+# This now bounds the TOOL TIP (see TOOL_OFFSET_MM), not the bare flange. 480 =
+# ~280 mm flange radius + ~90 mm tool + margin. Raise it further for a longer
+# tool; lower it back toward 280-330 for a bare flange.
+MAX_REACH_MM = 480 #280.0
 
 # z of the base mounting plate, in mm, in the SAME frame get_coords() uses.
 # At or above this height, only the reach sphere is checked.
@@ -179,6 +217,18 @@ CONTROL_RATE_HZ = 25.0
 # slightly higher speed than strictly needed to make sure the servo arrives
 # before the next setpoint rather than lagging the whole trajectory.
 STREAM_SPEED_GAIN = 1.6
+
+# ---------------------------------------------------------------------------
+# Gripper
+# ---------------------------------------------------------------------------
+# The serial protocol for this arm has NO angular gripper command. pymycobot
+# exposes set_gripper_value(value, speed): value 0-100 (0 = fully closed,
+# 100 = fully open), speed an integer 1-100. Arm.send_gripper(deg) takes an
+# opening ANGLE and maps [0, MAX_GRIPPER_DEG] linearly onto that 0-100 value:
+#   send_gripper(0)               -> closed
+#   send_gripper(MAX_GRIPPER_DEG) -> fully open
+MAX_GRIPPER_DEG = 120.0
+GRIPPER_DEFAULT_SPEED = 50   # pymycobot gripper speed, integer 1-100
 
 # ---------------------------------------------------------------------------
 # Cartesian API defaults

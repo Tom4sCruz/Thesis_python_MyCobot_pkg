@@ -246,6 +246,43 @@ class ArmConnection:
         with self._lock:
             return self._mc.release_all_servos()
 
+    # -- gripper ----------------------------------------------------------------
+
+    def set_gripper_value(
+        self,
+        value: int,
+        speed: int = config.GRIPPER_DEFAULT_SPEED,
+        gripper_type: int | None = None,
+    ):
+        """
+        Set the gripper opening: `value` 0-100 (0 closed, 100 open), `speed` an
+        integer 1-100. Thin wrapper over pymycobot's set_gripper_value under the
+        shared serial lock. The return value is whatever pymycobot returns
+        (often None on real hardware) -- success is the absence of an exception,
+        not a truthy result.
+        """
+        value = int(value)
+        if not 0 <= value <= 100:
+            raise ValueError(f"gripper value must be 0-100, got {value}")
+        speed = int(speed)
+        if not config.FIRMWARE_SPEED_MIN <= speed <= config.FIRMWARE_SPEED_MAX:
+            raise ValueError(
+                f"gripper speed must be {config.FIRMWARE_SPEED_MIN}-"
+                f"{config.FIRMWARE_SPEED_MAX}, got {speed}"
+            )
+        with self._lock:
+            if gripper_type is None:
+                return self._mc.set_gripper_value(value, speed)
+            return self._mc.set_gripper_value(value, speed, gripper_type)
+
+    def is_gripper_moving(self) -> bool:
+        with self._lock:
+            try:
+                return bool(self._mc.is_gripper_moving())
+            except Exception as exc:
+                log.debug("is_gripper_moving failed: %s", exc)
+                return False
+
     def close(self):
         try:
             self.stop()

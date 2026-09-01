@@ -1,10 +1,17 @@
 """
 Move the end effector along a chosen y-z path (LINEAR or CURVED) at fixed x,
-in SINGLE-JOINT mode, to compare how different jerk/twitch settings feel.
+to compare how different jerk/twitch settings feel.
 
-jerk, random_twitch, and twitch_intensity only apply in single-joint mode
-(arm.set_single_joint(1)) -- they have no effect on the normal coordinated
-send_path()/send_coords() path.
+arm.jerk / arm.random_twitch / arm.twitch_intensity apply to EVERY motion path
+now -- send_coords(), send_path(), move_joints(), in both normal and
+single-joint execution. This script runs in single-joint mode (see
+arm.set_single_joint(1) below); comment that call out to feel the same knobs on
+the coordinated path instead.
+
+    arm.jerk             roughness dial, 0 = smooth (tremor + uneven pace)
+    arm.random_twitch    expected discrete flinches per second
+    arm.twitch_intensity peak flinch amplitude, in degrees
+    arm.jerk_seed        None = fresh each run; set an int to reproduce a run
 """
 import time
 import numpy as np

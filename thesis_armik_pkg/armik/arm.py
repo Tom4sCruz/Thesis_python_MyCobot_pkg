@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import blending, config, ik
+from . import blending, config, ik, jerk
 from .connection import ArmConnection, ArmError
 from .kinematics import (
     check_joint_limits,
@@ -126,6 +126,17 @@ class Arm:
         self.last_plan: Plan | None = None
         self.last_execution: Execution | None = None
         self.last_error: str | None = None
+
+        # Deliberate jitter (armik/jerk.py). All zero -> every move streams the
+        # same smooth trajectory it always did. Set on the instance:
+        #   arm.jerk             roughness dial, 0 = smooth (tremor + uneven pace)
+        #   arm.random_twitch    expected discrete flinches per second
+        #   arm.twitch_intensity peak flinch amplitude, degrees
+        #   arm.jerk_seed        None = fresh randomness per move; int = repeatable
+        self.jerk = 0.0
+        self.random_twitch = 0.0
+        self.twitch_intensity = 0.0
+        self.jerk_seed: int | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -755,6 +766,18 @@ class Arm:
     # Execution
     # ------------------------------------------------------------------
 
+    def _make_jerk(self) -> jerk.JerkInjector:
+        """
+        Fresh jitter injector from the current jerk attributes. Inert unless
+        self.jerk > 0 or (self.random_twitch and self.twitch_intensity), so a
+        default Arm streams the smooth trajectory unchanged. self.jerk_seed
+        None -> fresh randomness each move; an int -> a repeatable sequence.
+        """
+        rng = np.random.default_rng(self.jerk_seed)
+        return jerk.JerkInjector(
+            self.jerk, self.random_twitch, self.twitch_intensity, config.DOF, rng
+        )
+
     def _execute(self, plan: Plan) -> Execution:
         """
         Stream the planned joint setpoints on an ABSOLUTE-deadline schedule.
@@ -779,8 +802,17 @@ class Arm:
         )
         gain = config.STREAM_SPEED_GAIN
 
+        # Deliberate jitter, if armed. Every setpoint EXCEPT the last is
+        # perturbed (position + commanded speed); the final setpoint is left
+        # clean so the move still ends exactly at the planned pose. Timing is
+        # untouched -- pace unevenness rides on `speed`, not the schedule, so
+        # total duration stays honest.
+        inj = self._make_jerk()
+        soft = config.joint_limits_array()
+
         try:
             t0 = time.perf_counter()
+            prev_cmd = np.asarray(wps[0], dtype=float)
             for k in range(1, n):
                 deadline = t0 + timestamps[k]
                 now = time.perf_counter()
@@ -790,10 +822,16 @@ class Arm:
                 elif now > deadline + dt_k:
                     ex.late_deadlines += 1
 
-                q_k = wps[k]
-                step_dps = float(np.max(np.abs(q_k - wps[k - 1])) / dt_k)
-                self.conn.send_angles(q_k, max(step_dps * gain, 1.0))
+                q_k = np.asarray(wps[k], dtype=float)
+                spd_factor = 1.0
+                if inj.active and k < n - 1:
+                    q_k = np.clip(q_k + inj.offsets(dt_k), soft[:, 0], soft[:, 1])
+                    spd_factor = inj.speed_factor()
 
+                step_dps = float(np.max(np.abs(q_k - prev_cmd)) / dt_k)
+                self.conn.send_angles(q_k, max(step_dps * gain * spd_factor, 1.0))
+
+                prev_cmd = q_k
                 ex.t_cmd.append(time.perf_counter() - t0)
                 ex.q_cmd.append([float(v) for v in q_k])
 
@@ -832,6 +870,14 @@ class Arm:
             ex.error = "single-joint execution requires at least one target waypoint"
             return ex
 
+        # Deliberate jitter, if armed. Each moving joint's commanded angle and
+        # speed are perturbed for every waypoint EXCEPT the last, so the arm
+        # still settles on the planned final configuration. A perturbed angle
+        # that would leave the safety envelope is dropped back to the clean
+        # target rather than aborting the whole path.
+        inj = self._make_jerk()
+        soft = config.joint_limits_array()
+
         try:
             t0 = time.perf_counter()
 
@@ -840,9 +886,10 @@ class Arm:
             #print("B: before for-loops")
 
             for waypoint_idx in range(1, len(q_waypoints)):
-                
+
                 #print("Iteration #", waypoint_idx)
 
+                is_last_wp = waypoint_idx == len(q_waypoints) - 1
                 target = np.asarray(q_waypoints[waypoint_idx], dtype=float)
 
                 #print("0", end='')
@@ -872,14 +919,30 @@ class Arm:
                         joint_speed = float(config.MAX_JOINT_SPEED_DPS[joint_idx])
 
                     joint_speed = min(joint_speed, config.MAX_JOINT_SPEED_DPS[joint_idx])
-                    
+
                     #Use the configured hardware ceiling for this joint.
                     #joint_speed = 20 #float(config.MAX_JOINT_SPEED_DPS[joint_idx])
 
                     #print("2", end='')
 
+                    cmd_angle = target_angle
+                    if inj.active and not is_last_wp:
+                        move_time = abs(target_angle - current_angle) / max(joint_speed, 1e-6)
+                        jittered = float(np.clip(
+                            target_angle + float(inj.offsets(move_time)[joint_idx]),
+                            soft[joint_idx, 0], soft[joint_idx, 1],
+                        ))
+                        cand = current.copy()
+                        cand[joint_idx] = jittered
+                        if check_workspace_bounds(forward_kinematics(cand)[:3, 3]) is None:
+                            cmd_angle = jittered
+                        joint_speed = min(
+                            max(joint_speed * inj.speed_factor(), 1.0),
+                            config.MAX_JOINT_SPEED_DPS[joint_idx],
+                        )
+
                     candidate = current.copy()
-                    candidate[joint_idx] = target_angle
+                    candidate[joint_idx] = cmd_angle
                     tip_mm = forward_kinematics(candidate)[:3, 3]
                     bounds_error = check_workspace_bounds(tip_mm)
                     if bounds_error is not None:
@@ -888,7 +951,7 @@ class Arm:
 
                     self.conn.send_angle(
                         joint_id,
-                        target_angle,
+                        cmd_angle,
                         joint_speed,
                     )
 
@@ -897,13 +960,13 @@ class Arm:
                     # Wait until the servo actually reaches the target.
                     self._wait_for_joint(
                         joint_id,
-                        target_angle,
+                        cmd_angle,
                     )
 
                     #print("4")
 
                     # Record the commanded configuration.
-                    current[joint_idx] = target_angle
+                    current[joint_idx] = cmd_angle
 
                     ex.t_cmd.append(time.perf_counter() - t0)
                     ex.q_cmd.append(current.tolist())

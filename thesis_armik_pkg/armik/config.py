@@ -127,6 +127,37 @@ JOINT_LIMIT_MARGIN_DEG = 3.0
 MAX_JOINT_SPEED_DPS = [240.0, 240.0, 240.0, 300.0, 300.0, 350.0]
 
 # ---------------------------------------------------------------------------
+# Jerk injection -- DELIBERATE jitter (armik/jerk.py; arm.jerk / .random_twitch
+# / .twitch_intensity)
+# ---------------------------------------------------------------------------
+#
+# This is the opposite of _min_jerk in arm.py: instead of smoothing a move, it
+# corrupts the streamed setpoints so the arm visibly shakes -- for comparing
+# smooth vs. jerky motion. All zero-safe: arm.jerk = 0 AND arm.random_twitch = 0
+# (or arm.twitch_intensity = 0) -> motion is byte-for-byte unchanged.
+#
+# arm.jerk is a DIMENSIONLESS roughness dial (0 = smooth, ~1-3 subtle, ~5-10
+# violent). It drives two effects, scaled by the two constants below:
+JERK_TREMOR_DEG_PER_UNIT = 0.30   # RMS joint deflection (deg) per unit of arm.jerk
+JERK_SPEED_FRAC_PER_UNIT = 0.05   # pace-modulation std (fraction) per unit of arm.jerk
+
+# AR(1) correlation for both the tremor noise and the pace modulation. 0 = white
+# (buzzy), ->1 = slow sway. ~0.5 reads as a hand tremor at CONTROL_RATE_HZ.
+JERK_TREMOR_CORRELATION = 0.5
+
+# Commanded-speed multiplier is clamped to this band after modulation, so a
+# perturbed setpoint can neither stall nor bolt.
+JERK_SPEED_FACTOR_MIN = 0.30
+JERK_SPEED_FACTOR_MAX = 2.50
+
+# Discrete twitch ("flinch") shape, in control ticks.
+JERK_TWITCH_RISE_TICKS = 1        # ticks to ramp a twitch to full amplitude
+JERK_TWITCH_DECAY_TICKS = 4       # ticks to decay it back to zero
+
+# Hard per-joint cap on the TOTAL perturbation (tremor + twitch), in degrees.
+JERK_MAX_DEG = 8.0
+
+# ---------------------------------------------------------------------------
 # pymycobot interface
 # ---------------------------------------------------------------------------
 

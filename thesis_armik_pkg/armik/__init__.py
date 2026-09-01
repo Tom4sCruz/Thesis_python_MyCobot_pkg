@@ -35,7 +35,7 @@ Offline, with no hardware:
         ...
 """
 
-from . import config, ik, kinematics
+from . import config, ik, jerk, kinematics
 from .arm import Arm, Execution, Plan, FAILURE, SUCCESS
 from .config import JOINT_1_HEIGHT_CM
 from .connection import ArmConnection, ArmError, dps_to_firmware_speed
@@ -64,6 +64,7 @@ __all__ = [
     "JOINT_1_HEIGHT_CM",
     "config",
     "ik",
+    "jerk",
     "kinematics",
     "forward_kinematics",
     "geometric_jacobian",

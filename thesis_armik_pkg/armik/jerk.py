@@ -15,7 +15,9 @@ Three independent knobs, set as plain attributes on ``Arm``:
                          modulated up and down), scaled by
                          ``config.JERK_TREMOR_DEG_PER_UNIT`` and
                          ``config.JERK_SPEED_FRAC_PER_UNIT``.
-    arm.random_twitch    Expected discrete "flinch" events per second (Poisson).
+    arm.random_twitch    Probability in [0, 1] that a discrete "flinch" starts
+                         on any given streamed setpoint -- so a twitch fires
+                         roughly ``random_twitch`` of the time during the move.
     arm.twitch_intensity Peak flinch amplitude, in degrees.
 
 A twitch fires on a random single joint with a random sign, ramps to full
@@ -72,7 +74,7 @@ class JerkInjector:
 
     def __init__(self, jerk, random_twitch, twitch_intensity, dof, rng):
         self.jerk = max(float(jerk), 0.0)
-        self.random_twitch = max(float(random_twitch), 0.0)
+        self.random_twitch = min(max(float(random_twitch), 0.0), 1.0)  # probability
         self.twitch_intensity = float(twitch_intensity)
         self.dof = int(dof)
         self.rng = rng
@@ -103,8 +105,9 @@ class JerkInjector:
         """
         (DOF,) degrees to ADD to this tick's setpoint. Advances internal state.
 
-        ``dt`` is the control period for this tick, in seconds -- it sets the
-        expected number of twitches (Poisson, rate = ``random_twitch``).
+        ``dt`` (control period, seconds) is accepted for call-signature
+        symmetry with ``speed_factor()`` but is not currently used -- the
+        twitch chance is a flat per-call probability (``random_twitch``).
         """
         if not self.active:
             return np.zeros(self.dof)
@@ -117,10 +120,9 @@ class JerkInjector:
             )
         out = np.array(self._tremor, dtype=float)
 
-        # -- twitches: maybe start some, then sum the live ones ------------
+        # -- twitches: maybe start one, then sum the live ones ------------
         if self.random_twitch > 0.0 and self.twitch_intensity != 0.0:
-            n_new = int(self.rng.poisson(self.random_twitch * max(float(dt), 0.0)))
-            for _ in range(n_new):
+            if self.rng.random() < self.random_twitch:
                 sign = 1.0 if self.rng.random() < 0.5 else -1.0
                 # 50-100% of twitch_intensity, so flinches vary in size
                 amp = sign * abs(self.twitch_intensity) * (0.5 + 0.5 * self.rng.random())

@@ -9,7 +9,7 @@ arm.set_single_joint(1) below); comment that call out to feel the same knobs on
 the coordinated path instead.
 
     arm.jerk             roughness dial, 0 = smooth (tremor + uneven pace)
-    arm.random_twitch    expected discrete flinches per second
+    arm.random_twitch    probability [0, 1] of a flinch per streamed setpoint
     arm.twitch_intensity peak flinch amplitude, in degrees
     arm.jerk_seed        None = fresh each run; set an int to reproduce a run
 """

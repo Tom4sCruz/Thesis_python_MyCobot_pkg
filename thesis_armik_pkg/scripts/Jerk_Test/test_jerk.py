@@ -11,7 +11,7 @@ arm.jerk / arm.random_twitch / arm.twitch_intensity apply to every motion path
 now (send_coords, send_path, move_joints; normal AND single-joint execution):
 
     arm.jerk             roughness dial, 0 = smooth (tremor + uneven pace)
-    arm.random_twitch    expected discrete flinches per second
+    arm.random_twitch    probability [0, 1] of a flinch per streamed setpoint
     arm.twitch_intensity peak flinch amplitude, in degrees
     arm.jerk_seed        None = fresh randomness each run; set an int to make a
                          run exactly reproducible
@@ -36,11 +36,11 @@ STARTING_Y = -20
 
 # label, jerk, random_twitch, twitch_intensity -- edit freely
 PRESETS = [
-    ("smooth",          0.0, 0.0,  0.0),
-    ("mild-tremor",     2.0, 0.0,  0.0),
-    ("strong-tremor",   5.0, 0.0,  0.0),
-    ("twitchy",         0.0, 2.0, 12.0),
-    ("tremor+twitch",   6.0, 2.5,  12.0),
+    ("smooth",          0.0, 0.00,  0.0),
+    ("mild-tremor",     2.0, 0.00,  0.0),
+    ("strong-tremor",   5.0, 0.00,  0.0),
+    ("twitchy",         0.0, 0.15, 12.0),
+    ("tremor+twitch",   6.0, 0.20, 12.0),
 ]
 
 

@@ -130,7 +130,7 @@ class Arm:
         # Deliberate jitter (armik/jerk.py). All zero -> every move streams the
         # same smooth trajectory it always did. Set on the instance:
         #   arm.jerk             roughness dial, 0 = smooth (tremor + uneven pace)
-        #   arm.random_twitch    expected discrete flinches per second
+        #   arm.random_twitch    probability [0, 1] of a flinch per streamed setpoint
         #   arm.twitch_intensity peak flinch amplitude, degrees
         #   arm.jerk_seed        None = fresh randomness per move; int = repeatable
         self.jerk = 0.0

@@ -88,10 +88,17 @@ CUBES_TARGET_POINTS = [           # deterministic, deliberately uneven drop poin
 PICK_ORIENTATION_DEG = (180.0, 0.0, -45.0)
 
 # -- arc + velocity profile --------------------------------------------------
-# Absolute apex z (cm) of every arc. Must clear all cubes AND stay reachable at
-# PICK_ORIENTATION_DEG -- with the gripper held straight down the arm runs out of
-# reach around z ~ 17-18 cm near the workspace edge, so keep this conservative.
+# All arcs are pieces of ONE shared parabola  y = a*x^2 + c  (b = 0, symmetric
+# about the chord midpoint). The WIDEST move in the run rises to
+# MAX_HEIGHT_TRAJECTORY; every shorter move keeps the same curvature `a` and so
+# lifts less: apex_i = MAX_HEIGHT_TRAJECTORY * (chord_i / chord_widest) ** 2.
+# Height is measured ABOVE the (possibly sloped, possibly diagonal) chord, and
+# "chord" is the HORIZONTAL (xy) distance -- so a straight-down pick barely
+# lifts, and moves in any xy direction (incl. right -> front) work unchanged.
+# Keep MAX_HEIGHT_TRAJECTORY reachable at PICK_ORIENTATION_DEG: gripper-down the
+# arm runs out of reach around world z ~ 17-18 cm near the workspace edge.
 MAX_HEIGHT_TRAJECTORY = 15.0
+MIN_ARC_HEIGHT_CM = 2.0          # floor, so short moves still clear the table / other cubes
 CRUISE_SPEED_CM_S = 25.0          # peak tip speed; the ease dials stretch the move time
 EASE_IN = 5.0                    # [0,10] start-of-move acceleration shape. 0 = abrupt,
 EASE_OUT = 5.0                   # [0,10] end-of-move deceleration shape.  10 = long, gentle S
@@ -100,8 +107,7 @@ MIN_SEGMENT_S = 0.02
 
 # -- per-move variation ("never the same twice") -----------------------------
 VARIATION = 0                  # [0,1] master scale; 0 = identical arcs every run
-APEX_HEIGHT_JITTER_CM = 0.0      # +/- on MAX_HEIGHT_TRAJECTORY
-APEX_POS_JITTER = 0.0           # +/- of the apex position along the chord (0.5 = middle)
+APEX_HEIGHT_JITTER_FRAC = 0.0    # +/- fraction of an arc's own apex height
 BOW_JITTER_CM = 0.0             # +/- sideways bow, perpendicular to the chord
 EASE_JITTER = 0.0              # +/- on EASE_IN / EASE_OUT per move
 
@@ -121,8 +127,12 @@ NUDGE_SETTLE_S = 1.5           # pause after the recoil, "waiting for the cube t
 GRIP_OPEN_DEG = 110.0           # 0 = closed .. config.MAX_GRIPPER_DEG = full open
 GRIP_CLOSED_DEG = 25.0          # tune to the cube width
 GRIP_SPEED = 90  #config.GRIPPER_DEFAULT_SPEED
-GRIP_SETTLE_S = 0.8
+GRIP_SETTLE_S = 0.35           # quiet time after a gripper command: it must LAND and the
+                              # jaws start moving. Tunable down to GRIP_MIN_GAP_S, not below.
+GRIP_MIN_GAP_S = 0.2          # hard floor -- pymycobot silently drops a gripper command
+                              # that is not followed by a short quiet gap (why 0.0 failed).
 REACH_TOL_CM = 3.0             # has_reached_* tolerance, per axis
+LEADOUT_PAUSE_S = 0.5         # deliberate beat between the last release and homing
 
 # -- gripper trigger boxes (optional) ------------------------------------------
 # [[(cx,cy,cz), (l,w,h), cycle_n], ...] -- on cycle cycle_n, the gripper fires
@@ -157,23 +167,36 @@ def _polyline_points(verts, s_query):
     return verts[j] + frac[:, None] * seg[j], total
 
 
-def _parabola_points(origin, target, max_height, rng):
-    """(list of PATH_WAYPOINTS (x,y,z), arc_length) along a parabolic arc from
-    `origin` up to apex `max_height` and down to `target`. With `rng` the apex
-    height / position and a sideways bow are jittered by VARIATION."""
+def _chord_len(p, q):
+    """Horizontal (xy) distance between two points."""
+    return float(np.hypot(q[0] - p[0], q[1] - p[1]))
+
+
+def _arc_height(d, d_max):
+    """Apex height (above the chord) for a move of horizontal length `d`, given
+    the widest move `d_max`. Shared parabola: a = -MAX_HEIGHT / (d_max/2)^2, and
+    c_i = -a * (d/2)^2 = MAX_HEIGHT * (d/d_max)^2."""
+    if d_max <= 1e-6:
+        return MIN_ARC_HEIGHT_CM
+    c = MAX_HEIGHT_TRAJECTORY * (d / d_max) ** 2
+    return float(np.clip(c, MIN_ARC_HEIGHT_CM, MAX_HEIGHT_TRAJECTORY))
+
+
+def _parabola_points(origin, target, arc_height, rng):
+    """(list of PATH_WAYPOINTS (x,y,z), arc_length) along the arc from `origin`
+    to `target`: the straight xy chord + a symmetric vertical parabolic lift of
+    apex `arc_height` above the chord (== a*x^2 + c with x = (u-0.5)*chord).
+    With `rng` the apex height and a sideways bow are jittered by VARIATION."""
     o = np.asarray(origin, dtype=float)
     t = np.asarray(target, dtype=float)
     z0, z1 = float(o[2]), float(t[2])
 
-    h = float(max_height)
-    upos = 0.5
+    h = float(arc_height)
     bow = 0.0
     if rng is not None and VARIATION > 0.0:
-        h += float(rng.uniform(-1.0, 1.0)) * APEX_HEIGHT_JITTER_CM * VARIATION
-        upos += float(rng.uniform(-1.0, 1.0)) * APEX_POS_JITTER * VARIATION
+        h = max(MIN_ARC_HEIGHT_CM,
+                h * (1.0 + float(rng.uniform(-1.0, 1.0)) * APEX_HEIGHT_JITTER_FRAC * VARIATION))
         bow = float(rng.uniform(-1.0, 1.0)) * BOW_JITTER_CM * VARIATION
-    upos = float(np.clip(upos, 0.15, 0.85))
-    h = max(h, max(z0, z1) + 1.0)
 
     M = 200
     u = np.linspace(0.0, 1.0, M)
@@ -186,12 +209,8 @@ def _parabola_points(origin, target, max_height, rng):
         perp = np.array([-chord[1], chord[0]]) / n
         xy = xy + perp[None, :] * (bow * 4.0 * (u * (1.0 - u)))[:, None]
 
-    # parabola through (0, z0), (upos, h), (1, z1)  (Lagrange, degree 2)
-    z = (
-        z0 * (u - upos) * (u - 1.0) / ((0.0 - upos) * (0.0 - 1.0))
-        + h * (u - 0.0) * (u - 1.0) / ((upos - 0.0) * (upos - 1.0))
-        + z1 * (u - 0.0) * (u - upos) / ((1.0 - 0.0) * (1.0 - upos))
-    )
+    # straight chord in z + symmetric parabolic lift (0 at both ends, peak h at u=0.5)
+    z = z0 + (z1 - z0) * u + 4.0 * h * u * (1.0 - u)
 
     dense = np.column_stack([xy, z])
     L = float(np.linalg.norm(np.diff(dense, axis=0), axis=1).sum())
@@ -199,15 +218,17 @@ def _parabola_points(origin, target, max_height, rng):
     return [tuple(float(v) for v in p) for p in pts], L
 
 
-def get_path(origin_point, target_point, max_height=MAX_HEIGHT_TRAJECTORY, rng=None):
-    """Parabolic arc from origin to target as PATH_WAYPOINTS (x,y,z) points."""
-    return _parabola_points(origin_point, target_point, max_height, rng)[0]
+def get_path(origin_point, target_point, arc_height, rng=None):
+    """Arc from origin to target as PATH_WAYPOINTS (x,y,z) points. `arc_height`
+    is this move's apex above the chord -- compute it with _arc_height()."""
+    return _parabola_points(origin_point, target_point, arc_height, rng)[0]
 
 
-def get_durations(origin_point, target_point, ease_in_accel=EASE_IN, ease_out_accel=EASE_OUT):
+def get_durations(origin_point, target_point, arc_height,
+                  ease_in_accel=EASE_IN, ease_out_accel=EASE_OUT):
     """PATH_WAYPOINTS-1 segment durations (s) for the arc between the two points,
     shaped by the EASE_IN / EASE_OUT dials (0..10, no physical meaning)."""
-    _, L = _parabola_points(origin_point, target_point, MAX_HEIGHT_TRAJECTORY, None)
+    _, L = _parabola_points(origin_point, target_point, arc_height, None)
 
     a = float(np.clip(ease_in_accel, 0.0, 10.0)) / 10.0
     b = float(np.clip(ease_out_accel, 0.0, 10.0)) / 10.0
@@ -277,12 +298,24 @@ def go_home(arm):
     arm.move_joints(HOME, duration=HOME_MOVE_S)
 
 
+def _fire_gripper(arm, deg):
+    """Send the gripper command twice with a tiny gap -- pymycobot drops a
+    gripper packet that is not followed by a short quiet window. No long wait
+    (caller decides). Returns False only if send_gripper itself refused."""
+    ok = arm.send_gripper(deg, speed=GRIP_SPEED)
+    time.sleep(0.06)
+    arm.send_gripper(deg, speed=GRIP_SPEED)
+    return bool(ok)
+
+
 def _grip(arm, deg, label):
     print(f"  gripper -> {deg:.0f} deg ({label})")
-    if not arm.send_gripper(deg, speed=GRIP_SPEED):
+    if not _fire_gripper(arm, deg):
         print(f"  send_gripper REFUSED -- {arm.last_error}")
         return False
-    time.sleep(GRIP_SETTLE_S)
+    if GRIP_SETTLE_S < GRIP_MIN_GAP_S:
+        print(f"  (GRIP_SETTLE_S {GRIP_SETTLE_S}s < floor {GRIP_MIN_GAP_S}s -- using the floor)")
+    time.sleep(max(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S) - 0.06, 0.0))
     return True
 
 
@@ -335,7 +368,7 @@ def _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
     if th.is_alive() and th.exc is None:
         print(f"  {label}: trigger box entered ~t={time.perf_counter()-t0:.2f}s "
               f"-> gripper {grip_deg:.0f}")
-        arm.send_gripper(grip_deg, speed=GRIP_SPEED)
+        _fire_gripper(arm, grip_deg)
         fired = True
 
     th.join()
@@ -346,8 +379,8 @@ def _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
         return False
     if not fired:
         print(f"  {label}: path ended before the box -- firing gripper {grip_deg:.0f} now")
-        arm.send_gripper(grip_deg, speed=GRIP_SPEED)
-    time.sleep(GRIP_SETTLE_S)
+        _fire_gripper(arm, grip_deg)
+    time.sleep(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S))
     pl = arm.last_plan
     print(f"  {label}: {pl.path_length_cm:.1f} cm, {pl.duration_s:.2f} s, "
           f"peak {pl.peak_joint_dps:.0f} deg/s")
@@ -365,7 +398,7 @@ def _trigger_time(pts, durs, cycle_n):
     return None
 
 
-def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs):
+def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
     """Scripted flinch: approach part-way, recoil, wait, re-approach the moved cube."""
     rx, ry, rz = PICK_ORIENTATION_DEG
     n = len(pts)
@@ -393,8 +426,10 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs):
 
     new_cube = tuple(float(c + o) for c, o in zip(seg["target"], NUDGE_OFFSET_CM))
     print(f"  cube moved -> re-approaching {tuple(round(v, 1) for v in new_cube)}")
-    p2 = get_path(current_pos(arm), new_cube, MAX_HEIGHT_TRAJECTORY, rng)
-    d2 = get_durations(current_pos(arm), new_cube, EASE_IN, EASE_OUT)
+    after = current_pos(arm)
+    h2 = _arc_height(_chord_len(after, new_cube), d_max)
+    p2 = get_path(after, new_cube, h2, rng)
+    d2 = get_durations(after, new_cube, h2, EASE_IN, EASE_OUT)
     if not _send_arc(arm, p2, d2, "  nudge re-approach"):
         return False
 
@@ -402,8 +437,9 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs):
     nxt = ci + 1
     if nxt < len(segments) and segments[nxt]["kind"] == "carry":
         segments[nxt]["origin"] = new_cube
-        paths[nxt] = get_path(new_cube, segments[nxt]["target"], MAX_HEIGHT_TRAJECTORY, rng)
-        all_durs[nxt] = get_durations(new_cube, segments[nxt]["target"], EASE_IN, EASE_OUT)
+        hc = _arc_height(_chord_len(new_cube, segments[nxt]["target"]), d_max)
+        paths[nxt] = get_path(new_cube, segments[nxt]["target"], hc, rng)
+        all_durs[nxt] = get_durations(new_cube, segments[nxt]["target"], hc, EASE_IN, EASE_OUT)
     return True
 
 
@@ -429,9 +465,13 @@ def preflight(arm, segments, paths):
     for name, (x, y, z) in checks:
         pl = arm.plan_coords(x=x, y=y, z=z, rx=rx, ry=ry, rz=rz,
                              speed=config.DEFAULT_SPEED_CM_S)
+        err = (pl.error or "").lower()
         if pl.ok:
             print(f"  OK  {name:14s} ({x:5.1f},{y:6.1f},{z:4.1f})  "
                   f"peak {pl.peak_joint_dps:.0f} deg/s")
+        elif "already at" in err:
+            # planning a move to the current pose -- reachable, just no motion
+            print(f"  OK  {name:14s} ({x:5.1f},{y:6.1f},{z:4.1f})  (already there)")
         else:
             print(f"  BAD {name:14s} ({x:5.1f},{y:6.1f},{z:4.1f})  {pl.error}")
             bad += 1
@@ -491,13 +531,19 @@ def main():
 
     segments = _build_segments(order, home_tip)
 
+    # the widest move sets the shared parabola; every shorter arc lifts less
+    d_max = max((_chord_len(s["origin"], s["target"]) for s in segments), default=1.0) or 1.0
+    print(f"widest move {d_max:.1f} cm -> apex {MAX_HEIGHT_TRAJECTORY:.1f} cm  "
+          f"(shared parabola a = {-MAX_HEIGHT_TRAJECTORY / (d_max / 2.0) ** 2:.4f})")
+
     # ---- precompute every arc + its durations --------------------------------
     paths, all_durs = [], []
     for seg in segments:
         ei = EASE_IN + float(rng.uniform(-1.0, 1.0)) * EASE_JITTER * VARIATION
         eo = EASE_OUT + float(rng.uniform(-1.0, 1.0)) * EASE_JITTER * VARIATION
-        paths.append(get_path(seg["origin"], seg["target"], MAX_HEIGHT_TRAJECTORY, rng))
-        all_durs.append(get_durations(seg["origin"], seg["target"], ei, eo))
+        h = _arc_height(_chord_len(seg["origin"], seg["target"]), d_max)
+        paths.append(get_path(seg["origin"], seg["target"], h, rng))
+        all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo))
 
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
     try:
@@ -526,7 +572,7 @@ def main():
 
             if kind == "leadout":
                 print(f"\n=== lead-out arc -> HOME ===")
-                time.sleep(0.5)
+                time.sleep(LEADOUT_PAUSE_S)
                 _send_arc(arm, pts, durs, "lead-out")
                 break
 
@@ -536,7 +582,7 @@ def main():
                   f"cube #{seg['k'] + 1}  -> {tuple(round(v, 1) for v in seg['target'])} ===")
 
             if kind == "reach" and ci == NUDGE_CYCLE:
-                if not run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs):
+                if not run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
                     print("\naborting run."); go_home(arm); return 1
                 if not _grip(arm, GRIP_CLOSED_DEG, "close on cube (new position)"):
                     return 1

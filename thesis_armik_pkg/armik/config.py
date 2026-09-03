@@ -162,7 +162,7 @@ JOINT_LIMIT_MARGIN_DEG = 3.0
 
 # Conservative per-joint ceiling, deg/s. Measure these rather than trusting them.
 #MAX_JOINT_SPEED_DPS = [110.0, 110.0, 110.0, 130.0, 130.0, 150.0]
-MAX_JOINT_SPEED_DPS = [240.0, 240.0, 240.0, 300.0, 300.0, 350.0]
+MAX_JOINT_SPEED_DPS = [250.0, 250.0, 250.0, 300.0, 300.0, 350.0]
 
 # ---------------------------------------------------------------------------
 # Jerk injection -- DELIBERATE jitter (armik/jerk.py; arm.jerk / .random_twitch

@@ -70,16 +70,16 @@ RANDOM_SEED = None                # int for a repeatable run, None for fresh eac
 # -- cubes (MEASURE AND REPLACE) ----------------------------------------------
 # (x, y, z) CM, at the GRIPPER TIP, base frame, z from the table.
 CUBES_INITIAL_POINTS = [          # a row on the pick side
-    (15.0,  5.0, 4.0),
-    (15.0,  9.0, 4.0),
-    (15.0, 13.0, 4.0),
-    (15.0, 17.0, 4.0),
+    (15.0, 10.0, 0.0),
+    (15.0, 13.0, 0.0),
+    (15.0, 16.0, 0.0),
+    (15.0, 19.0, 0.0),
 ]
 CUBES_TARGET_POINTS = [           # deterministic, deliberately uneven drop points
-    (14.0,  -6.0, 4.0),
-    (16.5, -10.5, 4.5),
-    (13.0, -15.0, 4.0),
-    (15.5, -19.0, 3.5),
+    (15.0, -10.0, 0.0),
+    (15.0, -13.0, 0.5),
+    (15.0, -16.0, 0.0),
+    (15.0, -19.0, 0.5),
 ]
 
 # Gripper orientation (rx, ry, rz DEG) held for EVERY move so the gripper stays
@@ -92,35 +92,35 @@ PICK_ORIENTATION_DEG = (180.0, 0.0, -45.0)
 # PICK_ORIENTATION_DEG -- with the gripper held straight down the arm runs out of
 # reach around z ~ 17-18 cm near the workspace edge, so keep this conservative.
 MAX_HEIGHT_TRAJECTORY = 15.0
-CRUISE_SPEED_CM_S = 14.0          # peak tip speed; the ease dials stretch the move time
-EASE_IN = 7.0                    # [0,10] start-of-move acceleration shape. 0 = abrupt,
-EASE_OUT = 8.0                   # [0,10] end-of-move deceleration shape.  10 = long, gentle S
+CRUISE_SPEED_CM_S = 25.0          # peak tip speed; the ease dials stretch the move time
+EASE_IN = 5.0                    # [0,10] start-of-move acceleration shape. 0 = abrupt,
+EASE_OUT = 5.0                   # [0,10] end-of-move deceleration shape.  10 = long, gentle S
 PATH_WAYPOINTS = 30              # samples per arc
 MIN_SEGMENT_S = 0.02
 
 # -- per-move variation ("never the same twice") -----------------------------
-VARIATION = 0.3                  # [0,1] master scale; 0 = identical arcs every run
-APEX_HEIGHT_JITTER_CM = 2.0      # +/- on MAX_HEIGHT_TRAJECTORY
-APEX_POS_JITTER = 0.12           # +/- of the apex position along the chord (0.5 = middle)
-BOW_JITTER_CM = 2.5             # +/- sideways bow, perpendicular to the chord
-EASE_JITTER = 1.5              # +/- on EASE_IN / EASE_OUT per move
+VARIATION = 0                  # [0,1] master scale; 0 = identical arcs every run
+APEX_HEIGHT_JITTER_CM = 0.0      # +/- on MAX_HEIGHT_TRAJECTORY
+APEX_POS_JITTER = 0.0           # +/- of the apex position along the chord (0.5 = middle)
+BOW_JITTER_CM = 0.0             # +/- sideways bow, perpendicular to the chord
+EASE_JITTER = 0.0              # +/- on EASE_IN / EASE_OUT per move
 
 # -- order ------------------------------------------------------------------------
 SHUFFLE_ORDER = True             # grab cubes in a random order (init<->target pairing kept)
 
 # -- scripted nudge / flinch ------------------------------------------------------
-NUDGE_CYCLE = 4                  # EVEN cycle index whose reach is interrupted; -1 disables
-NUDGE_OFFSET_CM = (2.0, -3.0, 0.0)   # where the nudged cube ends up (relative to its point)
+NUDGE_CYCLE = -1                  # EVEN cycle index whose reach is interrupted; -1 disables
+NUDGE_OFFSET_CM = (2.0, 0.0, 0.0)   # where the nudged cube ends up (relative to its point)
 NUDGE_AT_FRACTION = 0.6         # fraction of the reach arc completed before the recoil
-NUDGE_RECOIL_CM = 6.0           # how far the arm hops back
+NUDGE_RECOIL_CM = 10.0           # how far the arm hops back
 NUDGE_RECOIL_SPEED_CM_S = 25.0  # the recoil is fast
-NUDGE_RECOIL_JERK = 2.5        # brief arm.jerk on the recoil for a startled look (0 = clean)
+NUDGE_RECOIL_JERK = 0.0        # brief arm.jerk on the recoil for a startled look (0 = clean)
 NUDGE_SETTLE_S = 1.5           # pause after the recoil, "waiting for the cube to stop"
 
 # -- gripper ---------------------------------------------------------------------
 GRIP_OPEN_DEG = 110.0           # 0 = closed .. config.MAX_GRIPPER_DEG = full open
 GRIP_CLOSED_DEG = 25.0          # tune to the cube width
-GRIP_SPEED = config.GRIPPER_DEFAULT_SPEED
+GRIP_SPEED = 90  #config.GRIPPER_DEFAULT_SPEED
 GRIP_SETTLE_S = 0.8
 REACH_TOL_CM = 3.0             # has_reached_* tolerance, per axis
 

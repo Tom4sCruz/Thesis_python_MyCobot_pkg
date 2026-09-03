@@ -1,0 +1,62 @@
+'''
+import THINGS
+
+constants:
+
+CUBES_INITIAL_POINTS
+CUBES_TARGET_POINTS
+MAX_HEIGHT_TRAJECTORY
+EASE_IN # This is used for the initial acceleration. Its value has no physical meaning. It should be \in [0, 10].
+EASE_OUT # This is used for the initial acceleration. Its value has no physical meaning. It should be \in [0, 10].
+TRIGGER_BOXES # This should be a list like so: [[(x,y,z), (l,w,h), cycle_n], ...]. (x,y,z) represent the center coordinates of the box and (l,w,h) the length, width and height. 'cycle_n' is meant to serve as a condition, so that only on that cycle is this trigger box used, else: it is ignored.
+N_CYCLES = len(CUBES_INITIAL_POINTS) * 2 # Each represents a parabola. Ex.: If I have 1 cube, then there are 2 cycles: one to reach the cube and grab it, and another that is for placing the cube at the target position.
+HOME = [0, 0, -90, 0, 0, 0]
+
+functions:
+
+go_home() # This runs arm.move_joints(HOME)
+get_path(origin_point, target_point, max_height) # This should result in a arc (parabola).
+get_durations(origin_point, target_point, ease_in_accel=EASE_IN, ease_out_accel=EASE_OUT) # This function is used to get the durations based on the acceleration intended.
+is_in_trigger_box(end_effector_coords, cycle_n) # This should represent arm.get_coords()[:3], so only (x,y,z) are used
+has_reached_cube(end_effector_coords) # This is a simple function that checks if the end-effector is at a cube position. Returns True or False.
+has_reached_target(end_effector_coords) # This is a simple function that checks if the end-effector is at the target position. Returns True or False.
+current_pos() # This returns the end_effector_coords, i.e. arm.get_coords()[:3]
+
+main():
+
+    go_home()
+
+    # Path and Durations computation #
+
+    path = [send_path(current_pos(), CUBES_INITIAL_POINTS[0])]
+    durations = [get_durations(current_pos(), CUBES_INITIAL_POINTS[0])]
+    
+    prev_target = []
+    for cube_init, target in (CUBES_INITIAL_POINTS,CUBES_TARGET_POINTS):
+        if len(prev_target) != 0:
+            path.append(get_path(prev_target, cube_init))
+            durations.append(get_durations(prev_target, cube_init))
+
+        path.append(get_path(cube_init, target))
+        durations.append(get_durations(cube_init, target))
+
+        prev_target = target
+
+    path.append(get_path(CUBES_TARGET_POINTS[-1], get_coords(HOME)))
+    durations.append(get_durations(CUBES_TARGET_POINTS[-1], get_coords(HOME)))
+
+    # Real Path Execution #
+
+    for i in range(len(path)):
+        if i == len(path)-1:
+            time.sleep(0.5) # This is to add a delay between the final profile movement and the final HOME position.
+
+        arm.send_path(path[i], durations[i])
+        if i % 2 == 0:
+            if has_reached_cube():
+                arm.gripper_close()
+        else:
+            if has_reached_target():
+                arm.gripper_open()
+
+'''

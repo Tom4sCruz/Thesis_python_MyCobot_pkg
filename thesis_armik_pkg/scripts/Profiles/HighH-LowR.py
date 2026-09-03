@@ -49,6 +49,7 @@ _sys.path.insert(
 )
 
 import argparse
+import math
 import threading
 import time
 
@@ -62,7 +63,10 @@ from armik import Arm, config, pose_coords
 
 # -- run / connection -----------------------------------------------------------
 HOME = [0.0, 0.0, -90.0, 0.0, 0.0, 0.0]
-HOME_MOVE_S = 2.5
+HOME_MOVE_S = 2.5                  # minimum homing duration (short returns)
+HOME_RETURN_DPS = 35.0            # deg/s -- a big return gets proportionally MORE time so
+                                 # move_joints (no speed pre-check) does not outrun the
+                                 # servos and shake. Lower if the last homing still shakes.
 SETTLE_S = 0.3
 PREFLIGHT = True
 RANDOM_SEED = None                # int for a repeatable run, None for fresh each time
@@ -87,6 +91,15 @@ CUBES_TARGET_POINTS = [           # deterministic, deliberately uneven drop poin
 # arm.get_coords()[3:]  (this is in the current TOOL frame, config.TOOL_RPY_DEG).
 PICK_ORIENTATION_DEG = (180.0, 0.0, -45.0)
 
+# How the gripper YAW (rz) is handled -- rx/ry (pointing-down) are always held:
+#   "world" : rz fixed in the base frame (today's behaviour) -- J6 counter-rotates
+#             as J1 swings so the gripper keeps the same absolute heading.
+#   "base"  : rz follows the tip azimuth atan2(y, x) so J6 stays ~put as J1 turns
+#             (gripper heading fixed in J1's rotating frame, not the world's).
+#   "free"  : rz unconstrained -- IK keeps wrist motion minimal.
+ORIENT_LOCK = "world"
+ORIENT_LOCK_SIGN = 1.0            # flip to -1.0 if "base" yaws the gripper the wrong way
+
 # -- arc + velocity profile --------------------------------------------------
 # All arcs are pieces of ONE shared parabola  y = a*x^2 + c  (b = 0, symmetric
 # about the chord midpoint). The WIDEST move in the run rises to
@@ -100,6 +113,7 @@ PICK_ORIENTATION_DEG = (180.0, 0.0, -45.0)
 MAX_HEIGHT_TRAJECTORY = 15.0
 MIN_ARC_HEIGHT_CM = 2.0          # floor, so short moves still clear the table / other cubes
 CRUISE_SPEED_CM_S = 25.0          # peak tip speed; the ease dials stretch the move time
+LEADOUT_SPEED_CM_S = 10.0        # the final arc back toward HOME is slower / gentler
 EASE_IN = 5.0                    # [0,10] start-of-move acceleration shape. 0 = abrupt,
 EASE_OUT = 5.0                   # [0,10] end-of-move deceleration shape.  10 = long, gentle S
 PATH_WAYPOINTS = 30              # samples per arc
@@ -142,6 +156,8 @@ TRIGGER_BOXES = []
 
 N_CYCLES = len(CUBES_INITIAL_POINTS) * 2
 
+_AZ_REF = None                    # (x, y) tip position whose azimuth is rz's zero; set in main()
+
 
 # ===========================================================================
 # GEOMETRY / PROFILE HELPERS
@@ -150,6 +166,26 @@ N_CYCLES = len(CUBES_INITIAL_POINTS) * 2
 def _smootherstep(p):
     p = np.clip(p, 0.0, 1.0)
     return 6 * p ** 5 - 15 * p ** 4 + 10 * p ** 3
+
+
+def _yaw(pts_xy):
+    """rz for a run of waypoints, per ORIENT_LOCK. Returns a scalar (held), a
+    per-waypoint list, or None (free) -- send_path accepts all three."""
+    rz0 = PICK_ORIENTATION_DEG[2]
+    if ORIENT_LOCK == "free":
+        return None
+    if ORIENT_LOCK != "base":
+        return rz0
+    ax, ay = (_AZ_REF if _AZ_REF is not None else (1.0, 0.0))
+    az0 = math.degrees(math.atan2(ay, ax))
+    return [rz0 + ORIENT_LOCK_SIGN * (math.degrees(math.atan2(p[1], p[0])) - az0)
+            for p in pts_xy]
+
+
+def _yaw_one(xy):
+    """Scalar rz at a single point (for preflight / the recoil move)."""
+    r = _yaw([xy])
+    return r[0] if isinstance(r, list) else r
 
 
 def _polyline_points(verts, s_query):
@@ -225,7 +261,8 @@ def get_path(origin_point, target_point, arc_height, rng=None):
 
 
 def get_durations(origin_point, target_point, arc_height,
-                  ease_in_accel=EASE_IN, ease_out_accel=EASE_OUT):
+                  ease_in_accel=EASE_IN, ease_out_accel=EASE_OUT,
+                  cruise=CRUISE_SPEED_CM_S):
     """PATH_WAYPOINTS-1 segment durations (s) for the arc between the two points,
     shaped by the EASE_IN / EASE_OUT dials (0..10, no physical meaning)."""
     _, L = _parabola_points(origin_point, target_point, arc_height, None)
@@ -252,7 +289,7 @@ def get_durations(origin_point, target_point, arc_height,
     s = np.concatenate([[0.0], np.cumsum(0.5 * (v[1:] + v[:-1]) * np.diff(tau))])
     mean_v = float(s[-1])                     # == average of v over [0, 1]
     s_norm = s / s[-1]
-    T = L / max(CRUISE_SPEED_CM_S * mean_v, 1e-6)
+    T = L / max(cruise * mean_v, 1e-6)
 
     ss = np.linspace(0.0, 1.0, PATH_WAYPOINTS)
     tau_k = np.interp(ss, s_norm, tau)
@@ -295,7 +332,17 @@ def has_reached_target(end_effector_coords, target_xyz):
 # ===========================================================================
 
 def go_home(arm):
-    arm.move_joints(HOME, duration=HOME_MOVE_S)
+    """Homing move, with the duration scaled to the joint distance so a long
+    return from the far side is not crammed into HOME_MOVE_S (which makes
+    move_joints -- no speed pre-check -- outrun the servos and shake)."""
+    try:
+        dq = max(abs(a - b) for a, b in zip(arm.get_angles(), HOME))
+    except Exception:
+        dq = 0.0
+    dur = max(HOME_MOVE_S, dq / HOME_RETURN_DPS)
+    if dur > HOME_MOVE_S + 0.05:
+        print(f"  homing over {dur:.1f}s (joint travel {dq:.0f} deg)")
+    arm.move_joints(HOME, duration=dur)
 
 
 def _fire_gripper(arm, deg):
@@ -321,13 +368,13 @@ def _grip(arm, deg, label):
 
 def _send_arc(arm, pts, durs, label):
     """Blocking parabolic move. pts[0] is the implicit start (not sent)."""
-    rx, ry, rz = PICK_ORIENTATION_DEG
+    rx, ry = PICK_ORIENTATION_DEG[:2]
     if len(pts) < 2:
         print(f"  {label}: negligible, skipped")
         return True
     r = arm.send_path(
         x=[p[0] for p in pts[1:]], y=[p[1] for p in pts[1:]], z=[p[2] for p in pts[1:]],
-        rx=rx, ry=ry, rz=rz, durations=list(durs),
+        rx=rx, ry=ry, rz=_yaw(pts[1:]), durations=list(durs),
     )
     if not r:
         print(f"  {label}: send_path REFUSED -- {arm.last_error}")
@@ -354,9 +401,10 @@ class _PathThread(threading.Thread):
 def _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
     """Run the arc on a background thread and fire the gripper at t_fire so the
     arm never stops."""
-    rx, ry, rz = PICK_ORIENTATION_DEG
+    rx, ry = PICK_ORIENTATION_DEG[:2]
     kw = dict(x=[p[0] for p in pts[1:]], y=[p[1] for p in pts[1:]],
-              z=[p[2] for p in pts[1:]], rx=rx, ry=ry, rz=rz, durations=list(durs))
+              z=[p[2] for p in pts[1:]], rx=rx, ry=ry, rz=_yaw(pts[1:]),
+              durations=list(durs))
     th = _PathThread(arm, kw)
     t0 = time.perf_counter()
     th.start()
@@ -400,7 +448,7 @@ def _trigger_time(pts, durs, cycle_n):
 
 def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
     """Scripted flinch: approach part-way, recoil, wait, re-approach the moved cube."""
-    rx, ry, rz = PICK_ORIENTATION_DEG
+    rx, ry = PICK_ORIENTATION_DEG[:2]
     n = len(pts)
     cut = max(2, int(round(NUDGE_AT_FRACTION * (n - 1))) + 1)
     print(f"  NUDGE cycle {ci}: approaching to {int(NUDGE_AT_FRACTION*100)}% ...")
@@ -415,7 +463,8 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
     arm.jerk = NUDGE_RECOIL_JERK
     print(f"  RECOIL -> {np.round(recoil, 1).tolist()}  (jerk={arm.jerk})")
     ok = arm.send_coords(x=float(recoil[0]), y=float(recoil[1]), z=float(recoil[2]),
-                         rx=rx, ry=ry, rz=rz, speed=NUDGE_RECOIL_SPEED_CM_S)
+                         rx=rx, ry=ry, rz=_yaw_one((float(recoil[0]), float(recoil[1]))),
+                         speed=NUDGE_RECOIL_SPEED_CM_S)
     arm.jerk = 0.0
     if not ok:
         print(f"  recoil REFUSED -- {arm.last_error}")
@@ -448,7 +497,7 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
 # ===========================================================================
 
 def preflight(arm, segments, paths):
-    rx, ry, rz = PICK_ORIENTATION_DEG
+    rx, ry = PICK_ORIENTATION_DEG[:2]
     print("\n--- preflight: planning every cube point + arc apex (no motion) ---")
     checks = []
     for i, (s, t) in enumerate(zip(CUBES_INITIAL_POINTS, CUBES_TARGET_POINTS)):
@@ -463,7 +512,7 @@ def preflight(arm, segments, paths):
         checks.append((f"apex c{ci}", apex))
     bad = 0
     for name, (x, y, z) in checks:
-        pl = arm.plan_coords(x=x, y=y, z=z, rx=rx, ry=ry, rz=rz,
+        pl = arm.plan_coords(x=x, y=y, z=z, rx=rx, ry=ry, rz=_yaw_one((x, y)),
                              speed=config.DEFAULT_SPEED_CM_S)
         err = (pl.error or "").lower()
         if pl.ok:
@@ -523,7 +572,11 @@ def main():
     p_home = pose_coords(HOME)                       # mm/deg (Z_RELATIVE_TO_JOINT1 assumed False)
     home_tip = (p_home[0] / 10.0, p_home[1] / 10.0, p_home[2] / 10.0)
 
+    global _AZ_REF                                   # rz = PICK_ORIENTATION_DEG[2] at HOME's azimuth
+    _AZ_REF = (home_tip[0], home_tip[1])
+
     print(f"pick order (cube indices): {[int(k) for k in order]}")
+    print(f"orientation lock: {ORIENT_LOCK}")
     if 0 <= NUDGE_CYCLE < N_CYCLES:
         nudged_k = int(order[NUDGE_CYCLE // 2])
         print(f"NUDGE on cycle {NUDGE_CYCLE}: cube #{nudged_k + 1} "
@@ -541,9 +594,10 @@ def main():
     for seg in segments:
         ei = EASE_IN + float(rng.uniform(-1.0, 1.0)) * EASE_JITTER * VARIATION
         eo = EASE_OUT + float(rng.uniform(-1.0, 1.0)) * EASE_JITTER * VARIATION
+        cruise = LEADOUT_SPEED_CM_S if seg["kind"] == "leadout" else CRUISE_SPEED_CM_S
         h = _arc_height(_chord_len(seg["origin"], seg["target"]), d_max)
         paths.append(get_path(seg["origin"], seg["target"], h, rng))
-        all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo))
+        all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo, cruise=cruise))
 
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
     try:

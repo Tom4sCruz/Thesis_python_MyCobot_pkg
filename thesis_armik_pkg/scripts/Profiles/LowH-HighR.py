@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""
+MOVEMENT PROFILE: Low-human / High-robot
+=======================================
+
+Move cubes from one side of the frame to the other, the way a classic
+industrial robot would:
+
+  * ONE JOINT AT A TIME, with a hard stop and a short pause at each. The joint
+    ORDER depends on the waypoint's vertical direction (LOWER_JOINT_ORDER /
+    RAISE_JOINT_ORDER): descending onto a cube/target goes wrist J6..J3 then
+    J2 (shoulder) LAST, so the gripper drops straight down; lifting away /
+    traversing goes J2 first then wrist (J1..J6). Homing and the (disabled by
+    default) trigger-box mode still use plain J1..J6 via armik;
+  * a FAST CONSTANT joint speed (JOINT_SPEED_DPS), sharp corners, no blending;
+  * exactly the SAME trajectory every run -- nothing is randomised;
+  * cubes grabbed in a fixed order (PICK_ORDER, left -> right) and placed into
+    CUBES_TARGET_POINTS[k] in that order -- they end in a row;
+  * NO overshoot -- each joint is driven until it is within
+    config.SINGLE_JOINT_TOL_DEG of target, then stopped;
+  * one cube is NUDGED mid-run (scripted): the arm reaches for it, the cube
+    moves, the arm POINTS ITS GRIPPER at the new spot, holds a beat, then
+    IGNORES it -- that cube's carry is skipped and it is left behind
+    ("defective"). Fully scripted; the arm has no sensors.
+
+    python3 scripts/Profiles/LowH-HighR.py --mock --yes      # no hardware
+    python3 scripts/Profiles/LowH-HighR.py --port /dev/ttyTHS1
+
+Structure mirrors HighH-LowR.py (constants -> helpers -> precompute -> execute).
+armik's single-joint executor prints a line per servo poll -- the console is
+chatty; that is expected.
+
+Everything you tune is a CONSTANT below. The cube coordinates and
+PICK_ORIENTATION_DEG are PLACEHOLDERS -- measure them on your arm first.
+"""
+
+from __future__ import annotations
+
+import os as _os, sys as _sys
+# scripts/Profiles/ is two levels below the package root -> three dirname() calls
+_sys.path.insert(
+    0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+)
+
+import argparse
+import threading
+import time
+
+import numpy as np
+
+from armik import Arm, config, kinematics, pose_coords
+
+# ===========================================================================
+# CONSTANTS
+# ===========================================================================
+
+# -- run / connection -----------------------------------------------------------
+HOME = [0.0, 0.0, -90.0, 0.0, 0.0, 0.0]
+SETTLE_S = 0.3
+PREFLIGHT = True
+
+# -- cubes (MEASURE AND REPLACE) ----------------------------------------------
+# (x, y, z) CM, at the GRIPPER TIP, base frame, z from the table.
+CUBES_INITIAL_POINTS = [          # a row on the pick side, LISTED LEFT -> RIGHT
+    (15.0, 10.0, 0.0),
+    (15.0, 13.0, 0.0),
+    (15.0, 16.0, 0.0),
+    (15.0, 19.0, 0.0),
+]
+CUBES_TARGET_POINTS = [           # the drop row; cube picked k-th goes to slot k
+    (15.0, -10.0, 0.0),
+    (15.0, -13.0, 0.0),
+    (15.0, -16.0, 0.0),
+    (15.0, -19.0, 0.0),
+]
+
+# Gripper orientation (rx, ry, rz DEG) held for EVERY move. CALIBRATION: jog to
+# gripper-straight-down, read arm.get_coords()[3:] (current TOOL frame).
+PICK_ORIENTATION_DEG = (180.0, 0.0, -45.0)
+
+APPROACH_HEIGHT_CM = 6.0          # hover height above a cube before descending
+
+# -- robotic motion --------------------------------------------------------------
+JOINT_SPEED_DPS = 60.0           # fast, CONSTANT deg/s for every single-joint move and
+                                # for homing (clamped per joint to config.MAX_JOINT_SPEED_DPS)
+SEG_PLAN_S = 4.0               # generous per-waypoint duration handed to send_path ONLY so
+                              # its blended pre-check passes; single-joint execution ignores it
+DELAY_BETWEEN_JOINTS_S = 0.10  # -> config.SINGLE_JOINT_DELAY            (armik default 0.15)
+DELAY_BETWEEN_POINTS_S = 0.30  # -> config.SINGLE_JOINT_DELAY_BETWEEN_POINTS (default 2.0!)
+# --rviz ONLY (mock, no hardware): pace the single-joint motion so RViz can show
+# each joint rotating fully to a stop before the next one starts. Physical runs
+# (no --rviz) keep the fast DELAY_* values above. Keep RVIZ_JOINT_MOVE_S larger
+# than _rviz_bridge.VIZ_SEQ_MOVE_S; change both together to re-speed the viz.
+RVIZ_JOINT_MOVE_S = 1.0
+RVIZ_BETWEEN_POINTS_S = 0.5
+
+# grab order -- deterministic. Arrange CUBES_INITIAL_POINTS left->right, or set
+# explicit indices here.
+PICK_ORDER = list(range(len(CUBES_INITIAL_POINTS)))
+
+# -- joint order per waypoint direction (1-based ids) ------------------------
+# armik's single-joint executor is fixed J1..J6; _send_ordered() below picks one
+# of these per waypoint, from whether that waypoint goes DOWN or UP/across.
+LOWER_JOINT_ORDER = (1, 6, 5, 4, 3, 2)   # descending onto a cube/target: J1 (a
+                                         # no-op here), wrist J6..J3, then J2
+                                         # (shoulder) LAST -> a clean vertical drop
+RAISE_JOINT_ORDER = (1, 2, 3, 4, 5, 6)   # lifting away / traversing: J2 FIRST
+                                         # (up), then wrist -- armik's default order
+
+# -- scripted nudge ("defective cube") ------------------------------------------
+NUDGE_CYCLE = -1                # EVEN (reach) cycle index whose cube is nudged; -1 = off
+NUDGE_OFFSET_CM = (3.0, 0.0, 0.0)   # where the nudged cube ends up
+NUDGE_POINT_TILT_DEG = 25.0    # pitch the gripper this far off straight-down, toward the cube
+NUDGE_AIM_SPEED_DPS = 40.0     # deg/s for the "point at it" move
+NUDGE_LOOK_S = 1.5            # hold the "regarding it" pose before moving on
+
+# -- gripper ---------------------------------------------------------------------
+GRIP_OPEN_DEG = 110.0          # 0 = closed .. config.MAX_GRIPPER_DEG = full open
+GRIP_CLOSED_DEG = 25.0         # tune to the cube width
+GRIP_SPEED = 90  #config.GRIPPER_DEFAULT_SPEED
+GRIP_SETTLE_S = 0.35          # quiet time after a gripper command: it must LAND and the jaws
+                             # start moving. Tunable down to GRIP_MIN_GAP_S, not below.
+GRIP_MIN_GAP_S = 0.2         # hard floor -- pymycobot drops a gripper command with no quiet gap
+REACH_TOL_CM = 3.0            # has_reached_* tolerance, per axis
+
+# -- gripper trigger boxes (optional, experimental in single-joint mode) --------
+# [[(cx,cy,cz), (l,w,h), cycle_n], ...] -- on cycle cycle_n the gripper fires the
+# moment the tip enters this box (that cycle runs on a background thread, polled
+# live). Empty -> gripper fires at the cycle end. Single-joint timing is
+# unpredictable so the fire point is position-based, not time-based.
+TRIGGER_BOXES = []
+
+
+# ===========================================================================
+# GEOMETRY HELPERS
+# ===========================================================================
+
+def _approach(p):
+    return (p[0], p[1], p[2] + APPROACH_HEIGHT_CM)
+
+
+def get_path(origin_point, target_point):
+    """Straight waypoints for one move: traverse over the target, then descend
+    onto it. `origin_point` is unused -- _send_staccato() prepends a live lift
+    waypoint, so nothing depends on the precomputed start."""
+    return [tuple(map(float, _approach(target_point))), tuple(map(float, target_point))]
+
+
+def get_durations(pts):
+    """Planning-only per-waypoint durations (single-joint execution ignores them)."""
+    return [SEG_PLAN_S] * len(pts)
+
+
+# ===========================================================================
+# STATE CHECKS
+# ===========================================================================
+
+def current_pos(arm):
+    return tuple(float(v) for v in arm.get_coords()[:3])
+
+
+def _within(xyz, centre, half_extents):
+    d = np.abs(np.asarray(xyz, float) - np.asarray(centre, float))
+    return bool(np.all(d <= np.asarray(half_extents, float)))
+
+
+def is_in_trigger_box(end_effector_coords, cycle_n):
+    for entry in TRIGGER_BOXES:
+        centre, dims, cyc = entry
+        if cyc == cycle_n and _within(end_effector_coords, centre,
+                                      np.asarray(dims, float) / 2.0):
+            return True
+    return False
+
+
+def _has_trigger(cycle_n):
+    return any(cyc == cycle_n for _, _, cyc in TRIGGER_BOXES)
+
+
+def has_reached_cube(end_effector_coords, cube_xyz):
+    return _within(end_effector_coords, cube_xyz, (REACH_TOL_CM,) * 3)
+
+
+def has_reached_target(end_effector_coords, target_xyz):
+    return _within(end_effector_coords, target_xyz, (REACH_TOL_CM,) * 3)
+
+
+# ===========================================================================
+# MOTION
+# ===========================================================================
+
+def go_home(arm):
+    """Robotic homing -- drive J1..J6 to their HOME values ONE AT A TIME."""
+    for j in range(1, config.DOF + 1):
+        tgt = float(HOME[j - 1])
+        cur = float(arm.get_angles()[j - 1])
+        if abs(tgt - cur) <= config.SINGLE_JOINT_TOL_DEG:
+            continue
+        arm.conn.send_angle(j, tgt, JOINT_SPEED_DPS)
+        arm._wait_for_joint(j, tgt)
+        time.sleep(config.SINGLE_JOINT_DELAY)
+
+
+def _fire_gripper(arm, deg):
+    """Send the gripper command twice with a tiny gap -- pymycobot drops a
+    gripper packet that is not followed by a short quiet window."""
+    ok = arm.send_gripper(deg, speed=GRIP_SPEED)
+    time.sleep(0.06)
+    arm.send_gripper(deg, speed=GRIP_SPEED)
+    return bool(ok)
+
+
+def _grip(arm, deg, label):
+    print(f"  gripper -> {deg:.0f} deg ({label})")
+    if not _fire_gripper(arm, deg):
+        print(f"  send_gripper REFUSED -- {arm.last_error}")
+        return False
+    if GRIP_SETTLE_S < GRIP_MIN_GAP_S:
+        print(f"  (GRIP_SETTLE_S {GRIP_SETTLE_S}s < floor {GRIP_MIN_GAP_S}s -- using the floor)")
+    time.sleep(max(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S) - 0.06, 0.0))
+    return True
+
+
+def _staccato_kw(arm, pts):
+    """send_path kwargs for a joint-by-joint move through `pts`, with a live
+    lift waypoint prepended."""
+    sent = [_approach(current_pos(arm))] + [tuple(map(float, p)) for p in pts]
+    rx, ry, rz = PICK_ORIENTATION_DEG
+    return sent, dict(
+        x=[p[0] for p in sent], y=[p[1] for p in sent], z=[p[2] for p in sent],
+        rx=rx, ry=ry, rz=rz, speed=JOINT_SPEED_DPS, durations=[SEG_PLAN_S] * len(sent),
+    )
+
+
+def _send_staccato(arm, pts, label):
+    """Blocking one-joint-at-a-time move: lift -> traverse -> ... -> descend.
+    Uses armik's fixed J1..J6 order (kept for the trigger-box path)."""
+    sent, kw = _staccato_kw(arm, pts)
+    r = arm.send_path(**kw)
+    if not r:
+        print(f"  {label}: send_path REFUSED -- {arm.last_error}")
+        return False
+    ex = arm.last_execution
+    print(f"  {label}: {len(sent)} waypoints, {ex.duration_s:.1f}s, {ex.setpoints} joint moves")
+    return True
+
+
+def _send_ordered(arm, pts, label):
+    """One-joint-at-a-time move through `pts`, driving the joints in
+    LOWER_JOINT_ORDER for waypoints that go DOWN and RAISE_JOINT_ORDER for
+    waypoints that go up / across, instead of armik's fixed J1..J6. Mirrors
+    armik._execute_single_joint: IK-plan every waypoint (no motion), then step
+    each joint to its planned angle -- skipping joints already within
+    SINGLE_JOINT_TOL_DEG -- one servo at a time, honouring the same delays."""
+    sent, kw = _staccato_kw(arm, pts)
+    pl = arm.plan_path(**kw)                          # IK only, no motion
+    if not pl.ok:
+        print(f"  {label}: plan_path REFUSED -- {pl.error}")
+        return False
+    seg_q = pl.segment_q                              # [q0, wp1, wp2, ...] degrees
+    cur_tip_z = sent[0][2] - APPROACH_HEIGHT_CM       # tip z before the prepended lift
+    orders = []
+    for wi in range(1, len(seg_q)):
+        z_now = sent[wi - 1][2]
+        z_prev = sent[wi - 2][2] if wi >= 2 else cur_tip_z
+        order = LOWER_JOINT_ORDER if z_now < z_prev - 0.5 else RAISE_JOINT_ORDER
+        orders.append("lower" if order is LOWER_JOINT_ORDER else "raise")
+        target = [float(v) for v in seg_q[wi]]
+        cur = [float(v) for v in arm.get_angles()]
+        for j in order:
+            if abs(target[j - 1] - cur[j - 1]) <= config.SINGLE_JOINT_TOL_DEG:
+                continue
+            cand = list(cur)
+            cand[j - 1] = target[j - 1]
+            be = kinematics.check_workspace_bounds(
+                kinematics.forward_kinematics(np.asarray(cand, float))[:3, 3])
+            if be is not None:
+                print(f"  {label}: J{j} refused -- {be}")
+                return False
+            arm.conn.send_angle(j, target[j - 1], JOINT_SPEED_DPS)
+            arm._wait_for_joint(j, target[j - 1])
+            cur[j - 1] = target[j - 1]
+            time.sleep(config.SINGLE_JOINT_DELAY)
+        if wi < len(seg_q) - 1:
+            time.sleep(config.SINGLE_JOINT_DELAY_BETWEEN_POINTS)
+    print(f"  {label}: {len(sent)} waypoints [{', '.join(orders)}]")
+    return True
+
+
+class _PathThread(threading.Thread):
+    def __init__(self, arm, kw):
+        super().__init__(daemon=True)
+        self.arm, self.kw = arm, kw
+        self.result, self.exc = None, None
+
+    def run(self):
+        try:
+            self.result = self.arm.send_path(**self.kw)
+        except BaseException as exc:                       # noqa: BLE001
+            self.exc, self.result = exc, 0
+
+
+def _send_staccato_with_trigger(arm, pts, cycle_n, grip_deg, label):
+    """Run the move on a background thread; fire the gripper the first time the
+    tip is inside an active trigger box for this cycle (position-polled)."""
+    _sent, kw = _staccato_kw(arm, pts)
+    th = _PathThread(arm, kw)
+    th.start()
+    fired = False
+    while th.is_alive():
+        if not fired and th.exc is None:
+            try:
+                if is_in_trigger_box(current_pos(arm), cycle_n):
+                    print(f"  {label}: trigger box entered -> gripper {grip_deg:.0f}")
+                    _fire_gripper(arm, grip_deg)
+                    fired = True
+            except Exception:
+                pass
+        time.sleep(0.05)
+    th.join()
+    if th.exc is not None:
+        raise th.exc
+    if not th.result:
+        print(f"  {label}: send_path (threaded) REFUSED -- {arm.last_error}")
+        return False
+    if not fired:
+        print(f"  {label}: box not entered -- firing gripper {grip_deg:.0f} now")
+        _fire_gripper(arm, grip_deg)
+    time.sleep(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S))
+    return True
+
+
+def run_nudge(arm, seg, ci, segments):
+    """Scripted 'defective cube': reach, the cube moves, point the gripper at
+    its new spot, hold, then IGNORE it (its carry is skipped)."""
+    rx0, ry0, rz0 = PICK_ORIENTATION_DEG
+    print(f"  NUDGE cycle {ci}: reaching for cube #{seg['k']+1} ...")
+    if not _send_ordered(arm, [_approach(seg["target"])], "  nudge reach (hover)"):
+        return False
+
+    new_cube = tuple(float(c + o) for c, o in zip(seg["target"], NUDGE_OFFSET_CM))
+    aim = _approach(new_cube)
+    print(f"  cube moved to {tuple(round(v, 1) for v in new_cube)} -- "
+          f"pointing the gripper at it, then ignoring it")
+    r = arm.send_path(x=[float(aim[0])], y=[float(aim[1])], z=[float(aim[2])],
+                      rx=rx0, ry=ry0 + NUDGE_POINT_TILT_DEG, rz=rz0,
+                      speed=NUDGE_AIM_SPEED_DPS, durations=[SEG_PLAN_S])
+    if not r:
+        print(f"  aim REFUSED -- {arm.last_error}")
+        return False
+    time.sleep(NUDGE_LOOK_S)
+
+    nxt = ci + 1
+    if nxt < len(segments) and segments[nxt]["kind"] == "carry":
+        segments[nxt]["kind"] = "skip"
+    return True
+
+
+# ===========================================================================
+# PREFLIGHT
+# ===========================================================================
+
+def preflight(arm, segments):
+    rx, ry, rz = PICK_ORIENTATION_DEG
+    print("\n--- preflight: planning every cube point (no motion) ---")
+    checks = []
+    for i, (s, t) in enumerate(zip(CUBES_INITIAL_POINTS, CUBES_TARGET_POINTS)):
+        checks += [(f"init{i+1}", s), (f"init{i+1}^", _approach(s)),
+                   (f"tgt{i+1}", t), (f"tgt{i+1}^", _approach(t))]
+    if 0 <= NUDGE_CYCLE < len(segments):
+        nc = tuple(c + o for c, o in zip(segments[NUDGE_CYCLE]["target"], NUDGE_OFFSET_CM))
+        checks.append(("nudge^", _approach(nc)))
+    bad = 0
+    for name, (x, y, z) in checks:
+        pl = arm.plan_coords(x=x, y=y, z=z, rx=rx, ry=ry, rz=rz,
+                             speed=config.DEFAULT_SPEED_CM_S)
+        err = (pl.error or "").lower()
+        if pl.ok:
+            print(f"  OK  {name:10s} ({x:5.1f},{y:6.1f},{z:4.1f})  "
+                  f"peak {pl.peak_joint_dps:.0f} deg/s")
+        elif "already at" in err:
+            print(f"  OK  {name:10s} ({x:5.1f},{y:6.1f},{z:4.1f})  (already there)")
+        else:
+            print(f"  BAD {name:10s} ({x:5.1f},{y:6.1f},{z:4.1f})  {pl.error}")
+            bad += 1
+    print(f"--- preflight: {len(checks) - bad}/{len(checks)} reachable ---")
+    return bad == 0
+
+
+# ===========================================================================
+# MAIN
+# ===========================================================================
+
+def _build_segments(order, home_tip):
+    segs = []
+    prev_target = home_tip
+    for k in order:
+        segs.append({"kind": "reach", "origin": prev_target,
+                     "target": CUBES_INITIAL_POINTS[k], "k": int(k)})
+        segs.append({"kind": "carry", "origin": CUBES_INITIAL_POINTS[k],
+                     "target": CUBES_TARGET_POINTS[k], "k": int(k)})
+        prev_target = CUBES_TARGET_POINTS[k]
+    return segs
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--port", default=config.DEFAULT_PORT)
+    ap.add_argument("--baud", type=int, default=config.DEFAULT_BAUDRATE)
+    ap.add_argument("--mock", action="store_true")
+    ap.add_argument("--rviz", action="store_true",
+                    help="mock only: stream the simulated pose + precomputed path to RViz2 "
+                         "(needs rclpy; run inside the Study-docker container)")
+    ap.add_argument("--yes", action="store_true", help="skip the safety prompt")
+    args = ap.parse_args()
+
+    if args.rviz and not args.mock:
+        print("--rviz is mock-only; ignoring it (add --mock to visualize).")
+        args.rviz = False
+
+    if len(CUBES_INITIAL_POINTS) != len(CUBES_TARGET_POINTS):
+        print("CUBES_INITIAL_POINTS and CUBES_TARGET_POINTS must be the same length.")
+        return 1
+    if NUDGE_CYCLE >= 0 and NUDGE_CYCLE % 2 != 0:
+        print(f"NUDGE_CYCLE must be an EVEN (reach) cycle, got {NUDGE_CYCLE}.")
+        return 1
+
+    if not args.mock and not args.yes:
+        print("This will move the robot arm and actuate the gripper. Clear the workspace.")
+        if input("Type 'go' to continue: ").strip().lower() != "go":
+            return 1
+
+    config.SINGLE_JOINT_DELAY = DELAY_BETWEEN_JOINTS_S
+    config.SINGLE_JOINT_DELAY_BETWEEN_POINTS = DELAY_BETWEEN_POINTS_S
+    if args.rviz:                       # mock-only: slow so RViz shows one joint at a time
+        config.SINGLE_JOINT_DELAY = RVIZ_JOINT_MOVE_S
+        config.SINGLE_JOINT_DELAY_BETWEEN_POINTS = RVIZ_BETWEEN_POINTS_S
+
+    order = list(PICK_ORDER)
+    p_home = pose_coords(HOME)                       # mm/deg (Z_RELATIVE_TO_JOINT1 assumed False)
+    home_tip = (p_home[0] / 10.0, p_home[1] / 10.0, p_home[2] / 10.0)
+
+    print(f"pick order (cube indices): {order}")
+    segments = _build_segments(order, home_tip)
+    if 0 <= NUDGE_CYCLE < len(segments):
+        nk = segments[NUDGE_CYCLE]["k"]
+        print(f"NUDGE on cycle {NUDGE_CYCLE}: cube #{nk + 1} at {CUBES_INITIAL_POINTS[nk]} "
+              f"-- nudge THAT cube as the arm nears it; its carry is skipped")
+
+    paths = [get_path(s["origin"], s["target"]) for s in segments]
+
+    arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
+
+    bridge = None
+    if args.rviz:
+        from _rviz_bridge import RvizBridge
+        # polyline the EE actually traces: from HOME, then per segment
+        # lift-over-origin -> hover-over-target -> descend (mirrors _staccato_kw)
+        flat_path = [tuple(map(float, home_tip))]
+        for s in segments:
+            flat_path += [tuple(map(float, _approach(s["origin"]))),
+                          tuple(map(float, _approach(s["target"]))),
+                          tuple(map(float, s["target"]))]
+        cube_pts = [tuple(map(float, c)) for c in CUBES_INITIAL_POINTS]
+        try:
+            bridge = RvizBridge(arm.get_angles, path_xyz_cm=flat_path,
+                                cube_points=cube_pts, tip_source=arm.get_coords,
+                                gripper_source=arm.get_gripper_value,
+                                sequential_joints=True)
+            bridge.start()
+            print("RViz bridge up: publishing /joint_states + /visualization_marker")
+        except RuntimeError as exc:
+            print(exc)
+            bridge = None
+
+    try:
+        if not arm.conn.is_power_on():
+            print("powering on...")
+            arm.conn.power_on()
+            time.sleep(1.5)
+
+        arm.set_single_joint(1)
+        print("homing (one joint at a time)...")
+        go_home(arm)
+        time.sleep(SETTLE_S)
+        print(f"start pose (tip, cm/deg): {[round(v, 2) for v in arm.get_coords()]}")
+
+        if PREFLIGHT and not preflight(arm, segments):
+            print("\npreflight failed -- fix the cube coordinates or PICK_ORIENTATION_DEG. "
+                  "Nothing moved.")
+            go_home(arm)
+            return 1
+
+        if not _grip(arm, GRIP_OPEN_DEG, "open before first pick"):
+            return 1
+
+        for ci, seg in enumerate(segments):
+            kind = seg["kind"]
+
+            if kind == "skip":
+                print(f"\n=== cycle {ci}  cube #{seg['k'] + 1} -- DEFECTIVE, carry skipped ===")
+                continue
+
+            grip_deg = GRIP_CLOSED_DEG if kind == "reach" else GRIP_OPEN_DEG
+            label = "reach & grasp" if kind == "reach" else "carry & place"
+            print(f"\n=== cycle {ci}/{len(segments) - 1}  {label}  cube #{seg['k'] + 1}  "
+                  f"-> {tuple(round(v, 1) for v in seg['target'])} ===")
+
+            if kind == "reach" and ci == NUDGE_CYCLE:
+                if not run_nudge(arm, seg, ci, segments):
+                    print("\naborting run."); go_home(arm); return 1
+                continue
+
+            pts = paths[ci]
+            if _has_trigger(ci):
+                if not _send_staccato_with_trigger(arm, pts, ci, grip_deg, label):
+                    print("\naborting run."); go_home(arm); return 1
+                continue
+
+            if not _send_ordered(arm, pts, label):
+                print("\naborting run."); go_home(arm); return 1
+
+            cur = current_pos(arm)
+            reached = (has_reached_cube(cur, seg["target"]) if kind == "reach"
+                       else has_reached_target(cur, seg["target"]))
+            if reached:
+                if not _grip(arm, grip_deg,
+                             "close on cube" if kind == "reach" else "release cube"):
+                    return 1
+            else:
+                print(f"  !! tip at {tuple(round(v, 2) for v in cur)}, expected "
+                      f"{tuple(round(v, 1) for v in seg['target'])} +/- {REACH_TOL_CM} cm "
+                      f"-- gripper NOT fired")
+
+        print("\ndone. homing...")
+        go_home(arm)
+        return 0
+
+    except KeyboardInterrupt:
+        print("\nCtrl+C -- stopping the arm.")
+        arm.stop()
+        return 1
+    finally:
+        if bridge is not None:
+            bridge.stop()
+        try:
+            arm.set_single_joint(0)
+        except Exception:
+            pass
+        arm.close()
+
+
+if __name__ == "__main__":
+    _sys.exit(main())

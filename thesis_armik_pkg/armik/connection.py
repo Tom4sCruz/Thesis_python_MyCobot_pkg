@@ -292,6 +292,21 @@ class ArmConnection:
                 log.debug("is_gripper_moving failed: %s", exc)
                 return False
 
+    def get_gripper_value(self, gripper_type: int | None = None) -> int | None:
+        """Current gripper opening 0-100 (0 closed, 100 open), or None if the
+        device did not report one. Thin wrapper over pymycobot's
+        get_gripper_value under the shared serial lock."""
+        with self._lock:
+            try:
+                if gripper_type is None:
+                    v = self._mc.get_gripper_value()
+                else:
+                    v = self._mc.get_gripper_value(gripper_type)
+            except Exception as exc:
+                log.debug("get_gripper_value failed: %s", exc)
+                return None
+        return int(v) if v is not None else None
+
     def close(self):
         try:
             self.stop()

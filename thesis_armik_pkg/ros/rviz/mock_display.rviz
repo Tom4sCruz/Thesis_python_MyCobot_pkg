@@ -1,0 +1,127 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /RobotModel1
+        - /Marker1
+      Splitter Ratio: 0.5
+    Tree Height: 640
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Value: true
+      Alpha: 0.5
+      Color: 160; 160; 164
+      Cell Size: 0.1
+      Plane: XY
+      Plane Cell Count: 20
+      Normal Cell Count: 0
+      Line Style:
+        Line Width: 0.02
+        Value: Lines
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Enabled: true
+      Visual Enabled: true
+      Collision Enabled: false
+      Alpha: 1
+      Description Source: Topic
+      Description Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /robot_description
+      Mass Properties:
+        Inertia: false
+        Mass: false
+      Links:
+        All Links Enabled: true
+        Expand Joint Details: false
+        Expand Link Details: false
+        Expand Tree: false
+        Link Tree Style: Links in Alphabetic Order
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Value: true
+      Marker Scale: 0.3
+      Show Arrows: false
+      Show Axes: true
+      Show Names: false
+      Frame Timeout: 15
+      Update Interval: 0
+      Frames:
+        All Enabled: true
+    - Class: rviz_default_plugins/Marker
+      Name: Marker
+      Enabled: true
+      Value: true
+      Namespaces:
+        {}
+      Topic:
+        Depth: 100
+        Durability Policy: Volatile
+        Filter size: 100
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /visualization_marker
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: joint1
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 1.1
+      Yaw: 0.75
+      Pitch: 0.45
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0.2
+      Target Frame: <Fixed Frame>
+      Near Clip Distance: 0.01
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 820
+  Width: 1280
+  Selection:
+    collapsed: false
+  Tool Properties:
+    collapsed: false
+  Views:
+    collapsed: false
+  Hide Left Dock: false
+  Hide Right Dock: false

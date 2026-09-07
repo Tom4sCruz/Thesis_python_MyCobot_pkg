@@ -550,8 +550,15 @@ def main():
     ap.add_argument("--port", default=config.DEFAULT_PORT)
     ap.add_argument("--baud", type=int, default=config.DEFAULT_BAUDRATE)
     ap.add_argument("--mock", action="store_true")
+    ap.add_argument("--rviz", action="store_true",
+                    help="mock only: stream the simulated pose + precomputed path to RViz2 "
+                         "(needs rclpy; run inside the Study-docker container)")
     ap.add_argument("--yes", action="store_true", help="skip the safety prompt")
     args = ap.parse_args()
+
+    if args.rviz and not args.mock:
+        print("--rviz is mock-only; ignoring it (add --mock to visualize).")
+        args.rviz = False
 
     if len(CUBES_INITIAL_POINTS) != len(CUBES_TARGET_POINTS):
         print("CUBES_INITIAL_POINTS and CUBES_TARGET_POINTS must be the same length.")
@@ -600,6 +607,22 @@ def main():
         all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo, cruise=cruise))
 
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
+
+    bridge = None
+    if args.rviz:
+        from _rviz_bridge import RvizBridge
+        flat_path = [tuple(map(float, p)) for seg_pts in paths for p in seg_pts]
+        cube_pts = [tuple(map(float, c)) for c in CUBES_INITIAL_POINTS]
+        try:
+            bridge = RvizBridge(arm.get_angles, path_xyz_cm=flat_path,
+                                cube_points=cube_pts, tip_source=arm.get_coords,
+                                gripper_source=arm.get_gripper_value)
+            bridge.start()
+            print("RViz bridge up: publishing /joint_states + /visualization_marker")
+        except RuntimeError as exc:
+            print(exc)
+            bridge = None
+
     try:
         if not arm.conn.is_power_on():
             print("powering on...")
@@ -671,6 +694,8 @@ def main():
         arm.stop()
         return 1
     finally:
+        if bridge is not None:
+            bridge.stop()
         arm.close()
 
 

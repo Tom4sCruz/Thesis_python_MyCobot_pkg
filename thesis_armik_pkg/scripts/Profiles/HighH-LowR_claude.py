@@ -312,8 +312,15 @@ def main():
     ap.add_argument("--port", default=config.DEFAULT_PORT)
     ap.add_argument("--baud", type=int, default=config.DEFAULT_BAUDRATE)
     ap.add_argument("--mock", action="store_true")
+    ap.add_argument("--rviz", action="store_true",
+                    help="mock only: stream the simulated pose + precomputed path to RViz2 "
+                         "(needs rclpy; run inside the Study-docker container)")
     ap.add_argument("--yes", action="store_true", help="skip the safety prompt")
     args = ap.parse_args()
+
+    if args.rviz and not args.mock:
+        print("--rviz is mock-only; ignoring it (add --mock to visualize).")
+        args.rviz = False
 
     if len(SOURCE_CUBES) != len(TARGET_CUBES):
         print("SOURCE_CUBES and TARGET_CUBES must be the same length.")
@@ -325,6 +332,31 @@ def main():
             return 1
 
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
+
+    bridge = None
+    if args.rviz:
+        from _rviz_bridge import RvizBridge
+        # Coarse polyline mirroring run_cube()'s legs (straight segments -- the
+        # _build_profile S-curve is not reproduced; the live arm + tip sphere
+        # still follow the true profiled trajectory).
+        poly, prev_tgt = [], None
+        for src, tgt in zip(SOURCE_CUBES, TARGET_CUBES):
+            if prev_tgt is not None:
+                poly.append(_approach(prev_tgt))
+            poly += [_approach(src), src, _approach(src), _approach(tgt), tgt]
+            prev_tgt = tgt
+        flat_path = [tuple(map(float, p)) for p in poly]
+        cube_pts = [tuple(map(float, c)) for c in SOURCE_CUBES]
+        try:
+            bridge = RvizBridge(arm.get_angles, path_xyz_cm=flat_path,
+                                cube_points=cube_pts, tip_source=arm.get_coords,
+                                gripper_source=arm.get_gripper_value)
+            bridge.start()
+            print("RViz bridge up: publishing /joint_states + /visualization_marker")
+        except RuntimeError as exc:
+            print(exc)
+            bridge = None
+
     try:
         if not arm.conn.is_power_on():
             print("powering on...")
@@ -360,6 +392,8 @@ def main():
         arm.move_joints(HOME, duration=HOME_MOVE_S)
         return 0
     finally:
+        if bridge is not None:
+            bridge.stop()
         arm.close()
 
 

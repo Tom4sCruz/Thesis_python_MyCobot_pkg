@@ -394,6 +394,13 @@ class Arm:
             log.info("send_gripper refused: %s", exc)
             return FAILURE
 
+    def get_gripper_value(self) -> int | None:
+        """Current gripper opening on pymycobot's 0-100 scale (0 = closed,
+        100 = open), or None if the device did not report one. The inverse
+        scale of send_gripper()'s `deg` argument (deg = value / 100 *
+        config.MAX_GRIPPER_DEG)."""
+        return self.conn.get_gripper_value()
+
     def stop(self):
         return self.conn.stop()
 

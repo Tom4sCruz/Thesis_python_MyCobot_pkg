@@ -980,19 +980,9 @@ class Arm:
                         ex.error = f"J{joint_id} refused -- {bounds_error}"
                         return ex
 
-                    self.conn.send_angle(
-                        joint_id,
-                        cmd_angle,
-                        joint_speed,
-                    )
-
-                    #print("3", end='')
-
-                    # Wait until the servo actually reaches the target.
-                    self._wait_for_joint(
-                        joint_id,
-                        cmd_angle,
-                    )
+                    # Send the joint and block until it arrives, re-sending on a
+                    # stall (dropped serial packet).
+                    self._drive_joint(joint_id, cmd_angle, joint_speed)
 
                     #print("4")
 
@@ -1047,6 +1037,75 @@ class Arm:
                 raise ArmError(
                     f"J{joint_id} did not reach {target_deg:.2f} deg "
                     f"within {config.SINGLE_JOINT_TIMEOUT_S:.1f}s "
+                    f"(currently at {current:.2f} deg)"
+                )
+
+            time.sleep(period)
+
+    def _drive_joint(
+        self,
+        joint_id: int,
+        target_deg: float,
+        speed_dps: float,
+        label: str = "",
+    ) -> None:
+        """
+        Send ONE joint to ``target_deg`` and block until it arrives, RE-SENDING
+        the command if the servo makes no progress.
+
+        The MyCobot serial firmware sporadically drops a motion packet
+        (especially right after other serial traffic) -- the same quirk the
+        gripper double-send in the profiles works around. When that happens the
+        joint just never moves, and a plain ``_wait_for_joint`` waits out the
+        whole ``SINGLE_JOINT_TIMEOUT_S`` and then aborts the run. Here, once the
+        reading has not moved toward the target for ``SINGLE_JOINT_STALL_S``, the
+        command is re-issued (up to ``SINGLE_JOINT_RESEND_MAX`` times). The one
+        overall deadline is never reset, so total wait stays bounded; only a
+        joint that is *still* not progressing at the deadline raises ``ArmError``.
+
+        Re-sending the same target is harmless under fresh_mode=1 (latest command
+        wins) if the joint is in fact already moving, so a false-positive stall
+        costs nothing.
+        """
+        tol = config.SINGLE_JOINT_TOL_DEG
+        period = 1.0 / config.SINGLE_JOINT_POLL_HZ
+        stall_n = max(
+            1, round(config.SINGLE_JOINT_STALL_S * config.SINGLE_JOINT_POLL_HZ)
+        )
+        suffix = f" ({label})" if label else ""
+
+        self.conn.send_angle(joint_id, target_deg, speed_dps)
+        sends = 1
+        deadline = time.perf_counter() + config.SINGLE_JOINT_TIMEOUT_S
+        prev = None
+        still = 0
+        time.sleep(period)                     # let the write land / the servo start
+
+        while True:
+            current = float(self.conn.get_angles()[joint_id - 1])
+            gap = abs(current - target_deg)
+            print(f"  J{joint_id} target={target_deg:.2f} current={current:.2f} "
+                  f"gap={gap:.2f}{suffix}")
+
+            if gap <= tol:
+                return
+
+            if prev is not None and abs(current - prev) < config.SINGLE_JOINT_PROGRESS_DEG:
+                still += 1
+            else:
+                still = 0
+            prev = current
+
+            if still >= stall_n and sends <= config.SINGLE_JOINT_RESEND_MAX:
+                print(f"  J{joint_id} stalled at {current:.2f} (gap {gap:.2f}) -- "
+                      f"re-sending [{sends}/{config.SINGLE_JOINT_RESEND_MAX}]")
+                self.conn.send_angle(joint_id, target_deg, speed_dps)
+                sends += 1
+                still = 0
+            elif time.perf_counter() > deadline:
+                raise ArmError(
+                    f"J{joint_id} did not reach {target_deg:.2f} deg within "
+                    f"{config.SINGLE_JOINT_TIMEOUT_S:.1f}s after {sends} send(s) "
                     f"(currently at {current:.2f} deg)"
                 )
 

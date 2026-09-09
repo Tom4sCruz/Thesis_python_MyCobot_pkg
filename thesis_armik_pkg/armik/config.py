@@ -112,6 +112,16 @@ SINGLE_JOINT_POLL_HZ = 25.0
 # Max seconds to wait for a single joint to reach its target before giving up.
 SINGLE_JOINT_TIMEOUT_S = 5.0
 
+# A single-joint command that produces no progress for this long was almost
+# certainly a dropped serial packet (the same firmware quirk the gripper
+# double-send in the profiles works around) -- re-issue it rather than waiting
+# out SINGLE_JOINT_TIMEOUT_S and aborting the run.
+SINGLE_JOINT_STALL_S = 0.5
+# Per-poll angle change (deg) at or below which the joint counts as "not moving".
+SINGLE_JOINT_PROGRESS_DEG = 0.3
+# Max re-sends of one joint command before giving up (then ArmError).
+SINGLE_JOINT_RESEND_MAX = 3
+
 # Delay AFTER the arm fully reaches one waypoint (every joint needed for it
 # has arrived) and BEFORE starting toward the next waypoint, in single-joint
 # mode. Separate from SINGLE_JOINT_DELAY, which is the pause between

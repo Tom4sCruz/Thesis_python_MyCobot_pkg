@@ -52,7 +52,7 @@ import time
 
 import numpy as np
 
-from armik import Arm, config, jerk, kinematics, pose_coords
+from armik import Arm, ArmError, config, jerk, kinematics, pose_coords
 
 # ===========================================================================
 # CONSTANTS
@@ -222,8 +222,11 @@ def go_home(arm):
         cur = float(arm.get_angles()[j - 1])
         if abs(tgt - cur) <= config.SINGLE_JOINT_TOL_DEG:
             continue
-        arm.conn.send_angle(j, tgt, JOINT_SPEED_DPS)
-        arm._wait_for_joint(j, tgt)
+        try:
+            arm._drive_joint(j, tgt, JOINT_SPEED_DPS, "home")
+        except ArmError as exc:
+            print(f"  homing: J{j} would not move -- {exc}")
+            return
         time.sleep(config.SINGLE_JOINT_DELAY)
 
 
@@ -258,8 +261,9 @@ def _plan_pose_q(arm, x, y, z, label):
 
 def _step_joints(arm, order, q_goal, inj, is_last, label):
     """Drive the joints in `order` (1-based) to their `q_goal` values, one servo
-    at a time: skip any already within SINGLE_JOINT_TOL_DEG; else send_angle at
-    JOINT_SPEED_DPS, _wait_for_joint, SINGLE_JOINT_DELAY. A trailing
+    at a time: skip any already within SINGLE_JOINT_TOL_DEG; else
+    arm._drive_joint (send at JOINT_SPEED_DPS, block until arrived, re-send on a
+    stall), then SINGLE_JOINT_DELAY. A trailing
     SINGLE_JOINT_DELAY_BETWEEN_POINTS unless `is_last`. Re-reads arm.get_angles()
     on entry, so drift from a J1-only swing never accumulates. Mirrors
     Arm._execute_single_joint's inner loop, including the deliberate-jitter path
@@ -292,8 +296,11 @@ def _step_joints(arm, order, q_goal, inj, is_last, label):
         if be is not None:
             print(f"  {label}: J{j} refused -- {be}")
             return False
-        arm.conn.send_angle(j, cmd, speed)
-        arm._wait_for_joint(j, cmd)
+        try:
+            arm._drive_joint(j, cmd, speed, label)
+        except ArmError as exc:
+            print(f"  {label}: {exc}")
+            return False
         cur[j - 1] = cmd
         moved.append(j)
         time.sleep(config.SINGLE_JOINT_DELAY)
@@ -409,8 +416,11 @@ def _send_ordered(arm, pts, label):
             if be is not None:
                 print(f"  {label}: J{j} refused -- {be}")
                 return False
-            arm.conn.send_angle(j, target[j - 1], JOINT_SPEED_DPS)
-            arm._wait_for_joint(j, target[j - 1])
+            try:
+                arm._drive_joint(j, target[j - 1], JOINT_SPEED_DPS, label)
+            except ArmError as exc:
+                print(f"  {label}: {exc}")
+                return False
             cur[j - 1] = target[j - 1]
             time.sleep(config.SINGLE_JOINT_DELAY)
         if wi < len(seg_q) - 1:

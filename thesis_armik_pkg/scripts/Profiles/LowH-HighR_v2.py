@@ -47,7 +47,7 @@ import time
 
 import numpy as np
 
-from armik import Arm, config, pose_coords
+from armik import Arm, ArmError, config, pose_coords
 
 # ===========================================================================
 # CONSTANTS
@@ -182,8 +182,11 @@ def go_home(arm):
         cur = float(arm.get_angles()[j - 1])
         if abs(tgt - cur) <= config.SINGLE_JOINT_TOL_DEG:
             continue
-        arm.conn.send_angle(j, tgt, JOINT_SPEED_DPS)
-        arm._wait_for_joint(j, tgt)
+        try:
+            arm._drive_joint(j, tgt, JOINT_SPEED_DPS, "home")
+        except ArmError as exc:
+            print(f"  homing: J{j} would not move -- {exc}")
+            return
         time.sleep(config.SINGLE_JOINT_DELAY)
 
 

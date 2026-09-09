@@ -104,7 +104,7 @@ TOOL_RPY_DEG = (0.0, 0.0, -45.0)
 SINGLE_JOINT_DELAY = 0.15  # seconds
 
 # How close a joint must be to its target before it is considered stopped.
-SINGLE_JOINT_TOL_DEG = 2.0
+SINGLE_JOINT_TOL_DEG = 3.0
 
 # How often send_path() checks whether the active joint reached its target.
 SINGLE_JOINT_POLL_HZ = 25.0

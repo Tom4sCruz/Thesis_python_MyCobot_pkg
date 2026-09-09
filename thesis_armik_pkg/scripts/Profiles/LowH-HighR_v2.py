@@ -60,11 +60,14 @@ PREFLIGHT = True
 
 # -- cubes (MEASURE AND REPLACE) ----------------------------------------------
 # (x, y, z) CM, at the GRIPPER TIP, base frame, z from the table.
+
+Z_CUBE_COORD = -4.0
+
 CUBES_INITIAL_POINTS = [          # a row on the pick side, LISTED LEFT -> RIGHT
-    (15.0, 10.0, 0.0),
-    (15.0, 13.0, 0.0),
-    (15.0, 16.0, 0.0),
-    (15.0, 19.0, 0.0),
+    (15.0, 10.0, Z_CUBE_COORD),
+    (15.0, 13.0, Z_CUBE_COORD),
+    (15.0, 16.0, Z_CUBE_COORD),
+    (15.0, 19.0, Z_CUBE_COORD),
 ]
 CUBES_TARGET_POINTS = [           # the drop row; cube picked k-th goes to slot k
     (15.0, -10.0, 0.0),

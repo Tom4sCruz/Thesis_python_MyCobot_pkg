@@ -144,7 +144,7 @@ GRIP_CLOSED_DEG = 25.0         # tune to the cube width
 GRIP_SPEED = 90  #config.GRIPPER_DEFAULT_SPEED
 GRIP_SETTLE_S = 0.35          # quiet time after a gripper command: it must LAND and the jaws
                              # start moving. Tunable down to GRIP_MIN_GAP_S, not below.
-GRIP_MIN_GAP_S = 0.2         # hard floor -- pymycobot drops a gripper command with no quiet gap
+GRIP_MIN_GAP_S = 1.0         # hard floor -- pymycobot drops a gripper command with no quiet gap
 REACH_TOL_CM = 3.0            # has_reached_* tolerance, per axis
 
 # -- gripper trigger boxes (optional, experimental in single-joint mode) --------

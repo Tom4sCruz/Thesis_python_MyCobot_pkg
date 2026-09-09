@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MOVEMENT PROFILE: Low-human / High-robot
-=======================================
+MOVEMENT PROFILE: Low-human / High-robot  (v3 -- J2-only raise)
+==============================================================
 
 Move cubes from one side of the frame to the other, the way a classic
 industrial robot would:
@@ -9,11 +9,15 @@ industrial robot would:
   * ONE JOINT AT A TIME, with a hard stop and a short pause at each. Each cube
     is a fixed SWING / DESCEND / LIFT choreography (no hover-then-lower double
     move): J1 swings the arm to the cube's azimuth; J6..J2 descend onto it and
-    grab; J2..J4 lift back to a raised straight-down "above" pose; J1 swings to
-    the target azimuth; J6..J2 descend and drop; J2..J4 lift; J1 swings to the
-    next cube. The between-cube transit turns J1 ONLY. End-of-run homing is
-    J2..J4, then J1, then the wrist. The (disabled by default) nudge / trigger
-    paths still use armik's fixed J1..J6 executor;
+    grab; J2 ALONE lifts the shoulder; J1 swings to the target azimuth; J6..J2
+    descend and drop; J2 alone lifts; J1 swings to the next cube. Unlike
+    LowH-HighR.py (which raises with J2..J4), the raise here is a plain J2
+    rotation, so between cubes the gripper stays folded in its grab pose and
+    points forward-down, not straight down -- the NEXT descent's J6..J2 step
+    restores the straight-down pose at the target. The between-cube transit
+    turns J1 ONLY. End-of-run homing is J2..J4, then J1, then the wrist. The
+    (disabled by default) nudge / trigger paths still use armik's fixed J1..J6
+    executor;
   * a FAST CONSTANT joint speed (JOINT_SPEED_DPS), sharp corners, no blending;
   * exactly the SAME trajectory every run -- nothing is randomised (unless the
     JERK dials are raised: a deliberate tremor + uneven pace for a smooth-vs-
@@ -112,7 +116,9 @@ PICK_ORDER = list(range(len(CUBES_INITIAL_POINTS)))
 DESCEND_JOINT_ORDER = (6, 5, 4, 3, 2)   # grab / drop: wrist J6..J3 first, shoulder
                                         # J2 LAST -> a clean vertical drop. J1 is
                                         # already aligned by the preceding swing.
-LIFT_JOINT_ORDER    = (2, 3, 4)         # lift away from a cube: shoulder J2 up first
+LIFT_JOINT_ORDER    = (2,)              # v3: raise turns J2 ONLY (LowH-HighR.py uses
+                                        # (2, 3, 4)) -- a plain shoulder rotation; J3..J6
+                                        # stay in the grab pose until the next descent
 SWING_JOINT         = 1                 # transit between cubes turns J1 ONLY -- the
                                         # gripper heading rides along and is corrected
                                         # by the next descent's J6..J2 step
@@ -312,7 +318,9 @@ def _descend(arm, point, inj, label, is_last=False):
 
 
 def _lift(arm, point, inj, label, is_last=False):
-    """Step J2..J4 up to the raised straight-down 'above' pose over `point`."""
+    """Step J2 only up toward its value in the straight-down 'above' pose over
+    `point` (v3). J3..J6 keep their post-grab angles, so this is a plain shoulder
+    lift, not a return to a straight-down pose."""
     ax, ay, az = _approach(point)
     q = _plan_pose_q(arm, ax, ay, az, label)
     if q is None:
@@ -683,7 +691,7 @@ def main():
                       f"{tuple(round(v, 1) for v in tgt)} +/- {REACH_TOL_CM} cm "
                       f"-- gripper NOT fired")
 
-            # LIFT J2..J4 back to the raised 'above' pose (steps 3 / 6).
+            # LIFT (J2 only) -- plain shoulder rotation (steps 3 / 6).
             if not _lift(arm, tgt, inj, f"{label}: lift"):
                 print("\naborting run."); go_home(arm); return 1
 

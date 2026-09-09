@@ -138,7 +138,7 @@ BOW_JITTER_CM = 0.0             # +/- sideways bow, perpendicular to the chord
 EASE_JITTER = 0.0              # +/- on EASE_IN / EASE_OUT per move
 
 # -- order ------------------------------------------------------------------------
-SHUFFLE_ORDER = True             # grab cubes in a random order (init<->target pairing kept)
+SHUFFLE_ORDER = False #True             # grab cubes in a random order (init<->target pairing kept)
 
 # -- scripted nudge / flinch ------------------------------------------------------
 NUDGE_CYCLE = -1                  # EVEN cycle index whose reach is interrupted; -1 disables

@@ -73,11 +73,14 @@ RANDOM_SEED = None                # int for a repeatable run, None for fresh eac
 
 # -- cubes (MEASURE AND REPLACE) ----------------------------------------------
 # (x, y, z) CM, at the GRIPPER TIP, base frame, z from the table.
+
+Z_CUBE_COORD = -4.0
+
 CUBES_INITIAL_POINTS = [          # a row on the pick side
-    (15.0, 10.0, 0.0),
-    (15.0, 13.0, 0.0),
-    (15.0, 16.0, 0.0),
-    (15.0, 19.0, 0.0),
+    (15.0, 10.0, Z_CUBE_COORD),
+    (15.0, 13.0, Z_CUBE_COORD),
+    (15.0, 16.0, Z_CUBE_COORD),
+    (15.0, 19.0, Z_CUBE_COORD),
 ]
 CUBES_TARGET_POINTS = [           # deterministic, deliberately uneven drop points
     (15.0, -10.0, 0.0),

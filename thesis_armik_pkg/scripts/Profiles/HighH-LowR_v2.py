@@ -150,8 +150,8 @@ NUDGE_RECOIL_JERK = 0.0        # brief arm.jerk on the recoil for a startled loo
 NUDGE_SETTLE_S = 1.5           # pause after the recoil, "waiting for the cube to stop"
 
 # -- gripper ---------------------------------------------------------------------
-GRIP_OPEN_DEG = 110.0           # 0 = closed .. config.MAX_GRIPPER_DEG = full open
-GRIP_CLOSED_DEG = 25.0          # tune to the cube width
+GRIP_OPEN_DEG = 120.0           # 0 = closed .. config.MAX_GRIPPER_DEG = full open
+GRIP_CLOSED_DEG = 65.0          # tune to the cube width
 GRIP_SPEED = 90  #config.GRIPPER_DEFAULT_SPEED
 GRIP_SETTLE_S = 0.35           # quiet time after a gripper command: it must LAND and the
                               # jaws start moving. Tunable down to GRIP_MIN_GAP_S, not below.

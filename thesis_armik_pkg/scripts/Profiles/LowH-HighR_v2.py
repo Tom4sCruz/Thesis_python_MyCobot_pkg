@@ -105,8 +105,8 @@ NUDGE_AIM_SPEED_DPS = 40.0     # deg/s for the "point at it" move
 NUDGE_LOOK_S = 1.5            # hold the "regarding it" pose before moving on
 
 # -- gripper ---------------------------------------------------------------------
-GRIP_OPEN_DEG = 110.0          # 0 = closed .. config.MAX_GRIPPER_DEG = full open
-GRIP_CLOSED_DEG = 25.0         # tune to the cube width
+GRIP_OPEN_DEG = 120.0          # 0 = closed .. config.MAX_GRIPPER_DEG = full open
+GRIP_CLOSED_DEG = 65.0         # tune to the cube width
 GRIP_SPEED = 90  #config.GRIPPER_DEFAULT_SPEED
 GRIP_SETTLE_S = 0.35          # quiet time after a gripper command: it must LAND and the jaws
                              # start moving. Tunable down to GRIP_MIN_GAP_S, not below.

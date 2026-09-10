@@ -186,6 +186,12 @@ MAX_JOINT_SPEED_DPS = [250.0, 250.0, 250.0, 300.0, 300.0, 350.0]
 #
 # arm.jerk is a DIMENSIONLESS roughness dial (0 = smooth, ~1-3 subtle, ~5-10
 # violent). It drives two effects, scaled by the two constants below:
+#
+# Seed for the deliberate-jitter RNG. arm.jerk_seed (an int, set on the Arm)
+# overrides this; None on both -> fresh randomness each session. Here so a
+# profile / script needs no seed constant of its own for a reproducible run.
+JERK_SEED = 1
+
 JERK_TREMOR_DEG_PER_UNIT = 0.30   # RMS joint deflection (deg) per unit of arm.jerk
 JERK_SPEED_FRAC_PER_UNIT = 0.05   # pace-modulation std (fraction) per unit of arm.jerk
 
@@ -195,30 +201,39 @@ JERK_TREMOR_CORRELATION = 0.5
 
 # Commanded-speed multiplier is clamped to this band after modulation, so a
 # perturbed setpoint can neither stall nor bolt.
-JERK_SPEED_FACTOR_MIN = 0.30
-JERK_SPEED_FACTOR_MAX = 2.50
+JERK_SPEED_FACTOR_MIN = 0.25
+JERK_SPEED_FACTOR_MAX = 2.0
 
 # Discrete twitch ("flinch") shape, in control ticks.
 JERK_TWITCH_RISE_TICKS = 1        # ticks to ramp a twitch to full amplitude
 JERK_TWITCH_DECAY_TICKS = 4       # ticks to decay it back to zero
 
 # Hard per-joint cap on the TOTAL perturbation (tremor + twitch), in degrees.
-JERK_MAX_DEG = 8.0
+JERK_MAX_DEG = 10.0
 
-# --- Deliberate jerk in SINGLE-JOINT mode -----------------------------------
+# --- Jerk in SINGLE-JOINT mode: the STUTTER --------------------------------------
 # Single-joint execution sends one servo command per joint and blocks until it
-# arrives -- there is no CONTROL_RATE_HZ setpoint stream to carry a tremor, and
-# the SINGLE_JOINT_TOL_DEG arrival window swallows a small offset. So when jerk
-# is armed a jittered joint move becomes a short STUTTER: JERK_SINGLE_JOINT_
-# SUBSTEPS transient jittered sub-commands (fire-and-dwell, each preempted
-# mid-slew by the next under fresh_mode=1), then a clean settle onto the true
-# target. All additive: jerk = 0 -> exactly one clean send, byte-for-byte
-# unchanged.
-JERK_SINGLE_JOINT_SUBSTEPS = 3     # jittered sub-commands per joint move (0 disables the stutter)
-JERK_SINGLE_JOINT_GAIN     = 3.0   # scales the per-joint offset -- streamed mode applies it
-                                   # CONTROL_RATE_HZ times/s, here only a few, so it must be
-                                   # bigger to be felt against SINGLE_JOINT_TOL_DEG
-JERK_SUBSTEP_DWELL_S       = 0.12  # dwell after each jittered sub-command (no arrival check)
+# arrives -- no CONTROL_RATE_HZ stream to carry a tremor, and the
+# SINGLE_JOINT_TOL_DEG window swallows a small offset. So when jerk is armed
+# (arm.jerk / arm.twitch_intensity) a joint move becomes a short STUTTER: a few
+# transient jittered sub-commands (fire-and-dwell, each preempted mid-slew by the
+# next under fresh_mode=1), then a clean settle onto the true target. Two
+# INDEPENDENT dials:
+#   AMPLITUDE ("how much") -- each wobble deviates from the target by the
+#     injector's per-joint offset (arm.jerk drives the tremor,
+#     arm.twitch_intensity the flinches) times JERK_SINGLE_JOINT_GAIN.
+#   VELOCITY ("how fast")  -- the wobble sub-commands slew at
+#     JERK_SUBSTEP_SPEED_DPS (absolute deg/s, clamped per joint; NOT tied to the
+#     joint's normal move speed) and are spaced JERK_SUBSTEP_DWELL_S apart. Fast
+#     + short = a violent snap; slow + long = a lazy "move to a plotted point and
+#     back". The clean settle afterwards uses the caller's own speed.
+# jerk = 0 -> no sub-commands, exactly one clean send, byte-for-byte unchanged.
+JERK_SINGLE_JOINT_SUBSTEPS = 3      # jittered sub-commands per joint move (0 disables the stutter)
+JERK_SINGLE_JOINT_GAIN     = 3.0    # AMPLITUDE: multiplier on the per-joint offset
+JERK_SUBSTEP_SPEED_DPS     = 180.0  # VELOCITY: deg/s the wobble sub-commands slew at. >= about
+                                   # DEG_PER_S_AT_SPEED_100 all map to the firmware's top speed;
+                                   # drop below that (~10-120) for slower, laggier wobbles
+JERK_SUBSTEP_DWELL_S       = 0.05   # VELOCITY: gap between wobble sub-commands (no arrival wait)
 
 # ---------------------------------------------------------------------------
 # pymycobot interface

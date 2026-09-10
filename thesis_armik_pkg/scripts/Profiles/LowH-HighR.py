@@ -15,9 +15,10 @@ industrial robot would:
     J2..J4, then J1, then the wrist. The (disabled by default) nudge / trigger
     paths still use armik's fixed J1..J6 executor;
   * a FAST CONSTANT joint speed (JOINT_SPEED_DPS), sharp corners, no blending;
-  * exactly the SAME trajectory every run -- nothing is randomised (unless the
-    JERK dials are raised: a deliberate tremor + uneven pace for a smooth-vs-
-    jerky comparison; JERK = 0 -> identical to a clean run);
+  * exactly the SAME trajectory every run -- nothing is randomised (unless
+    deliberate jerk is armed on the Arm: `arm.jerk` / `arm.random_twitch` /
+    `arm.twitch_intensity` -- single-joint moves then STUTTER; tune amplitude /
+    velocity via armik/config.py JERK_SINGLE_JOINT_* / JERK_SUBSTEP_*);
   * cubes grabbed in a fixed order (PICK_ORDER, left -> right) and placed into
     CUBES_TARGET_POINTS[k] in that order -- they end in a row;
   * NO overshoot -- each joint is driven until it is within
@@ -52,7 +53,7 @@ import time
 
 import numpy as np
 
-from armik import Arm, ArmError, config, jerk, kinematics, pose_coords
+from armik import Arm, ArmError, config, kinematics, pose_coords
 
 # ===========================================================================
 # CONSTANTS
@@ -122,14 +123,10 @@ SWING_JOINT         = 1                 # transit between cubes turns J1 ONLY --
 LOWER_JOINT_ORDER = (1, 6, 5, 4, 3, 2)   # descending onto a cube/target
 RAISE_JOINT_ORDER = (1, 2, 3, 4, 5, 6)   # lifting away / traversing
 
-# -- deliberate jitter (jerk) --------------------------------------------------
-# All four default to 0 / None -> armik.jerk.JerkInjector is INERT and the motion
-# is byte-for-byte identical to a clean run. Raise JERK for a visible tremor +
-# uneven pace; set JERK_SEED to an int to replay a run exactly.
-JERK = 0.0                       # -> arm.jerk             (0 smooth; ~1-3 subtle; ~5-10 violent)
-JERK_RANDOM_TWITCH = 0.0         # -> arm.random_twitch    (flinch probability per joint step [0,1])
-JERK_TWITCH_INTENSITY_DEG = 0.0  # -> arm.twitch_intensity (peak flinch amplitude, deg)
-JERK_SEED = None                 # -> arm.jerk_seed        (None = fresh each run; int = repeatable)
+# -- jerk constants -------------------------------------------------------------
+JERK = 5.0
+TWITCH_FREQ = 0.0
+TWITCH_INTENSITY = 5.0
 
 # -- scripted nudge ("defective cube") ------------------------------------------
 NUDGE_CYCLE = -1                # EVEN (reach) cycle index whose cube is nudged; -1 = off
@@ -230,17 +227,6 @@ def go_home(arm):
         time.sleep(config.SINGLE_JOINT_DELAY)
 
 
-def _make_run_injector():
-    """One JerkInjector for the whole hand-rolled run (mirrors Arm._make_jerk).
-    A single rng stream -> a given JERK_SEED reproduces the run exactly, and the
-    AR(1) tremor state carries across phases like a real tremor. INERT (no rng
-    draw, zero offsets, unit speed factor) unless JERK > 0 or both
-    JERK_RANDOM_TWITCH and JERK_TWITCH_INTENSITY_DEG are non-zero."""
-    rng = np.random.default_rng(JERK_SEED)
-    return jerk.JerkInjector(JERK, JERK_RANDOM_TWITCH, JERK_TWITCH_INTENSITY_DEG,
-                             config.DOF, rng)
-
-
 def _plan_pose_q(arm, x, y, z, label):
     """IK-plan a straight-down pose (PICK_ORIENTATION_DEG) at (x, y, z) cm and
     return the goal joint vector (list[6], deg), or None. No motion. Uses
@@ -259,14 +245,14 @@ def _plan_pose_q(arm, x, y, z, label):
     return None
 
 
-def _step_joints(arm, order, q_goal, inj, is_last, label):
+def _step_joints(arm, order, q_goal, is_last, label):
     """Drive the joints in `order` (1-based) to their `q_goal` values, one servo
-    at a time: skip any already within SINGLE_JOINT_TOL_DEG; else drive it with
-    arm._drive_joint_jerky (a jerk STUTTER when `inj` is armed and not `is_last`,
-    otherwise one clean send -- both stall/re-send resilient), then
-    SINGLE_JOINT_DELAY. A trailing SINGLE_JOINT_DELAY_BETWEEN_POINTS unless
-    `is_last`. Re-reads arm.get_angles() on entry, so drift from a J1-only swing
-    never accumulates. Returns bool."""
+    at a time via arm._drive_joint: skip any already within SINGLE_JOINT_TOL_DEG;
+    else one clean send (stall/re-send resilient; a jerk stutter first if
+    arm.jerk is armed -- handled inside armik), then SINGLE_JOINT_DELAY. A
+    trailing SINGLE_JOINT_DELAY_BETWEEN_POINTS unless `is_last`. Re-reads
+    arm.get_angles() on entry, so drift from a J1-only swing never accumulates.
+    Returns bool."""
     cur = np.array(arm.get_angles(), dtype=float)
     moved = []
     for j in order:
@@ -281,10 +267,7 @@ def _step_joints(arm, order, q_goal, inj, is_last, label):
             print(f"  {label}: J{j} refused -- {be}")
             return False
         try:
-            if inj.active and not is_last:
-                arm._drive_joint_jerky(j, a_goal, JOINT_SPEED_DPS, inj, cur, label)
-            else:
-                arm._drive_joint(j, a_goal, JOINT_SPEED_DPS, label)
+            arm._drive_joint(j, a_goal, JOINT_SPEED_DPS, label)
         except ArmError as exc:
             print(f"  {label}: {exc}")
             return False
@@ -297,31 +280,31 @@ def _step_joints(arm, order, q_goal, inj, is_last, label):
     return True
 
 
-def _descend(arm, point, inj, label, is_last=False):
+def _descend(arm, point, label, is_last=False):
     """SWING already done -- step J6..J2 down onto `point` (grab / drop)."""
     q = _plan_pose_q(arm, point[0], point[1], point[2], label)
     if q is None:
         return False
-    return _step_joints(arm, DESCEND_JOINT_ORDER, q, inj, is_last, label)
+    return _step_joints(arm, DESCEND_JOINT_ORDER, q, is_last, label)
 
 
-def _lift(arm, point, inj, label, is_last=False):
+def _lift(arm, point, label, is_last=False):
     """Step J2..J4 up to the raised straight-down 'above' pose over `point`."""
     ax, ay, az = _approach(point)
     q = _plan_pose_q(arm, ax, ay, az, label)
     if q is None:
         return False
-    return _step_joints(arm, LIFT_JOINT_ORDER, q, inj, is_last, label)
+    return _step_joints(arm, LIFT_JOINT_ORDER, q, is_last, label)
 
 
-def _swing_j1(arm, point, inj, label, is_last=False):
+def _swing_j1(arm, point, label, is_last=False):
     """Turn J1 ONLY to `point`'s azimuth, arm held at the 'above' height. The
     gripper heading rides along; the next _descend's J6..J2 step corrects it."""
     ax, ay, az = _approach(point)
     q = _plan_pose_q(arm, ax, ay, az, label)
     if q is None:
         return False
-    return _step_joints(arm, (SWING_JOINT,), q, inj, is_last, label)
+    return _step_joints(arm, (SWING_JOINT,), q, is_last, label)
 
 
 def _fire_gripper(arm, deg):
@@ -579,14 +562,14 @@ def main():
     paths = [get_path(s["origin"], s["target"]) for s in segments]
 
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
+    # Jerky motion? Set these on the Arm and every single-joint move (incl.
+    # homing) stutters -- see armik/config.py JERK_SINGLE_JOINT_* / JERK_SUBSTEP_*
+    # for the amplitude / velocity dials, seed via arm.jerk_seed or
+    # config.JERK_SEED. Left off by default.
+    
     arm.jerk = JERK
-    arm.random_twitch = JERK_RANDOM_TWITCH
-    arm.twitch_intensity = JERK_TWITCH_INTENSITY_DEG
-    arm.jerk_seed = JERK_SEED
-    inj = _make_run_injector()                       # drives the hand-rolled joint stepping
-    if inj.active:
-        print(f"JERK on: jerk={JERK} twitch={JERK_RANDOM_TWITCH}@{JERK_TWITCH_INTENSITY_DEG}deg "
-              f"seed={JERK_SEED}")
+    arm.random_twitch = TWITCH_FREQ
+    arm.twitch_intensity = TWITCH_INTENSITY
 
     bridge = None
     if args.rviz:
@@ -661,11 +644,11 @@ def main():
             # 1); every carry swings J1 to the drop azimuth (step 4). Reach
             # cycles > 0 are already aligned by the previous carry's step-7 swing.
             if kind == "carry" or ci == 0:
-                if not _swing_j1(arm, tgt, inj, f"{label}: swing J1"):
+                if not _swing_j1(arm, tgt, f"{label}: swing J1"):
                     print("\naborting run."); go_home(arm); return 1
 
             # DESCEND J6..J2 onto the cube / drop point (steps 2 / 5).
-            if not _descend(arm, tgt, inj, f"{label}: descend"):
+            if not _descend(arm, tgt, f"{label}: descend"):
                 print("\naborting run."); go_home(arm); return 1
 
             cur = current_pos(arm)
@@ -681,21 +664,21 @@ def main():
                       f"-- gripper NOT fired")
 
             # LIFT J2..J4 back to the raised 'above' pose (steps 3 / 6).
-            if not _lift(arm, tgt, inj, f"{label}: lift"):
+            if not _lift(arm, tgt, f"{label}: lift"):
                 print("\naborting run."); go_home(arm); return 1
 
             # After a carry, swing J1 to the NEXT cube's azimuth (step 7).
             if kind == "carry" and ci + 1 < len(segments):
-                if not _swing_j1(arm, segments[ci + 1]["target"], inj,
+                if not _swing_j1(arm, segments[ci + 1]["target"],
                                  "swing J1 -> next cube"):
                     print("\naborting run."); go_home(arm); return 1
 
         # End-of-run homing: J2..J4 to HOME, then J1, then the wrist (J5, J6) --
         # mirrors the descents (shoulder settled before the wrist tidies up).
         print("\ndone. homing (J2-J4, then J1, then wrist)...")
-        _step_joints(arm, (2, 3, 4), HOME, inj, True, "home: J2-J4")
-        _step_joints(arm, (SWING_JOINT,), HOME, inj, True, "home: J1")
-        _step_joints(arm, (5, 6), HOME, inj, True, "home: wrist")
+        _step_joints(arm, (2, 3, 4), HOME, True, "home: J2-J4")
+        _step_joints(arm, (SWING_JOINT,), HOME, True, "home: J1")
+        _step_joints(arm, (5, 6), HOME, True, "home: wrist")
         return 0
 
     except KeyboardInterrupt:

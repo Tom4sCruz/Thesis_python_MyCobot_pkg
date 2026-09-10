@@ -34,10 +34,10 @@ Pure numpy, no hardware, deterministic given the rng. Per tick, call
 advance internal state, so a consistent call order keeps runs reproducible.
 
 ``Arm._execute()`` streams at ``CONTROL_RATE_HZ`` and uses ``offsets()`` (all six
-joints per tick). Single-joint execution (``Arm._execute_single_joint`` and the
-hand-rolled profile steppers, via ``Arm._drive_joint_jerky``) has no such stream,
-so it calls ``joint_offset(joint_idx)`` once per stutter sub-step instead: one
-joint at a time, with twitches redirected onto the joint being moved.
+joints per tick). Single-joint execution has no such stream, so ``Arm._drive_joint``
+(via ``Arm._jerk_stutter``) calls ``joint_offset(joint_idx)`` once per stutter
+sub-step instead: one joint at a time, with twitches redirected onto the joint
+being moved. Both executors share one persistent injector (``Arm._jerk_injector``).
 """
 
 from __future__ import annotations

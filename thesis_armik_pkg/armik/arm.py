@@ -127,16 +127,24 @@ class Arm:
         self.last_execution: Execution | None = None
         self.last_error: str | None = None
 
-        # Deliberate jitter (armik/jerk.py). All zero -> every move streams the
-        # same smooth trajectory it always did. Set on the instance:
+        # Deliberate jitter (armik/jerk.py). All zero -> every move (streamed AND
+        # single-joint, incl. homing) is byte-for-byte the smooth trajectory it
+        # always was. Set on the instance:
         #   arm.jerk             roughness dial, 0 = smooth (tremor + uneven pace)
-        #   arm.random_twitch    probability [0, 1] of a flinch per streamed setpoint
+        #   arm.random_twitch    probability [0, 1] of a flinch per (sub-)step
         #   arm.twitch_intensity peak flinch amplitude, degrees
-        #   arm.jerk_seed        None = fresh randomness per move; int = repeatable
+        #   arm.jerk_seed        int = repeatable; None -> config.JERK_SEED (also None
+        #                        -> fresh randomness each session)
+        # A single persistent JerkInjector backs both executors (see
+        # _jerk_injector), so a seed reproduces a whole run and the tremor state
+        # carries across moves. Single-joint tuning: config.JERK_SINGLE_JOINT_* /
+        # JERK_SUBSTEP_*.
         self.jerk = 0.0
         self.random_twitch = 0.0
         self.twitch_intensity = 0.0
         self.jerk_seed: int | None = None
+        self._jerk_inj: jerk.JerkInjector | None = None   # (re)built lazily by _jerk_injector
+        self._jerk_inj_key = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -797,17 +805,55 @@ class Arm:
     # Execution
     # ------------------------------------------------------------------
 
+    @property
+    def _jerk_injector(self) -> jerk.JerkInjector:
+        """The ONE persistent jitter injector for this Arm -- so `arm.jerk` (etc.)
+        just works everywhere, the AR(1) tremor / pace state carries across moves
+        like a real tremor, and a seed reproduces the whole run. Rebuilt only when
+        a jerk attribute changes. Seed: `self.jerk_seed`, else `config.JERK_SEED`.
+        Inert (zero offsets, unit speed factor) unless `self.jerk > 0` or both
+        `self.random_twitch` and `self.twitch_intensity` are non-zero.
+        """
+        seed = self.jerk_seed if self.jerk_seed is not None else config.JERK_SEED
+        key = (self.jerk, self.random_twitch, self.twitch_intensity, seed)
+        if self._jerk_inj_key != key:
+            self._jerk_inj = jerk.JerkInjector(
+                self.jerk, self.random_twitch, self.twitch_intensity,
+                config.DOF, np.random.default_rng(seed),
+            )
+            self._jerk_inj_key = key
+        return self._jerk_inj
+
     def _make_jerk(self) -> jerk.JerkInjector:
-        """
-        Fresh jitter injector from the current jerk attributes. Inert unless
-        self.jerk > 0 or (self.random_twitch and self.twitch_intensity), so a
-        default Arm streams the smooth trajectory unchanged. self.jerk_seed
-        None -> fresh randomness each move; an int -> a repeatable sequence.
-        """
-        rng = np.random.default_rng(self.jerk_seed)
-        return jerk.JerkInjector(
-            self.jerk, self.random_twitch, self.twitch_intensity, config.DOF, rng
-        )
+        """Back-compat alias -- returns the persistent `_jerk_injector`."""
+        return self._jerk_injector
+
+    def _jerk_stutter(self, joint_id: int, target_deg: float) -> None:
+        """Fire `config.JERK_SINGLE_JOINT_SUBSTEPS` transient jittered
+        sub-commands for ONE joint before it is driven cleanly onto `target_deg`.
+        Single-joint execution has no CONTROL_RATE_HZ stream to carry a tremor and
+        the SINGLE_JOINT_TOL_DEG window swallows a small offset, so this is how
+        `arm.jerk` becomes visible there: each sub-command is `target +/- (per-
+        joint offset * JERK_SINGLE_JOINT_GAIN)` slewed at `JERK_SUBSTEP_SPEED_DPS`
+        (the VELOCITY dial -- NOT the caller's speed), fire-and-dwell so the next
+        one preempts it mid-slew under fresh_mode=1. No-op when the injector is
+        inert or SUBSTEPS <= 0 (then the caller's single clean send is
+        byte-identical to a non-jerk run)."""
+        inj = self._jerk_injector
+        if not inj.active or config.JERK_SINGLE_JOINT_SUBSTEPS <= 0:
+            return
+        j = joint_id - 1
+        soft = config.joint_limits_array()
+        wob = min(float(config.JERK_SUBSTEP_SPEED_DPS),
+                  float(config.MAX_JOINT_SPEED_DPS[j]))
+        q = np.array(self.conn.get_angles(), dtype=float)     # one read, for the bounds check
+        for _ in range(int(config.JERK_SINGLE_JOINT_SUBSTEPS)):
+            off = inj.joint_offset(j) * config.JERK_SINGLE_JOINT_GAIN
+            sub = float(np.clip(target_deg + off, soft[j, 0], soft[j, 1]))
+            q[j] = sub
+            if check_workspace_bounds(forward_kinematics(q)[:3, 3]) is None:
+                self.conn.send_angle(joint_id, sub, wob)
+                time.sleep(config.JERK_SUBSTEP_DWELL_S)
 
     def _execute(self, plan: Plan) -> Execution:
         """
@@ -901,11 +947,9 @@ class Arm:
             ex.error = "single-joint execution requires at least one target waypoint"
             return ex
 
-        # Deliberate jitter, if armed. Each moving joint's move becomes a stutter
-        # of jittered sub-commands then a clean settle (_drive_joint_jerky), so
-        # the arm still ends on the planned configuration. The final waypoint of
-        # a genuine multi-waypoint path runs clean.
-        inj = self._make_jerk()
+        # Deliberate jitter, if armed, is applied per joint inside _drive_joint
+        # (a stutter of jittered sub-commands then a clean settle), so the arm
+        # still ends on the planned configuration.
 
         try:
             t0 = time.perf_counter()
@@ -918,7 +962,6 @@ class Arm:
 
                 #print("Iteration #", waypoint_idx)
 
-                is_last_wp = waypoint_idx == len(q_waypoints) - 1
                 target = np.asarray(q_waypoints[waypoint_idx], dtype=float)
 
                 #print("0", end='')
@@ -963,22 +1006,14 @@ class Arm:
                         ex.error = f"J{joint_id} refused -- {bounds_error}"
                         return ex
 
-                    # Drive the joint. With jerk armed, a STUTTER of jittered
-                    # sub-commands then a clean settle; otherwise one clean send.
-                    # The final waypoint of a genuine multi-waypoint path stays
-                    # clean, but a 2-row segment_q (the send_coords case) does
-                    # stutter -- otherwise single-joint send_coords sees no jerk.
-                    if inj.active and not (is_last_wp and len(q_waypoints) > 2):
-                        self._drive_joint_jerky(
-                            joint_id, target_angle, joint_speed, inj, current
-                        )
-                    else:
-                        self._drive_joint(joint_id, target_angle, joint_speed)
+                    # Drive the joint (a jerk stutter first if arm.jerk is armed
+                    # -- handled inside _drive_joint), then a clean settle.
+                    self._drive_joint(joint_id, target_angle, joint_speed)
 
                     #print("4")
 
                     # Record the commanded configuration (always the clean target
-                    # -- _drive_joint_jerky settles there).
+                    # -- _drive_joint settles there).
                     current[joint_idx] = target_angle
 
                     ex.t_cmd.append(time.perf_counter() - t0)
@@ -1058,7 +1093,15 @@ class Arm:
         Re-sending the same target is harmless under fresh_mode=1 (latest command
         wins) if the joint is in fact already moving, so a false-positive stall
         costs nothing.
+
+        When deliberate jerk is armed (``arm.jerk`` / ``arm.twitch_intensity``)
+        the move is preceded by a STUTTER of transient jittered sub-commands
+        (:meth:`_jerk_stutter`); the clean send + poll loop below then drives the
+        joint exactly onto ``target_deg`` at the caller's ``speed_dps``. jerk = 0
+        -> just the clean send, byte-for-byte unchanged.
         """
+        self._jerk_stutter(joint_id, target_deg)     # no-op unless jerk is armed
+
         tol = config.SINGLE_JOINT_TOL_DEG
         period = 1.0 / config.SINGLE_JOINT_POLL_HZ
         stall_n = max(
@@ -1102,55 +1145,6 @@ class Arm:
                 )
 
             time.sleep(period)
-
-    def _drive_joint_jerky(
-        self,
-        joint_id: int,
-        target_deg: float,
-        base_speed_dps: float,
-        inj,
-        q_now,
-        label: str = "",
-    ) -> None:
-        """
-        Drive ONE joint to ``target_deg`` with a visible JERK STUTTER, then a
-        clean settle.
-
-        Single-joint execution has no CONTROL_RATE_HZ setpoint stream to carry a
-        tremor, and the SINGLE_JOINT_TOL_DEG arrival window swallows a small
-        offset. So, when ``inj`` is armed, the move becomes
-        ``config.JERK_SINGLE_JOINT_SUBSTEPS`` transient jittered sub-commands
-        (``target +/- joint_offset*GAIN`` at a jittered speed, fire-and-dwell --
-        no arrival wait, so each is preempted mid-slew by the next under
-        fresh_mode=1), followed by a plain ``_drive_joint`` onto the true target
-        so the joint still ends exactly where planned (and keeps the dropped-
-        packet stall/re-send resilience).
-
-        Falls back to a single clean ``_drive_joint`` when ``inj`` is inert or
-        ``JERK_SINGLE_JOINT_SUBSTEPS <= 0`` -- byte-identical to a non-jerk run.
-        ``q_now`` is the current 6-joint vector, used only to workspace-check
-        each jittered sub-target.
-        """
-        j = joint_id - 1
-        if (inj is None or not inj.active
-                or config.JERK_SINGLE_JOINT_SUBSTEPS <= 0):
-            self._drive_joint(joint_id, target_deg, base_speed_dps, label)
-            return
-
-        soft = config.joint_limits_array()
-        q = np.asarray(q_now, dtype=float).copy()
-        for _ in range(int(config.JERK_SINGLE_JOINT_SUBSTEPS)):
-            off = inj.joint_offset(j) * config.JERK_SINGLE_JOINT_GAIN
-            spd = float(np.clip(base_speed_dps * inj.speed_factor(), 1.0,
-                                config.MAX_JOINT_SPEED_DPS[j]))
-            sub = float(np.clip(target_deg + off, soft[j, 0], soft[j, 1]))
-            q[j] = sub
-            if check_workspace_bounds(forward_kinematics(q)[:3, 3]) is not None:
-                continue                      # this wobble would leave the envelope
-            self.conn.send_angle(joint_id, sub, spd)
-            time.sleep(config.JERK_SUBSTEP_DWELL_S)
-
-        self._drive_joint(joint_id, target_deg, base_speed_dps, label)
 
 # ---------------------------------------------------------------------------
 # helpers

@@ -97,17 +97,6 @@ DESCENT_SPEED_CM_S = 4.0      # cm/s for the coordinated lift and grab/place des
 # explicit indices here.
 PICK_ORDER = list(range(len(CUBES_INITIAL_POINTS)))
 
-# -- deliberate jitter (jerk) --------------------------------------------------
-# All four default to 0 / None -> armik.jerk.JerkInjector is INERT and the motion
-# is byte-for-byte identical to a clean run. v2's cube moves are coordinated /
-# streamed (send_coords / move_joints -> Arm._execute), which applies the jerk
-# tremor per control tick; go_home stays clean. Set JERK_SEED to an int to
-# replay a run exactly.
-JERK = 0.0                       # -> arm.jerk             (0 smooth; ~1-3 subtle; ~5-10 violent)
-JERK_RANDOM_TWITCH = 0.0         # -> arm.random_twitch    (flinch probability per tick [0,1])
-JERK_TWITCH_INTENSITY_DEG = 0.0  # -> arm.twitch_intensity (peak flinch amplitude, deg)
-JERK_SEED = None                 # -> arm.jerk_seed        (None = fresh each run; int = repeatable)
-
 # -- scripted nudge ("defective cube") ------------------------------------------
 NUDGE_CYCLE = -1                # EVEN (reach) cycle index whose cube is nudged; -1 = off
 NUDGE_OFFSET_CM = (3.0, 0.0, 0.0)   # where the nudged cube ends up
@@ -478,13 +467,11 @@ def main():
     paths = [get_path(s["origin"], s["target"]) for s in segments]
 
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
-    arm.jerk = JERK
-    arm.random_twitch = JERK_RANDOM_TWITCH
-    arm.twitch_intensity = JERK_TWITCH_INTENSITY_DEG
-    arm.jerk_seed = JERK_SEED
-    if arm.jerk > 0 or (arm.random_twitch and arm.twitch_intensity):
-        print(f"JERK on: jerk={JERK} twitch={JERK_RANDOM_TWITCH}@{JERK_TWITCH_INTENSITY_DEG}deg "
-              f"seed={JERK_SEED} (coordinated/streamed moves only; go_home stays clean)")
+    # Jerky motion? Set these on the Arm -- v2's cube moves are coordinated /
+    # streamed, so the jerk tremor rides them per control tick; homing stutters
+    # too. Amplitude / velocity dials + seed: armik/config.py JERK_* /
+    # config.JERK_SEED. Left off by default.
+    # arm.jerk = 5.0; arm.random_twitch = 0.2; arm.twitch_intensity = 5.0
 
     bridge = None
     if args.rviz:

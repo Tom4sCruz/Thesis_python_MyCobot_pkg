@@ -82,17 +82,20 @@ RANDOM_SEED = 0                   # fixed -> the same run every time ("High Robo
 
 # -- cubes (MEASURE AND REPLACE) ----------------------------------------------
 # (x, y, z) CM, at the GRIPPER TIP, base frame, z from the table.
+
+Z_CUBE_COORD = -4.0
+
 CUBES_INITIAL_POINTS = [          # a row on the pick side
-    (15.0, 10.0, 0.0),
-    (15.0, 13.0, 0.0),
-    (15.0, 16.0, 0.0),
-    (15.0, 19.0, 0.0),
+    (15.0, 13.0, Z_CUBE_COORD),
+    (15.0, 15.0, Z_CUBE_COORD),
+    (15.0, 16.0, Z_CUBE_COORD),
+    (15.0, 19.0, Z_CUBE_COORD),
 ]
 CUBES_TARGET_POINTS = [           # clean, evenly-spaced drop row, uniform z -- no overshoot
-    (15.0, -10.0, 0.0),
-    (15.0, -13.0, 0.0),
-    (15.0, -16.0, 0.0),
-    (15.0, -19.0, 0.0),
+    (15.0, -13.0, Z_CUBE_COORD),
+    (15.0, -15.0, Z_CUBE_COORD),
+    (15.0, -16.0, Z_CUBE_COORD),
+    (15.0, -19.0, Z_CUBE_COORD),
 ]
 
 # Gripper orientation (rx, ry, rz DEG) held for EVERY move so the gripper stays
@@ -118,13 +121,13 @@ ORIENT_LOCK_SIGN = 1.0            # flip to -1.0 if "base" yaws the gripper the 
 # (z0 + z1)/2, floored at MIN_ARC_HEIGHT_CM.
 # Keep APEX_Z_CM reachable at PICK_ORIENTATION_DEG: gripper-down the arm runs out
 # of reach around world z ~ 17-18 cm near the workspace edge.
-APEX_Z_CM = 15.0
+APEX_Z_CM = 10.0
 MIN_ARC_HEIGHT_CM = 2.0          # floor, so a near-flat arc still clears the table / cubes
 # CONSTANT tip speed -- get_durations gives every arc equal per-segment times, so
 # there is no ease-in / ease-out. Check each arc's "peak N deg/s" in a --mock run
 # against config.MAX_JOINT_SPEED_DPS; lower toward 25 / 20 if any arc is refused
 # ("segment ... too fast for the hardware") or nears a joint limit.
-CRUISE_SPEED_CM_S = 30.0
+CRUISE_SPEED_CM_S = 19.0
 LEADOUT_SPEED_CM_S = 10.0        # the final arc back toward HOME cruises slower / gentler
 PATH_WAYPOINTS = 30              # samples per arc
 MIN_SEGMENT_S = 0.02

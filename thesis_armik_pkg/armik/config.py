@@ -215,10 +215,11 @@ JERK_MAX_DEG = 10.0
 # Single-joint execution sends one servo command per joint and blocks until it
 # arrives -- no CONTROL_RATE_HZ stream to carry a tremor, and the
 # SINGLE_JOINT_TOL_DEG window swallows a small offset. So when jerk is armed
-# (arm.jerk / arm.twitch_intensity) a joint move becomes a short STUTTER: a few
-# transient jittered sub-commands (fire-and-dwell, each preempted mid-slew by the
-# next under fresh_mode=1), then a clean settle onto the true target. Two
-# INDEPENDENT dials:
+# (arm.jerk / arm.twitch_intensity) a joint move becomes a short STUTTER, of one
+# of two shapes (STUTTER_TYPE): a lateral WOBBLE, or a STOP-and-go hesitation.
+# The WOBBLE (STUTTER_TYPE = 1) fires a few transient jittered sub-commands
+# (fire-and-dwell, each preempted mid-slew by the next under fresh_mode=1), then
+# a clean settle onto the true target. Two INDEPENDENT dials:
 #   AMPLITUDE ("how much") -- each wobble deviates from the target by the
 #     injector's per-joint offset (arm.jerk drives the tremor,
 #     arm.twitch_intensity the flinches) times JERK_SINGLE_JOINT_GAIN.
@@ -228,12 +229,22 @@ JERK_MAX_DEG = 10.0
 #     + short = a violent snap; slow + long = a lazy "move to a plotted point and
 #     back". The clean settle afterwards uses the caller's own speed.
 # jerk = 0 -> no sub-commands, exactly one clean send, byte-for-byte unchanged.
-JERK_SINGLE_JOINT_SUBSTEPS = 3      # jittered sub-commands per joint move (0 disables the stutter)
-JERK_SINGLE_JOINT_GAIN     = 3.0    # AMPLITUDE: multiplier on the per-joint offset
-JERK_SUBSTEP_SPEED_DPS     = 180.0  # VELOCITY: deg/s the wobble sub-commands slew at. >= about
+JERK_SINGLE_JOINT_SUBSTEPS = 7      # sub-commands / stops per joint move (0 disables the stutter)
+JERK_SINGLE_JOINT_GAIN     = 1.5    # AMPLITUDE: multiplier on the per-joint offset (WOBBLE only)
+JERK_SUBSTEP_SPEED_DPS     = 120.0  # VELOCITY: deg/s the wobble sub-commands slew at. >= about
                                    # DEG_PER_S_AT_SPEED_100 all map to the firmware's top speed;
                                    # drop below that (~10-120) for slower, laggier wobbles
-JERK_SUBSTEP_DWELL_S       = 0.05   # VELOCITY: gap between wobble sub-commands (no arrival wait)
+JERK_SUBSTEP_DWELL_S       = 0.10   # VELOCITY: gap between wobble sub-commands / length of each stop
+
+# STUTTER shape:
+#   1 -> WOBBLE: jittered sub-commands to target +/- offset (uses the AMPLITUDE +
+#        VELOCITY dials above).
+#   0 -> STOP-and-go: no lateral motion. The joint is driven toward the true
+#        target, then halted JERK_SINGLE_JOINT_SUBSTEPS times (conn.stop()), each
+#        halt JERK_SUBSTEP_DWELL_S long -- and it also travels ~DWELL_S between
+#        halts -- then driven cleanly the rest of the way. A hesitant start-stop
+#        crawl. AMPLITUDE / GAIN / SUBSTEP_SPEED_DPS are ignored.
+STUTTER_TYPE = 0
 
 # ---------------------------------------------------------------------------
 # pymycobot interface

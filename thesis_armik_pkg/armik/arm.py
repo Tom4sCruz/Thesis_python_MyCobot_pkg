@@ -828,20 +828,36 @@ class Arm:
         """Back-compat alias -- returns the persistent `_jerk_injector`."""
         return self._jerk_injector
 
-    def _jerk_stutter(self, joint_id: int, target_deg: float) -> None:
-        """Fire `config.JERK_SINGLE_JOINT_SUBSTEPS` transient jittered
-        sub-commands for ONE joint before it is driven cleanly onto `target_deg`.
-        Single-joint execution has no CONTROL_RATE_HZ stream to carry a tremor and
-        the SINGLE_JOINT_TOL_DEG window swallows a small offset, so this is how
-        `arm.jerk` becomes visible there: each sub-command is `target +/- (per-
-        joint offset * JERK_SINGLE_JOINT_GAIN)` slewed at `JERK_SUBSTEP_SPEED_DPS`
-        (the VELOCITY dial -- NOT the caller's speed), fire-and-dwell so the next
-        one preempts it mid-slew under fresh_mode=1. No-op when the injector is
-        inert or SUBSTEPS <= 0 (then the caller's single clean send is
-        byte-identical to a non-jerk run)."""
+    def _jerk_stutter(self, joint_id: int, target_deg: float, base_speed_dps: float) -> None:
+        """Make `arm.jerk` visible on a single-joint move, in one of two shapes
+        (`config.STUTTER_TYPE`), before the joint is driven cleanly onto
+        `target_deg`. No-op when the injector is inert or SUBSTEPS <= 0 (then the
+        caller's single clean send is byte-identical to a non-jerk run).
+
+        STUTTER_TYPE = 1 (WOBBLE): fire `config.JERK_SINGLE_JOINT_SUBSTEPS`
+        transient sub-commands to `target +/- (per-joint offset *
+        JERK_SINGLE_JOINT_GAIN)` slewed at `JERK_SUBSTEP_SPEED_DPS` (the VELOCITY
+        dial -- NOT the caller's speed), fire-and-dwell so the next preempts it
+        mid-slew under fresh_mode=1.
+
+        STUTTER_TYPE = 0 (STOP-and-go): no lateral motion. Command the real move,
+        then halt (`conn.stop()`) `JERK_SINGLE_JOINT_SUBSTEPS` times, each halt
+        `JERK_SUBSTEP_DWELL_S` long (and ~DWELL_S of travel between halts), then
+        resume -- at the caller's `base_speed_dps`. A hesitant start-stop crawl.
+        """
         inj = self._jerk_injector
         if not inj.active or config.JERK_SINGLE_JOINT_SUBSTEPS <= 0:
             return
+
+        if config.STUTTER_TYPE == 0:
+            self.conn.send_angle(joint_id, target_deg, base_speed_dps)
+            for _ in range(int(config.JERK_SINGLE_JOINT_SUBSTEPS)):
+                time.sleep(config.JERK_SUBSTEP_DWELL_S)      # travelling toward target
+                self.conn.stop()                            # abrupt halt
+                time.sleep(config.JERK_SUBSTEP_DWELL_S)      # held still
+                self.conn.send_angle(joint_id, target_deg, base_speed_dps)  # resume
+            return
+
         j = joint_id - 1
         soft = config.joint_limits_array()
         wob = min(float(config.JERK_SUBSTEP_SPEED_DPS),
@@ -1095,12 +1111,13 @@ class Arm:
         costs nothing.
 
         When deliberate jerk is armed (``arm.jerk`` / ``arm.twitch_intensity``)
-        the move is preceded by a STUTTER of transient jittered sub-commands
-        (:meth:`_jerk_stutter`); the clean send + poll loop below then drives the
-        joint exactly onto ``target_deg`` at the caller's ``speed_dps``. jerk = 0
-        -> just the clean send, byte-for-byte unchanged.
+        the move is preceded by a STUTTER -- a lateral wobble or a stop-and-go
+        hesitation, per ``config.STUTTER_TYPE`` (:meth:`_jerk_stutter`); the clean
+        send + poll loop below then drives the joint exactly onto ``target_deg``
+        at the caller's ``speed_dps``. jerk = 0 -> just the clean send,
+        byte-for-byte unchanged.
         """
-        self._jerk_stutter(joint_id, target_deg)     # no-op unless jerk is armed
+        self._jerk_stutter(joint_id, target_deg, speed_dps)   # no-op unless jerk is armed
 
         tol = config.SINGLE_JOINT_TOL_DEG
         period = 1.0 / config.SINGLE_JOINT_POLL_HZ

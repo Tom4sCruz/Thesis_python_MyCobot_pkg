@@ -828,7 +828,7 @@ class Arm:
         """Back-compat alias -- returns the persistent `_jerk_injector`."""
         return self._jerk_injector
 
-    def _jerk_stutter(self, joint_id: int, target_deg: float, base_speed_dps: float) -> None:
+    def _jerk_stutter(self, joint_id: int, target_deg: float) -> None:
         """Make `arm.jerk` visible on a single-joint move, in one of two shapes
         (`config.STUTTER_TYPE`), before the joint is driven cleanly onto
         `target_deg`. No-op when the injector is inert or SUBSTEPS <= 0 (then the
@@ -840,23 +840,17 @@ class Arm:
         dial -- NOT the caller's speed), fire-and-dwell so the next preempts it
         mid-slew under fresh_mode=1.
 
-        STUTTER_TYPE = 0 (STOP-and-go): no lateral motion. Command the real move,
-        then halt (`conn.stop()`) `JERK_SINGLE_JOINT_SUBSTEPS` times, each halt
-        `JERK_SUBSTEP_DWELL_S` long (and ~DWELL_S of travel between halts), then
-        resume -- at the caller's `base_speed_dps`. A hesitant start-stop crawl.
+        STUTTER_TYPE = 0 (STOP-and-go): no lateral motion -- the joint is halted
+        `JERK_SINGLE_JOINT_SUBSTEPS` times at RANDOM points spread across the
+        move, each halt `JERK_SUBSTEP_DWELL_S` long. That is done inside
+        `_drive_joint`'s poll loop (so arrival stays guaranteed), NOT here; this
+        method is a no-op for type 0.
         """
         inj = self._jerk_injector
         if not inj.active or config.JERK_SINGLE_JOINT_SUBSTEPS <= 0:
             return
-
         if config.STUTTER_TYPE == 0:
-            self.conn.send_angle(joint_id, target_deg, base_speed_dps)
-            for _ in range(int(config.JERK_SINGLE_JOINT_SUBSTEPS)):
-                time.sleep(config.JERK_SUBSTEP_DWELL_S)      # travelling toward target
-                self.conn.stop()                            # abrupt halt
-                time.sleep(config.JERK_SUBSTEP_DWELL_S)      # held still
-                self.conn.send_angle(joint_id, target_deg, base_speed_dps)  # resume
-            return
+            return                                          # handled in _drive_joint
 
         j = joint_id - 1
         soft = config.joint_limits_array()
@@ -1111,13 +1105,13 @@ class Arm:
         costs nothing.
 
         When deliberate jerk is armed (``arm.jerk`` / ``arm.twitch_intensity``)
-        the move is preceded by a STUTTER -- a lateral wobble or a stop-and-go
-        hesitation, per ``config.STUTTER_TYPE`` (:meth:`_jerk_stutter`); the clean
-        send + poll loop below then drives the joint exactly onto ``target_deg``
-        at the caller's ``speed_dps``. jerk = 0 -> just the clean send,
-        byte-for-byte unchanged.
+        the move gets a STUTTER, per ``config.STUTTER_TYPE``: type 1 is a lateral
+        wobble fired first by :meth:`_jerk_stutter`; type 0 is a stop-and-go --
+        ``conn.stop()`` at ``JERK_SINGLE_JOINT_SUBSTEPS`` random points across the
+        move, woven into the poll loop below so arrival stays guaranteed. jerk = 0
+        -> just the clean send, byte-for-byte unchanged.
         """
-        self._jerk_stutter(joint_id, target_deg, speed_dps)   # no-op unless jerk is armed
+        self._jerk_stutter(joint_id, target_deg)   # type-1 wobble; no-op otherwise
 
         tol = config.SINGLE_JOINT_TOL_DEG
         period = 1.0 / config.SINGLE_JOINT_POLL_HZ
@@ -1126,9 +1120,22 @@ class Arm:
         )
         suffix = f" ({label})" if label else ""
 
+        # STUTTER_TYPE == 0: random fractions of the total travel at which to halt.
+        stop_fracs: list[float] = []
+        _inj = self._jerk_injector
+        if (_inj.active and config.STUTTER_TYPE == 0
+                and config.JERK_SINGLE_JOINT_SUBSTEPS > 0):
+            stop_fracs = sorted(
+                float(_inj.rng.random())
+                for _ in range(int(config.JERK_SINGLE_JOINT_SUBSTEPS))
+            )
+        q_start = float(self.conn.get_angles()[joint_id - 1])
+        span = max(abs(target_deg - q_start), 1e-6)
+
         self.conn.send_angle(joint_id, target_deg, speed_dps)
         sends = 1
         deadline = time.perf_counter() + config.SINGLE_JOINT_TIMEOUT_S
+        deadline += len(stop_fracs) * config.JERK_SUBSTEP_DWELL_S   # deliberate holds don't eat the budget
         prev = None
         still = 0
         time.sleep(period)                     # let the write land / the servo start
@@ -1141,6 +1148,17 @@ class Arm:
 
             if gap <= tol:
                 return
+
+            if stop_fracs and abs(current - q_start) / span >= stop_fracs[0]:
+                stop_fracs.pop(0)
+                print(f"  J{joint_id} stutter-stop at {current:.2f} "
+                      f"({100 * abs(current - q_start) / span:.0f}% of the move)")
+                self.conn.stop()
+                time.sleep(config.JERK_SUBSTEP_DWELL_S)
+                self.conn.send_angle(joint_id, target_deg, speed_dps)   # resume toward target
+                prev, still = None, 0          # a deliberate stop is not a stall
+                time.sleep(period)
+                continue
 
             if prev is not None and abs(current - prev) < config.SINGLE_JOINT_PROGRESS_DEG:
                 still += 1

@@ -239,11 +239,12 @@ JERK_SUBSTEP_DWELL_S       = 0.10   # VELOCITY: gap between wobble sub-commands 
 # STUTTER shape:
 #   1 -> WOBBLE: jittered sub-commands to target +/- offset (uses the AMPLITUDE +
 #        VELOCITY dials above).
-#   0 -> STOP-and-go: no lateral motion. The joint is driven toward the true
-#        target, then halted JERK_SINGLE_JOINT_SUBSTEPS times (conn.stop()), each
-#        halt JERK_SUBSTEP_DWELL_S long -- and it also travels ~DWELL_S between
-#        halts -- then driven cleanly the rest of the way. A hesitant start-stop
-#        crawl. AMPLITUDE / GAIN / SUBSTEP_SPEED_DPS are ignored.
+#   0 -> STOP-and-go: no lateral motion. As the joint travels to its target it is
+#        halted (conn.stop()) JERK_SINGLE_JOINT_SUBSTEPS times at RANDOM points
+#        spread across the move (from the seeded jerk rng -- JERK_SEED reproduces
+#        the pattern), each halt JERK_SUBSTEP_DWELL_S long, then it carries on.
+#        Arrival is still guaranteed (the stops live inside _drive_joint's poll /
+#        stall-retry loop). AMPLITUDE / GAIN / SUBSTEP_SPEED_DPS are ignored.
 STUTTER_TYPE = 0
 
 # ---------------------------------------------------------------------------

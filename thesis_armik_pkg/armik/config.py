@@ -205,6 +205,21 @@ JERK_TWITCH_DECAY_TICKS = 4       # ticks to decay it back to zero
 # Hard per-joint cap on the TOTAL perturbation (tremor + twitch), in degrees.
 JERK_MAX_DEG = 8.0
 
+# --- Deliberate jerk in SINGLE-JOINT mode -----------------------------------
+# Single-joint execution sends one servo command per joint and blocks until it
+# arrives -- there is no CONTROL_RATE_HZ setpoint stream to carry a tremor, and
+# the SINGLE_JOINT_TOL_DEG arrival window swallows a small offset. So when jerk
+# is armed a jittered joint move becomes a short STUTTER: JERK_SINGLE_JOINT_
+# SUBSTEPS transient jittered sub-commands (fire-and-dwell, each preempted
+# mid-slew by the next under fresh_mode=1), then a clean settle onto the true
+# target. All additive: jerk = 0 -> exactly one clean send, byte-for-byte
+# unchanged.
+JERK_SINGLE_JOINT_SUBSTEPS = 3     # jittered sub-commands per joint move (0 disables the stutter)
+JERK_SINGLE_JOINT_GAIN     = 3.0   # scales the per-joint offset -- streamed mode applies it
+                                   # CONTROL_RATE_HZ times/s, here only a few, so it must be
+                                   # bigger to be felt against SINGLE_JOINT_TOL_DEG
+JERK_SUBSTEP_DWELL_S       = 0.12  # dwell after each jittered sub-command (no arrival check)
+
 # ---------------------------------------------------------------------------
 # pymycobot interface
 # ---------------------------------------------------------------------------

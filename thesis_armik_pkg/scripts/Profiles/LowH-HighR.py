@@ -86,7 +86,7 @@ CUBES_TARGET_POINTS = [           # the drop row; cube picked k-th goes to slot 
 # gripper-straight-down, read arm.get_coords()[3:] (current TOOL frame).
 PICK_ORIENTATION_DEG = (180.0, 0.0, -45.0)
 
-APPROACH_HEIGHT_CM = 6.0          # hover height above a cube before descending
+APPROACH_HEIGHT_CM = 10.0          # hover height above a cube before descending
 
 # -- robotic motion --------------------------------------------------------------
 JOINT_SPEED_DPS = 60.0           # fast, CONSTANT deg/s for every single-joint move and
@@ -261,47 +261,34 @@ def _plan_pose_q(arm, x, y, z, label):
 
 def _step_joints(arm, order, q_goal, inj, is_last, label):
     """Drive the joints in `order` (1-based) to their `q_goal` values, one servo
-    at a time: skip any already within SINGLE_JOINT_TOL_DEG; else
-    arm._drive_joint (send at JOINT_SPEED_DPS, block until arrived, re-send on a
-    stall), then SINGLE_JOINT_DELAY. A trailing
-    SINGLE_JOINT_DELAY_BETWEEN_POINTS unless `is_last`. Re-reads arm.get_angles()
-    on entry, so drift from a J1-only swing never accumulates. Mirrors
-    Arm._execute_single_joint's inner loop, including the deliberate-jitter path
-    (angle + speed perturbed for every step EXCEPT when is_last, and only when
-    the injector is active). Returns bool."""
-    soft = config.joint_limits_array()
+    at a time: skip any already within SINGLE_JOINT_TOL_DEG; else drive it with
+    arm._drive_joint_jerky (a jerk STUTTER when `inj` is armed and not `is_last`,
+    otherwise one clean send -- both stall/re-send resilient), then
+    SINGLE_JOINT_DELAY. A trailing SINGLE_JOINT_DELAY_BETWEEN_POINTS unless
+    `is_last`. Re-reads arm.get_angles() on entry, so drift from a J1-only swing
+    never accumulates. Returns bool."""
     cur = np.array(arm.get_angles(), dtype=float)
     moved = []
     for j in order:
         a_goal = float(q_goal[j - 1])
         if abs(a_goal - float(cur[j - 1])) <= config.SINGLE_JOINT_TOL_DEG:
             continue
-        speed = JOINT_SPEED_DPS
-        cmd = a_goal
-        if inj.active and not is_last:
-            move_time = abs(a_goal - float(cur[j - 1])) / max(speed, 1e-6)
-            jittered = float(np.clip(a_goal + float(inj.offsets(move_time)[j - 1]),
-                                     soft[j - 1, 0], soft[j - 1, 1]))
-            cand = cur.copy()
-            cand[j - 1] = jittered
-            if kinematics.check_workspace_bounds(
-                    kinematics.forward_kinematics(cand)[:3, 3]) is None:
-                cmd = jittered
-            speed = min(max(speed * inj.speed_factor(), 1.0),
-                        config.MAX_JOINT_SPEED_DPS[j - 1])
         cand = cur.copy()
-        cand[j - 1] = cmd
+        cand[j - 1] = a_goal
         be = kinematics.check_workspace_bounds(
             kinematics.forward_kinematics(cand)[:3, 3])
         if be is not None:
             print(f"  {label}: J{j} refused -- {be}")
             return False
         try:
-            arm._drive_joint(j, cmd, speed, label)
+            if inj.active and not is_last:
+                arm._drive_joint_jerky(j, a_goal, JOINT_SPEED_DPS, inj, cur, label)
+            else:
+                arm._drive_joint(j, a_goal, JOINT_SPEED_DPS, label)
         except ArmError as exc:
             print(f"  {label}: {exc}")
             return False
-        cur[j - 1] = cmd
+        cur[j - 1] = a_goal
         moved.append(j)
         time.sleep(config.SINGLE_JOINT_DELAY)
     if not is_last:

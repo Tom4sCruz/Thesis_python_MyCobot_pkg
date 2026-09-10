@@ -70,17 +70,17 @@ CUBES_INITIAL_POINTS = [          # a row on the pick side, LISTED LEFT -> RIGHT
     (15.0, 19.0, Z_CUBE_COORD),
 ]
 CUBES_TARGET_POINTS = [           # the drop row; cube picked k-th goes to slot k
-    (15.0, -10.0, 0.0),
-    (15.0, -13.0, 0.0),
-    (15.0, -16.0, 0.0),
-    (15.0, -19.0, 0.0),
+    (15.0, -10.0, Z_CUBE_COORD),
+    (15.0, -13.0, Z_CUBE_COORD),
+    (15.0, -16.0, Z_CUBE_COORD),
+    (15.0, -19.0, Z_CUBE_COORD),
 ]
 
 # Gripper orientation (rx, ry, rz DEG) held for EVERY move. CALIBRATION: jog to
 # gripper-straight-down, read arm.get_coords()[3:] (current TOOL frame).
 PICK_ORIENTATION_DEG = (180.0, 0.0, -45.0)
 
-APPROACH_HEIGHT_CM = 6.0          # hover height above a cube (preflight checks only)
+APPROACH_HEIGHT_CM = 10.0          # hover height above a cube (preflight checks only)
 
 # -- robotic motion --------------------------------------------------------------
 JOINT_SPEED_DPS = 60.0           # fast, CONSTANT deg/s for the J1 swing + homing
@@ -96,6 +96,17 @@ DESCENT_SPEED_CM_S = 4.0      # cm/s for the coordinated lift and grab/place des
 # grab order -- deterministic. Arrange CUBES_INITIAL_POINTS left->right, or set
 # explicit indices here.
 PICK_ORDER = list(range(len(CUBES_INITIAL_POINTS)))
+
+# -- deliberate jitter (jerk) --------------------------------------------------
+# All four default to 0 / None -> armik.jerk.JerkInjector is INERT and the motion
+# is byte-for-byte identical to a clean run. v2's cube moves are coordinated /
+# streamed (send_coords / move_joints -> Arm._execute), which applies the jerk
+# tremor per control tick; go_home stays clean. Set JERK_SEED to an int to
+# replay a run exactly.
+JERK = 0.0                       # -> arm.jerk             (0 smooth; ~1-3 subtle; ~5-10 violent)
+JERK_RANDOM_TWITCH = 0.0         # -> arm.random_twitch    (flinch probability per tick [0,1])
+JERK_TWITCH_INTENSITY_DEG = 0.0  # -> arm.twitch_intensity (peak flinch amplitude, deg)
+JERK_SEED = None                 # -> arm.jerk_seed        (None = fresh each run; int = repeatable)
 
 # -- scripted nudge ("defective cube") ------------------------------------------
 NUDGE_CYCLE = -1                # EVEN (reach) cycle index whose cube is nudged; -1 = off
@@ -467,6 +478,13 @@ def main():
     paths = [get_path(s["origin"], s["target"]) for s in segments]
 
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
+    arm.jerk = JERK
+    arm.random_twitch = JERK_RANDOM_TWITCH
+    arm.twitch_intensity = JERK_TWITCH_INTENSITY_DEG
+    arm.jerk_seed = JERK_SEED
+    if arm.jerk > 0 or (arm.random_twitch and arm.twitch_intensity):
+        print(f"JERK on: jerk={JERK} twitch={JERK_RANDOM_TWITCH}@{JERK_TWITCH_INTENSITY_DEG}deg "
+              f"seed={JERK_SEED} (coordinated/streamed moves only; go_home stays clean)")
 
     bridge = None
     if args.rviz:

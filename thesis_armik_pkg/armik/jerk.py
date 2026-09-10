@@ -32,6 +32,12 @@ The injector is INERT -- ``offsets()`` returns zeros, ``speed_factor()`` returns
 Pure numpy, no hardware, deterministic given the rng. Per tick, call
 ``offsets()`` first, then ``speed_factor()`` -- both draw from the rng and
 advance internal state, so a consistent call order keeps runs reproducible.
+
+``Arm._execute()`` streams at ``CONTROL_RATE_HZ`` and uses ``offsets()`` (all six
+joints per tick). Single-joint execution (``Arm._execute_single_joint`` and the
+hand-rolled profile steppers, via ``Arm._drive_joint_jerky``) has no such stream,
+so it calls ``joint_offset(joint_idx)`` once per stutter sub-step instead: one
+joint at a time, with twitches redirected onto the joint being moved.
 """
 
 from __future__ import annotations
@@ -141,6 +147,51 @@ class JerkInjector:
             self._twitches = live
 
         return np.clip(out, -self._cap, self._cap)
+
+    def joint_offset(self, joint_idx: int) -> float:
+        """Scalar perturbation (deg) for ONE joint -- the counterpart to
+        ``offsets()`` for a SINGLE-JOINT stepper that advances the injector once
+        per joint move (or per stutter sub-step) rather than once per control
+        tick.
+
+        Returns the per-joint AR(1) tremor for ``joint_idx`` PLUS any twitch
+        that fires on this call, forced onto ``joint_idx`` (``offsets()`` spawns
+        twitches on a random joint, so a caller reading only one component of
+        the 6-vector misses almost all of them -- this makes ``random_twitch`` /
+        ``twitch_intensity`` actually felt in single-joint mode). Advances
+        internal state; call once per (sub-)step, then ``speed_factor()``.
+        Clipped to +/-JERK_MAX_DEG. ``0.0`` when inert.
+        """
+        if not self.active:
+            return 0.0
+
+        if self._tremor_sigma > 0.0:
+            self._tremor[joint_idx] = (
+                self._rho * self._tremor[joint_idx]
+                + self._innov * self._tremor_sigma * float(self.rng.standard_normal())
+            )
+        out = float(self._tremor[joint_idx])
+
+        if self.random_twitch > 0.0 and self.twitch_intensity != 0.0:
+            if self.rng.random() < self.random_twitch:
+                sign = 1.0 if self.rng.random() < 0.5 else -1.0
+                amp = sign * abs(self.twitch_intensity) * (0.5 + 0.5 * self.rng.random())
+                self._twitches.append(_Twitch(
+                    joint=int(joint_idx),
+                    peak_deg=amp,
+                    rise=int(config.JERK_TWITCH_RISE_TICKS),
+                    decay=int(config.JERK_TWITCH_DECAY_TICKS),
+                ))
+            live: list[_Twitch] = []
+            for tw in self._twitches:
+                if tw.joint == joint_idx:
+                    out += tw.value()
+                tw.advance()
+                if not tw.done:
+                    live.append(tw)
+            self._twitches = live
+
+        return float(np.clip(out, -self._cap, self._cap))
 
     def speed_factor(self) -> float:
         """Multiplier for this tick's commanded joint speed ('uneven pace')."""

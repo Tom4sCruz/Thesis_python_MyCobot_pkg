@@ -7,10 +7,15 @@ Move cubes from one side of the frame to the other, fast and precise, tracing
 the exact same fluid arc every run -- a skilled operator / a well-tuned
 collaborative robot:
 
-  * every move is a smooth PARABOLIC arc -- accelerate out of the start,
-    decelerate into the end (EASE_IN / EASE_OUT);
+  * every move is a PARABOLIC arc whose APEX reaches a FIXED world height
+    (APEX_Z_CM) regardless of how far the move travels -- unlike HighH-LowR,
+    where a long carry lifts much higher than a short one;
+  * each arc is traversed at CONSTANT tip speed -- no ease-in / ease-out
+    (CRUISE_SPEED_CM_S; the final lead-out to HOME at LEADOUT_SPEED_CM_S). Each
+    arc still starts and ends at a full stop, so the very first / last setpoint
+    of an arc unavoidably ramps;
   * every run is IDENTICAL -- no shuffle, no per-move variation (SHUFFLE_ORDER
-    off, VARIATION 0). The same smooth trajectory, every time;
+    off, VARIATION 0). The same trajectory, every time;
   * the cubes are grabbed strictly LEFT -> RIGHT (order = CUBES_INITIAL_POINTS
     as listed);
   * they are dropped in a CLEAN, EVENLY-SPACED row at a uniform height
@@ -39,8 +44,8 @@ then runs on a background thread so the arm never stops. Empty TRIGGER_BOXES
 (the default) keeps everything single-threaded.
 
 Everything you tune is a CONSTANT below. The cube coordinates,
-PICK_ORIENTATION_DEG and MAX_HEIGHT_TRAJECTORY are PLACEHOLDERS -- measure them
-on your arm first.
+PICK_ORIENTATION_DEG and APEX_Z_CM are PLACEHOLDERS -- measure them on your arm
+first.
 """
 
 from __future__ import annotations
@@ -105,24 +110,22 @@ ORIENT_LOCK = "world"
 ORIENT_LOCK_SIGN = 1.0            # flip to -1.0 if "base" yaws the gripper the wrong way
 
 # -- arc + velocity profile --------------------------------------------------
-# All arcs are pieces of ONE shared parabola  y = a*x^2 + c  (b = 0, symmetric
-# about the chord midpoint). The WIDEST move in the run rises to
-# MAX_HEIGHT_TRAJECTORY; every shorter move keeps the same curvature `a` and so
-# lifts less: apex_i = MAX_HEIGHT_TRAJECTORY * (chord_i / chord_widest) ** 2.
-# Height is measured ABOVE the (possibly sloped, possibly diagonal) chord, and
-# "chord" is the HORIZONTAL (xy) distance -- so a straight-down pick barely
-# lifts, and moves in any xy direction (incl. right -> front) work unchanged.
-# Keep MAX_HEIGHT_TRAJECTORY reachable at PICK_ORIENTATION_DEG: gripper-down the
-# arm runs out of reach around world z ~ 17-18 cm near the workspace edge.
-MAX_HEIGHT_TRAJECTORY = 15.0
-MIN_ARC_HEIGHT_CM = 2.0          # floor, so short moves still clear the table / other cubes
-CRUISE_SPEED_CM_S = 30.0          # peak tip speed (fast); the ease dials stretch the move
-                                 # time. Check each arc's "peak N deg/s" in a --mock run
-                                 # against config.MAX_JOINT_SPEED_DPS; lower toward 25 if
-                                 # any arc nears its joint limit.
-LEADOUT_SPEED_CM_S = 10.0        # the final arc back toward HOME is slower / gentler
-EASE_IN = 5.0                    # [0,10] start-of-move acceleration shape. 0 = abrupt,
-EASE_OUT = 5.0                   # [0,10] end-of-move deceleration shape.  10 = long, gentle S
+# Every arc is a symmetric vertical parabola over the straight xy chord. Unlike
+# HighH-LowR's shared parabola (apex scaled by chord length), here the apex of
+# EVERY arc -- short carry, long carry, reach from HOME, lead-out -- reaches the
+# SAME world height APEX_Z_CM. _apex_h() back-solves the above-chord height for
+# each arc: _parabola_points peaks at (z0 + z1)/2 + h, so h = APEX_Z_CM -
+# (z0 + z1)/2, floored at MIN_ARC_HEIGHT_CM.
+# Keep APEX_Z_CM reachable at PICK_ORIENTATION_DEG: gripper-down the arm runs out
+# of reach around world z ~ 17-18 cm near the workspace edge.
+APEX_Z_CM = 15.0
+MIN_ARC_HEIGHT_CM = 2.0          # floor, so a near-flat arc still clears the table / cubes
+# CONSTANT tip speed -- get_durations gives every arc equal per-segment times, so
+# there is no ease-in / ease-out. Check each arc's "peak N deg/s" in a --mock run
+# against config.MAX_JOINT_SPEED_DPS; lower toward 25 / 20 if any arc is refused
+# ("segment ... too fast for the hardware") or nears a joint limit.
+CRUISE_SPEED_CM_S = 30.0
+LEADOUT_SPEED_CM_S = 10.0        # the final arc back toward HOME cruises slower / gentler
 PATH_WAYPOINTS = 30              # samples per arc
 MIN_SEGMENT_S = 0.02
 
@@ -132,7 +135,6 @@ MIN_SEGMENT_S = 0.02
 VARIATION = 0                  # [0,1] master scale; 0 = identical arcs every run
 APEX_HEIGHT_JITTER_FRAC = 0.0    # +/- fraction of an arc's own apex height
 BOW_JITTER_CM = 0.0             # +/- sideways bow, perpendicular to the chord
-EASE_JITTER = 0.0              # +/- on EASE_IN / EASE_OUT per move
 
 # -- order ------------------------------------------------------------------------
 SHUFFLE_ORDER = False            # deterministic: grab cubes left -> right, as listed
@@ -175,11 +177,6 @@ _AZ_REF = None                    # (x, y) tip position whose azimuth is rz's ze
 # GEOMETRY / PROFILE HELPERS
 # ===========================================================================
 
-def _smootherstep(p):
-    p = np.clip(p, 0.0, 1.0)
-    return 6 * p ** 5 - 15 * p ** 4 + 10 * p ** 3
-
-
 def _yaw(pts_xy):
     """rz for a run of waypoints, per ORIENT_LOCK. Returns a scalar (held), a
     per-waypoint list, or None (free) -- send_path accepts all three."""
@@ -215,19 +212,23 @@ def _polyline_points(verts, s_query):
     return verts[j] + frac[:, None] * seg[j], total
 
 
-def _chord_len(p, q):
-    """Horizontal (xy) distance between two points."""
-    return float(np.hypot(q[0] - p[0], q[1] - p[1]))
+def _apex_h(origin, target):
+    """Above-the-chord height h that puts the TOP of the arc at world
+    z = APEX_Z_CM, for ANY chord -- level or sloped.
 
-
-def _arc_height(d, d_max):
-    """Apex height (above the chord) for a move of horizontal length `d`, given
-    the widest move `d_max`. Shared parabola: a = -MAX_HEIGHT / (d_max/2)^2, and
-    c_i = -a * (d/2)^2 = MAX_HEIGHT * (d/d_max)^2."""
-    if d_max <= 1e-6:
-        return MIN_ARC_HEIGHT_CM
-    c = MAX_HEIGHT_TRAJECTORY * (d / d_max) ** 2
-    return float(np.clip(c, MIN_ARC_HEIGHT_CM, MAX_HEIGHT_TRAJECTORY))
+    _parabola_points builds z(u) = z0 + (z1-z0)*u + 4*h*u*(1-u); its maximum is
+    at u* = 0.5 + (z1-z0)/(8h) and equals (z0+z1)/2 + h + (z1-z0)**2/(16h).
+    Setting that to APEX_Z_CM gives a quadratic in h whose larger root is
+        h = (B + sqrt(B**2 - dz**2/4)) / 2 ,   B = APEX_Z_CM - (z0+z1)/2
+    which reduces to h = B when the chord is level (dz = 0). Floored at
+    MIN_ARC_HEIGHT_CM so a near-flat arc still humps clear of the table; falls
+    back to h = B if the discriminant is negative (APEX_Z_CM too low for a very
+    sloped chord)."""
+    z0, z1 = float(origin[2]), float(target[2])
+    b = APEX_Z_CM - 0.5 * (z0 + z1)
+    disc = b * b - 0.25 * (z1 - z0) ** 2
+    h = 0.5 * (b + math.sqrt(disc)) if disc > 0.0 else b
+    return float(max(h, MIN_ARC_HEIGHT_CM))
 
 
 def _parabola_points(origin, target, arc_height, rng):
@@ -268,45 +269,21 @@ def _parabola_points(origin, target, arc_height, rng):
 
 def get_path(origin_point, target_point, arc_height, rng=None):
     """Arc from origin to target as PATH_WAYPOINTS (x,y,z) points. `arc_height`
-    is this move's apex above the chord -- compute it with _arc_height()."""
+    is this move's apex above the chord -- compute it with _apex_h()."""
     return _parabola_points(origin_point, target_point, arc_height, rng)[0]
 
 
 def get_durations(origin_point, target_point, arc_height,
-                  ease_in_accel=EASE_IN, ease_out_accel=EASE_OUT,
                   cruise=CRUISE_SPEED_CM_S):
-    """PATH_WAYPOINTS-1 segment durations (s) for the arc between the two points,
-    shaped by the EASE_IN / EASE_OUT dials (0..10, no physical meaning)."""
+    """PATH_WAYPOINTS-1 EQUAL segment durations -> CONSTANT tip speed, no ease.
+    _parabola_points resamples the arc to equal arc-length steps, so equal time
+    per step == constant speed along the arc. Each arc still begins and ends at a
+    full stop (the gripper fires between arcs), so the rest-to-rest Hermite blend
+    still ramps the very first / last segment -- 'constant' is through the
+    interior."""
     _, L = _parabola_points(origin_point, target_point, arc_height, None)
-
-    a = float(np.clip(ease_in_accel, 0.0, 10.0)) / 10.0
-    b = float(np.clip(ease_out_accel, 0.0, 10.0)) / 10.0
-    r_in = 0.05 + 0.45 * a
-    r_out = 0.05 + 0.45 * b
-    if r_in + r_out > 1.0:
-        k = 1.0 / (r_in + r_out)
-        r_in *= k
-        r_out *= k
-
-    tau = np.linspace(0.0, 1.0, 2001)
-    v = np.ones_like(tau)
-    m_in = tau < r_in
-    p = tau[m_in] / r_in
-    v[m_in] = (1.0 - a) * p + a * _smootherstep(p)
-    m_out = tau > 1.0 - r_out
-    q = (1.0 - tau[m_out]) / r_out
-    v[m_out] = (1.0 - b) * q + b * _smootherstep(q)
-    v = np.maximum(v, 1e-6)
-
-    s = np.concatenate([[0.0], np.cumsum(0.5 * (v[1:] + v[:-1]) * np.diff(tau))])
-    mean_v = float(s[-1])                     # == average of v over [0, 1]
-    s_norm = s / s[-1]
-    T = L / max(cruise * mean_v, 1e-6)
-
-    ss = np.linspace(0.0, 1.0, PATH_WAYPOINTS)
-    tau_k = np.interp(ss, s_norm, tau)
-    t_k = tau_k * T
-    return np.maximum(np.diff(t_k), MIN_SEGMENT_S).tolist()
+    seg_t = (L / max(cruise, 1e-6)) / (PATH_WAYPOINTS - 1)
+    return [max(seg_t, MIN_SEGMENT_S)] * (PATH_WAYPOINTS - 1)
 
 
 # ===========================================================================
@@ -458,7 +435,7 @@ def _trigger_time(pts, durs, cycle_n):
     return None
 
 
-def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
+def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs):
     """Scripted flinch: approach part-way, recoil, wait, re-approach the moved cube."""
     rx, ry = PICK_ORIENTATION_DEG[:2]
     n = len(pts)
@@ -488,9 +465,9 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
     new_cube = tuple(float(c + o) for c, o in zip(seg["target"], NUDGE_OFFSET_CM))
     print(f"  cube moved -> re-approaching {tuple(round(v, 1) for v in new_cube)}")
     after = current_pos(arm)
-    h2 = _arc_height(_chord_len(after, new_cube), d_max)
+    h2 = _apex_h(after, new_cube)
     p2 = get_path(after, new_cube, h2, rng)
-    d2 = get_durations(after, new_cube, h2, EASE_IN, EASE_OUT)
+    d2 = get_durations(after, new_cube, h2)
     if not _send_arc(arm, p2, d2, "  nudge re-approach"):
         return False
 
@@ -498,9 +475,9 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
     nxt = ci + 1
     if nxt < len(segments) and segments[nxt]["kind"] == "carry":
         segments[nxt]["origin"] = new_cube
-        hc = _arc_height(_chord_len(new_cube, segments[nxt]["target"]), d_max)
+        hc = _apex_h(new_cube, segments[nxt]["target"])
         paths[nxt] = get_path(new_cube, segments[nxt]["target"], hc, rng)
-        all_durs[nxt] = get_durations(new_cube, segments[nxt]["target"], hc, EASE_IN, EASE_OUT)
+        all_durs[nxt] = get_durations(new_cube, segments[nxt]["target"], hc)
     return True
 
 
@@ -603,20 +580,15 @@ def main():
 
     segments = _build_segments(order, home_tip)
 
-    # the widest move sets the shared parabola; every shorter arc lifts less
-    d_max = max((_chord_len(s["origin"], s["target"]) for s in segments), default=1.0) or 1.0
-    print(f"widest move {d_max:.1f} cm -> apex {MAX_HEIGHT_TRAJECTORY:.1f} cm  "
-          f"(shared parabola a = {-MAX_HEIGHT_TRAJECTORY / (d_max / 2.0) ** 2:.4f})")
+    print(f"fixed apex: every arc tops out at world z = {APEX_Z_CM:.1f} cm")
 
     # ---- precompute every arc + its durations --------------------------------
     paths, all_durs = [], []
     for seg in segments:
-        ei = EASE_IN + float(rng.uniform(-1.0, 1.0)) * EASE_JITTER * VARIATION
-        eo = EASE_OUT + float(rng.uniform(-1.0, 1.0)) * EASE_JITTER * VARIATION
         cruise = LEADOUT_SPEED_CM_S if seg["kind"] == "leadout" else CRUISE_SPEED_CM_S
-        h = _arc_height(_chord_len(seg["origin"], seg["target"]), d_max)
+        h = _apex_h(seg["origin"], seg["target"])
         paths.append(get_path(seg["origin"], seg["target"], h, rng))
-        all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo, cruise=cruise))
+        all_durs.append(get_durations(seg["origin"], seg["target"], h, cruise=cruise))
 
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
 
@@ -671,7 +643,7 @@ def main():
                   f"cube #{seg['k'] + 1}  -> {tuple(round(v, 1) for v in seg['target'])} ===")
 
             if kind == "reach" and ci == NUDGE_CYCLE:
-                if not run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
+                if not run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs):
                     print("\naborting run."); go_home(arm); return 1
                 if not _grip(arm, GRIP_CLOSED_DEG, "close on cube (new position)"):
                     return 1

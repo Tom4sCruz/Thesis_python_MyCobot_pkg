@@ -162,7 +162,7 @@ GRIP_SETTLE_S = 0.35           # quiet time after a gripper command: it must LAN
                               # jaws start moving. Tunable down to GRIP_MIN_GAP_S, not below.
 GRIP_MIN_GAP_S = 0.2          # hard floor -- pymycobot silently drops a gripper command
                               # that is not followed by a short quiet gap (why 0.0 failed).
-REACH_TOL_CM = 3.0             # has_reached_* tolerance, per axis
+REACH_TOL_CM = 6.0             # has_reached_* tolerance, per axis
 LEADOUT_PAUSE_S = 0.5         # deliberate beat between the last release and homing
 
 # -- gripper trigger boxes (optional) ------------------------------------------

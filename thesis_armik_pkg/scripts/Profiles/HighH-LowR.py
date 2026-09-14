@@ -154,6 +154,11 @@ GRIP_SETTLE_S = 0.35           # quiet time after a gripper command: it must LAN
                               # jaws start moving. Tunable down to GRIP_MIN_GAP_S, not below.
 GRIP_MIN_GAP_S = 0.2          # hard floor -- pymycobot silently drops a gripper command
                               # that is not followed by a short quiet gap (why 0.0 failed).
+GRIP_LEAD_S = 0.15   # fire the gripper this many seconds BEFORE the arc's planned end
+                     # (on a background thread, like TRIGGER_BOXES) so it finishes
+                     # actuating right as the arm physically stops, instead of visibly
+                     # afterward. Tune on hardware to match measured command->actuation
+                     # lag; too large and it fires while still short of the target.
 REACH_TOL_CM = 3.0             # has_reached_* tolerance, per axis
 LEADOUT_PAUSE_S = 0.5         # deliberate beat between the last release and homing
 
@@ -424,8 +429,7 @@ def _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
 
     fired = False
     if th.is_alive() and th.exc is None:
-        print(f"  {label}: trigger box entered ~t={time.perf_counter()-t0:.2f}s "
-              f"-> gripper {grip_deg:.0f}")
+        print(f"  {label}: gripper fires ~t={time.perf_counter()-t0:.2f}s -> {grip_deg:.0f}")
         _fire_gripper(arm, grip_deg)
         fired = True
 
@@ -436,7 +440,7 @@ def _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
         print(f"  {label}: send_path (threaded) REFUSED -- {arm.last_error}")
         return False
     if not fired:
-        print(f"  {label}: path ended before the box -- firing gripper {grip_deg:.0f} now")
+        print(f"  {label}: path ended before the fire time -- firing gripper {grip_deg:.0f} now")
         _fire_gripper(arm, grip_deg)
     time.sleep(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S))
     pl = arm.last_plan
@@ -699,24 +703,19 @@ def main():
                 continue
 
             t_fire = _trigger_time(pts, durs, ci)
-            if t_fire is not None:
-                if not _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
-                    print("\naborting run."); go_home(arm); return 1
-                continue
+            if t_fire is None:
+                t_fire = max(sum(durs) - GRIP_LEAD_S, 0.0)
 
-            if not _send_arc(arm, pts, durs, label):
+            if not _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
                 print("\naborting run."); go_home(arm); return 1
 
             cur = current_pos(arm)
             reached = (has_reached_cube(cur, seg["target"]) if kind == "reach"
                        else has_reached_target(cur, seg["target"]))
-            if reached:
-                if not _grip(arm, grip_deg, "close on cube" if kind == "reach" else "release cube"):
-                    return 1
-            else:
+            if not reached:
                 print(f"  !! tip at {tuple(round(v, 2) for v in cur)}, expected "
                       f"{tuple(round(v, 1) for v in seg['target'])} +/- {REACH_TOL_CM} cm "
-                      f"-- gripper NOT fired")
+                      f"(gripper already fired)")
 
         print("\nall cubes placed. homing...")
         go_home(arm)

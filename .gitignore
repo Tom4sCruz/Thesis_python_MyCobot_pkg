@@ -1,6 +1,3 @@
-# Claude files
-CLAUDE.md
-
 # Byte-compiled / cache
 __pycache__/
 *.py[cod]

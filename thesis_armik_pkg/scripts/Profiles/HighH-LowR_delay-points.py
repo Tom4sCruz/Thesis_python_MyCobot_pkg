@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-MOVEMENT PROFILE: High-human / Low-robot  (v2 -- J6 locked)
-==========================================================
+MOVEMENT PROFILE: High-human / Low-robot  (parabolic rework, delay-points variant)
+===================================================================================
 
-Same parabolic engine as HighH-LowR.py, with ONE difference: J6 is frozen at
-J6_LOCK_DEG (= its HOME value) for the entire run. There is NO yaw compensation
--- the gripper heading rotates rigidly with the body as J1 swings, instead of
-the wrist counter-rotating to hold a fixed absolute heading. Each arc is planned
-with the tool yaw UNCONSTRAINED (rz=None), then J6 is overwritten on every
-streamed setpoint before execution. J6 is pure tool roll about the straight-down
-approach axis (config.TOOL_OFFSET_MM is along the J6 axis), so overwriting it
-leaves the tip xyz and the straight-down pointing untouched -- only the gripper
-yaw changes.
+Same choreography as HighH-LowR.py, with ONE difference: gripper timing.
+HighH-LowR.py fires the gripper as the very next statement after the arc's
+blocking send_path() call returns (0 delay between the arm stopping and the
+gripper command, no pre-firing trick). This variant instead fires the gripper
+a little BEFORE the arm's last point, by splitting the arc into two
+consecutive BLOCKING send_path() calls glued together at the waypoint where
+the trailing (tail) duration first reaches GRIP_LEAD_S -- no background
+thread, no thread relative to the arm's motion running in parallel. See
+_lead_split_index() and the GRIPPER TIMING section below.
 
 Move cubes from one side of the frame to the other, the way a person doing it
 casually would:
@@ -28,8 +28,8 @@ casually would:
     startled hop backwards), waits for the cube to "settle", then grabs it at
     its new position. This is fully scripted -- the arm has no sensors.
 
-    python3 scripts/Profiles/HighH-LowR.py --mock --yes      # no hardware
-    python3 scripts/Profiles/HighH-LowR.py --port /dev/ttyTHS1
+    python3 scripts/Profiles/HighH-LowR_delay-points.py --mock --yes      # no hardware
+    python3 scripts/Profiles/HighH-LowR_delay-points.py --port /dev/ttyTHS1
 
 CYCLES
 ------
@@ -39,11 +39,18 @@ returns to HOME.
 
 GRIPPER TIMING
 --------------
-By default the gripper fires at the END of each reach / carry cycle (a clean
-pause at the cube, like a hand). Optionally a TRIGGER_BOXES entry fires it
-*during* a cycle, the moment the tip enters the box: that cycle's send_path
-then runs on a background thread so the arm never stops. Empty TRIGGER_BOXES
-(the default) keeps everything single-threaded.
+Each reach/carry arc's waypoint durations are walked backward from the end,
+accumulating a running tail sum, until that tail first reaches GRIP_LEAD_S
+seconds (_lead_split_index()). The arc is then sent as TWO blocking calls:
+pts[:split+1] (the "approach", up to and including the split waypoint), then
+the gripper fires, then pts[split:] (the "final approach", split waypoint to
+the target). No thread runs alongside the arm's motion. This trades precision
+(limited to PATH_WAYPOINTS resolution -- the split lands on whichever sampled
+waypoint's cumulative tail first crosses GRIP_LEAD_S, not an exact time) and a
+momentary real pause at the split (the arm fully stops for both the end of
+the first call and the gripper's blocking double-send, and the second call's
+Hermite blend starts fresh from zero velocity rather than carrying through
+momentum) for the simplicity of never running two things at once.
 
 Everything you tune is a CONSTANT below. The cube coordinates,
 PICK_ORIENTATION_DEG and MAX_HEIGHT_TRAJECTORY are PLACEHOLDERS -- measure them
@@ -59,7 +66,7 @@ _sys.path.insert(
 )
 
 import argparse
-import threading
+import math
 import time
 
 import numpy as np
@@ -103,14 +110,14 @@ CUBES_TARGET_POINTS = [           # deterministic, deliberately uneven drop poin
 # arm.get_coords()[3:]  (this is in the current TOOL frame, config.TOOL_RPY_DEG).
 PICK_ORIENTATION_DEG = (180.0, 0.0, -45.0)
 
-# -- J6 lock (v2) -------------------------------------------------------------
-# J6 is held at this angle for the WHOLE run (rx/ry still hold the tool pointing
-# straight down). Arcs are planned with the yaw unconstrained; J6 is overwritten
-# on every setpoint before streaming. J6 is pure tool roll about the
-# straight-down approach axis, so this changes only the gripper yaw -- tip xyz
-# and the down-pointing are unaffected. Keep this == J6 after homing so the lock
-# adds no wrist jump on the first arc.
-J6_LOCK_DEG = HOME[5]             # 0.0
+# How the gripper YAW (rz) is handled -- rx/ry (pointing-down) are always held:
+#   "world" : rz fixed in the base frame (today's behaviour) -- J6 counter-rotates
+#             as J1 swings so the gripper keeps the same absolute heading.
+#   "base"  : rz follows the tip azimuth atan2(y, x) so J6 stays ~put as J1 turns
+#             (gripper heading fixed in J1's rotating frame, not the world's).
+#   "free"  : rz unconstrained -- IK keeps wrist motion minimal.
+ORIENT_LOCK = "world"
+ORIENT_LOCK_SIGN = 1.0            # flip to -1.0 if "base" yaws the gripper the wrong way
 
 # -- arc + velocity profile --------------------------------------------------
 # All arcs are pieces of ONE shared parabola  y = a*x^2 + c  (b = 0, symmetric
@@ -124,7 +131,12 @@ J6_LOCK_DEG = HOME[5]             # 0.0
 # arm runs out of reach around world z ~ 17-18 cm near the workspace edge.
 MAX_HEIGHT_TRAJECTORY = 15.0
 MIN_ARC_HEIGHT_CM = 2.0          # floor, so short moves still clear the table / other cubes
-CRUISE_SPEED_CM_S = 25.0          # peak tip speed; the ease dials stretch the move time
+CRUISE_SPEED_CM_S = 25.0          # pace basis for every reach/carry arc -- the WIDEST arc's
+                                 # own duration at this cruise speed becomes the shared
+                                 # duration every reach/carry arc gets (main() computes
+                                 # arc_duration_s), so no arc is ever pushed faster than
+                                 # this already-smooth pace; shorter arcs get relatively
+                                 # gentler instead of independently finishing sooner.
 LEADOUT_SPEED_CM_S = 10.0        # the final arc back toward HOME is slower / gentler
 ARC_TIME_EQUALIZATION = 0.5   # 0..1: blends each reach/carry arc's own duration at
                               # CRUISE_SPEED_CM_S (0 = today, duration grows with arc
@@ -163,16 +175,17 @@ GRIP_SETTLE_S = 0.35           # quiet time after a gripper command: it must LAN
                               # jaws start moving. Tunable down to GRIP_MIN_GAP_S, not below.
 GRIP_MIN_GAP_S = 0.2          # hard floor -- pymycobot silently drops a gripper command
                               # that is not followed by a short quiet gap (why 0.0 failed).
+GRIP_LEAD_S = 0.15   # fire the gripper once the remaining travel to the arc's end drops
+                     # to about this many seconds (see _lead_split_index()), instead of
+                     # waiting for the arm to fully stop. Quantized to PATH_WAYPOINTS
+                     # resolution -- the actual lead achieved is whichever sampled
+                     # waypoint's cumulative tail duration first reaches this value.
 REACH_TOL_CM = 3.0             # has_reached_* tolerance, per axis
 LEADOUT_PAUSE_S = 0.5         # deliberate beat between the last release and homing
 
-# -- gripper trigger boxes (optional) ------------------------------------------
-# [[(cx,cy,cz), (l,w,h), cycle_n], ...] -- on cycle cycle_n, the gripper fires
-# the moment the tip enters this box (that cycle runs on a background thread so
-# the arm keeps moving). Empty -> gripper always fires at the cycle end.
-TRIGGER_BOXES = []
-
 N_CYCLES = len(CUBES_INITIAL_POINTS) * 2
+
+_AZ_REF = None                    # (x, y) tip position whose azimuth is rz's zero; set in main()
 
 
 # ===========================================================================
@@ -184,48 +197,24 @@ def _smootherstep(p):
     return 6 * p ** 5 - 15 * p ** 4 + 10 * p ** 3
 
 
-def _lock_j6(plan):
-    """Pin J6 to J6_LOCK_DEG across every streamed setpoint (and the segment
-    knots, for inspection). Call on an ok Plan straight from plan_path() /
-    plan_coords(), before arm._execute(). J6 is pure tool roll about the
-    straight-down approach axis, so tip xyz and rx/ry are unchanged -- only the
-    gripper yaw moves."""
-    if plan.q_waypoints is not None:
-        plan.q_waypoints = np.asarray(plan.q_waypoints, dtype=float)
-        plan.q_waypoints[:, 5] = J6_LOCK_DEG
-    if plan.segment_q is not None:
-        plan.segment_q = np.asarray(plan.segment_q, dtype=float)
-        plan.segment_q[:, 5] = J6_LOCK_DEG
-    return plan
+def _yaw(pts_xy):
+    """rz for a run of waypoints, per ORIENT_LOCK. Returns a scalar (held), a
+    per-waypoint list, or None (free) -- send_path accepts all three."""
+    rz0 = PICK_ORIENTATION_DEG[2]
+    if ORIENT_LOCK == "free":
+        return None
+    if ORIENT_LOCK != "base":
+        return rz0
+    ax, ay = (_AZ_REF if _AZ_REF is not None else (1.0, 0.0))
+    az0 = math.degrees(math.atan2(ay, ax))
+    return [rz0 + ORIENT_LOCK_SIGN * (math.degrees(math.atan2(p[1], p[0])) - az0)
+            for p in pts_xy]
 
 
-def _run_locked_arc(arm, kw):
-    """plan_path(**kw) with the yaw free -> _lock_j6 -> arm._execute. Sets
-    arm.last_plan / arm.last_execution so the callers' prints keep working.
-    Returns (ok, plan, execution); plan is always set, execution is None only if
-    planning itself refused."""
-    pl = arm.plan_path(**kw)
-    if not pl.ok:
-        return False, pl, None
-    _lock_j6(pl)
-    arm.last_plan = pl
-    ex = arm._execute(pl)
-    arm.last_execution = ex
-    return bool(ex.ok), pl, ex
-
-
-def _send_coords_locked(arm, x, y, z, rx, ry, speed):
-    """Single coordinated Cartesian move with J6 locked (yaw planned free, then
-    overwritten). For the disabled-by-default nudge recoil. Returns (ok, plan)."""
-    pl = arm.plan_coords(x=float(x), y=float(y), z=float(z),
-                         rx=rx, ry=ry, rz=None, speed=speed)
-    if not pl.ok:
-        return False, pl
-    _lock_j6(pl)
-    arm.last_plan = pl
-    ex = arm._execute(pl)
-    arm.last_execution = ex
-    return bool(ex.ok), pl
+def _yaw_one(xy):
+    """Scalar rz at a single point (for preflight / the recoil move)."""
+    r = _yaw([xy])
+    return r[0] if isinstance(r, list) else r
 
 
 def _polyline_points(verts, s_query):
@@ -338,6 +327,21 @@ def get_durations(origin_point, target_point, arc_height,
     return np.maximum(np.diff(t_k), MIN_SEGMENT_S).tolist()
 
 
+def _lead_split_index(durs, lead_s):
+    """Largest i such that the remaining travel from pts[i] to the arc's end
+    (sum(durs[i:])) is still >= lead_s -- i.e. firing the gripper exactly
+    when the arm reaches pts[i] gives it about `lead_s` seconds head start
+    before the final point. Mirrors summing trailing waypoint durations
+    until the threshold is exceeded. Falls back to 0 (fire at the very
+    start) if the whole arc is shorter than lead_s."""
+    tail = 0.0
+    for i in range(len(durs) - 1, -1, -1):
+        tail += durs[i]
+        if tail >= lead_s:
+            return i
+    return 0
+
+
 # ===========================================================================
 # STATE CHECKS
 # ===========================================================================
@@ -349,15 +353,6 @@ def current_pos(arm):
 def _within(xyz, centre, half_extents):
     d = np.abs(np.asarray(xyz, float) - np.asarray(centre, float))
     return bool(np.all(d <= np.asarray(half_extents, float)))
-
-
-def is_in_trigger_box(end_effector_coords, cycle_n):
-    for entry in TRIGGER_BOXES:
-        centre, dims, cyc = entry
-        if cyc == cycle_n and _within(end_effector_coords, centre,
-                                      np.asarray(dims, float) / 2.0):
-            return True
-    return False
 
 
 def has_reached_cube(end_effector_coords, cube_xyz):
@@ -408,88 +403,22 @@ def _grip(arm, deg, label):
 
 
 def _send_arc(arm, pts, durs, label):
-    """Blocking parabolic move, J6 locked. pts[0] is the implicit start (not
-    sent)."""
+    """Blocking parabolic move. pts[0] is the implicit start (not sent)."""
     rx, ry = PICK_ORIENTATION_DEG[:2]
     if len(pts) < 2:
         print(f"  {label}: negligible, skipped")
         return True
-    ok, pl, ex = _run_locked_arc(arm, dict(
+    r = arm.send_path(
         x=[p[0] for p in pts[1:]], y=[p[1] for p in pts[1:]], z=[p[2] for p in pts[1:]],
-        rx=rx, ry=ry, rz=None, durations=list(durs),
-    ))
-    if not pl.ok:
-        print(f"  {label}: plan_path REFUSED -- {pl.error}")
+        rx=rx, ry=ry, rz=_yaw(pts[1:]), durations=list(durs),
+    )
+    if not r:
+        print(f"  {label}: send_path REFUSED -- {arm.last_error}")
         return False
-    if not ok:
-        print(f"  {label}: execute FAILED -- {ex.error}")
-        return False
-    # peak_joint_dps is the PRE-LOCK estimate (from the yaw-free plan); the real
-    # J6 rate after locking is lower.
-    print(f"  {label}: {pl.path_length_cm:.1f} cm, {pl.duration_s:.2f} s, "
-          f"peak {pl.peak_joint_dps:.0f} deg/s  (J6 locked {J6_LOCK_DEG:.0f})")
-    return True
-
-
-class _PathThread(threading.Thread):
-    def __init__(self, arm, kw):
-        super().__init__(daemon=True)
-        self.arm, self.kw = arm, kw
-        self.result, self.exc = None, None
-
-    def run(self):
-        try:
-            self.result, _pl, _ex = _run_locked_arc(self.arm, self.kw)
-        except BaseException as exc:                       # noqa: BLE001
-            self.exc, self.result = exc, 0
-
-
-def _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
-    """Run the arc on a background thread and fire the gripper at t_fire so the
-    arm never stops."""
-    rx, ry = PICK_ORIENTATION_DEG[:2]
-    kw = dict(x=[p[0] for p in pts[1:]], y=[p[1] for p in pts[1:]],
-              z=[p[2] for p in pts[1:]], rx=rx, ry=ry, rz=None,
-              durations=list(durs))
-    th = _PathThread(arm, kw)
-    t0 = time.perf_counter()
-    th.start()
-
-    while time.perf_counter() - t0 < t_fire and th.is_alive():
-        time.sleep(0.02)
-
-    fired = False
-    if th.is_alive() and th.exc is None:
-        print(f"  {label}: trigger box entered ~t={time.perf_counter()-t0:.2f}s "
-              f"-> gripper {grip_deg:.0f}")
-        _fire_gripper(arm, grip_deg)
-        fired = True
-
-    th.join()
-    if th.exc is not None:
-        raise th.exc
-    if not th.result:
-        print(f"  {label}: send_path (threaded) REFUSED -- {arm.last_error}")
-        return False
-    if not fired:
-        print(f"  {label}: path ended before the box -- firing gripper {grip_deg:.0f} now")
-        _fire_gripper(arm, grip_deg)
-    time.sleep(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S))
     pl = arm.last_plan
     print(f"  {label}: {pl.path_length_cm:.1f} cm, {pl.duration_s:.2f} s, "
           f"peak {pl.peak_joint_dps:.0f} deg/s")
     return True
-
-
-def _trigger_time(pts, durs, cycle_n):
-    """Cumulative time at the first arc sample inside an active trigger box for
-    this cycle, or None."""
-    t = 0.0
-    for i in range(1, len(pts)):
-        t += durs[i - 1]
-        if is_in_trigger_box(pts[i], cycle_n):
-            return t
-    return None
 
 
 def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, cruise_dur_max):
@@ -508,8 +437,9 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, cr
 
     arm.jerk = NUDGE_RECOIL_JERK
     print(f"  RECOIL -> {np.round(recoil, 1).tolist()}  (jerk={arm.jerk})")
-    ok, _pl = _send_coords_locked(arm, float(recoil[0]), float(recoil[1]), float(recoil[2]),
-                                  rx, ry, NUDGE_RECOIL_SPEED_CM_S)
+    ok = arm.send_coords(x=float(recoil[0]), y=float(recoil[1]), z=float(recoil[2]),
+                         rx=rx, ry=ry, rz=_yaw_one((float(recoil[0]), float(recoil[1]))),
+                         speed=NUDGE_RECOIL_SPEED_CM_S)
     arm.jerk = 0.0
     if not ok:
         print(f"  recoil REFUSED -- {arm.last_error}")
@@ -562,7 +492,7 @@ def preflight(arm, segments, paths):
         checks.append((f"apex c{ci}", apex))
     bad = 0
     for name, (x, y, z) in checks:
-        pl = arm.plan_coords(x=x, y=y, z=z, rx=rx, ry=ry, rz=None,
+        pl = arm.plan_coords(x=x, y=y, z=z, rx=rx, ry=ry, rz=_yaw_one((x, y)),
                              speed=config.DEFAULT_SPEED_CM_S)
         err = (pl.error or "").lower()
         if pl.ok:
@@ -629,8 +559,11 @@ def main():
     p_home = pose_coords(HOME)                       # mm/deg (Z_RELATIVE_TO_JOINT1 assumed False)
     home_tip = (p_home[0] / 10.0, p_home[1] / 10.0, p_home[2] / 10.0)
 
+    global _AZ_REF                                   # rz = PICK_ORIENTATION_DEG[2] at HOME's azimuth
+    _AZ_REF = (home_tip[0], home_tip[1])
+
     print(f"pick order (cube indices): {[int(k) for k in order]}")
-    print(f"J6 locked at {J6_LOCK_DEG:.1f} deg (gripper turns with the body)")
+    print(f"orientation lock: {ORIENT_LOCK}")
     if 0 <= NUDGE_CYCLE < N_CYCLES:
         nudged_k = int(order[NUDGE_CYCLE // 2])
         print(f"NUDGE on cycle {NUDGE_CYCLE}: cube #{nudged_k + 1} "
@@ -730,19 +663,16 @@ def main():
                     return 1
                 continue
 
-            t_fire = _trigger_time(pts, durs, ci)
-            if t_fire is not None:
-                if not _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
+            split = _lead_split_index(durs, GRIP_LEAD_S)
+            if split > 0:
+                if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (approach)"):
                     print("\naborting run."); go_home(arm); return 1
-                continue
 
-            if not _send_arc(arm, pts, durs, label):
-                print("\naborting run."); go_home(arm); return 1
-
-            # grip IMMEDIATELY -- nothing (no position read, no extra round
-            # trip) runs between the arm stopping and the gripper command.
             if not _grip(arm, grip_deg, "close on cube" if kind == "reach" else "release cube"):
                 return 1
+
+            if not _send_arc(arm, pts[split:], durs[split:], f"{label} (final approach)"):
+                print("\naborting run."); go_home(arm); return 1
 
             cur = current_pos(arm)
             reached = (has_reached_cube(cur, seg["target"]) if kind == "reach"

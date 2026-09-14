@@ -128,6 +128,9 @@ JERK = 5.0
 TWITCH_FREQ = 0.0
 TWITCH_INTENSITY = 5.0
 
+config.JERK_SINGLE_JOINT_SUBSTEPS = 4
+
+
 # -- scripted nudge ("defective cube") ------------------------------------------
 NUDGE_CYCLE = -1                # EVEN (reach) cycle index whose cube is nudged; -1 = off
 NUDGE_OFFSET_CM = (3.0, 0.0, 0.0)   # where the nudged cube ends up

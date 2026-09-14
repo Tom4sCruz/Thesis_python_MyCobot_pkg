@@ -1107,9 +1107,11 @@ class Arm:
         When deliberate jerk is armed (``arm.jerk`` / ``arm.twitch_intensity``)
         the move gets a STUTTER, per ``config.STUTTER_TYPE``: type 1 is a lateral
         wobble fired first by :meth:`_jerk_stutter`; type 0 is a stop-and-go --
-        ``conn.stop()`` at ``JERK_SINGLE_JOINT_SUBSTEPS`` random points across the
-        move, woven into the poll loop below so arrival stays guaranteed. jerk = 0
-        -> just the clean send, byte-for-byte unchanged.
+        THIS joint is re-targeted to its own current reading (never a whole-arm
+        ``conn.stop()``, which was found to disturb other joints' hold) at
+        ``JERK_SINGLE_JOINT_SUBSTEPS`` random points across the move, woven into
+        the poll loop below so arrival stays guaranteed. jerk = 0 -> just the
+        clean send, byte-for-byte unchanged.
         """
         self._jerk_stutter(joint_id, target_deg)   # type-1 wobble; no-op otherwise
 
@@ -1153,7 +1155,14 @@ class Arm:
                 stop_fracs.pop(0)
                 print(f"  J{joint_id} stutter-stop at {current:.2f} "
                       f"({100 * abs(current - q_start) / span:.0f}% of the move)")
-                self.conn.stop()
+                # Hold ONLY this joint at its current reading. conn.stop() is a
+                # whole-arm stop (no joint argument -- connection.py) and was
+                # observed disturbing OTHER joints' hold (e.g. a raised J4
+                # sagging during a J1 swing's stutter) even though only
+                # joint_id is meant to be in motion. Re-targeting just this
+                # joint to where it already is freezes it without touching
+                # anything else.
+                self.conn.send_angle(joint_id, current, speed_dps)
                 time.sleep(config.JERK_SUBSTEP_DWELL_S)
                 self.conn.send_angle(joint_id, target_deg, speed_dps)   # resume toward target
                 prev, still = None, 0          # a deliberate stop is not a stall

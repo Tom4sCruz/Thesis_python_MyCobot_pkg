@@ -117,6 +117,12 @@ MAX_HEIGHT_TRAJECTORY = 15.0
 MIN_ARC_HEIGHT_CM = 2.0          # floor, so short moves still clear the table / other cubes
 CRUISE_SPEED_CM_S = 25.0          # peak tip speed; the ease dials stretch the move time
 LEADOUT_SPEED_CM_S = 10.0        # the final arc back toward HOME is slower / gentler
+ARC_TIME_EQUALIZATION = 0.5   # 0..1: blends each reach/carry arc's own duration at
+                              # CRUISE_SPEED_CM_S (0 = today, duration grows with arc
+                              # length) toward the WIDEST arc's own duration at that
+                              # speed (1 = every arc takes exactly that time). The
+                              # widest arc's own pace is unchanged either way, so it's
+                              # never pushed faster than the already-smooth cruise speed.
 EASE_IN = 5.0                    # [0,10] start-of-move acceleration shape. 0 = abrupt,
 EASE_OUT = 5.0                   # [0,10] end-of-move deceleration shape.  10 = long, gentle S
 PATH_WAYPOINTS = 30              # samples per arc
@@ -265,9 +271,10 @@ def get_path(origin_point, target_point, arc_height, rng=None):
 
 def get_durations(origin_point, target_point, arc_height,
                   ease_in_accel=EASE_IN, ease_out_accel=EASE_OUT,
-                  cruise=CRUISE_SPEED_CM_S):
+                  cruise=CRUISE_SPEED_CM_S, duration=None):
     """PATH_WAYPOINTS-1 segment durations (s) for the arc between the two points,
-    shaped by the EASE_IN / EASE_OUT dials (0..10, no physical meaning)."""
+    shaped by the EASE_IN / EASE_OUT dials (0..10, no physical meaning). Total
+    time is `duration` seconds if given, otherwise derived from `cruise` cm/s."""
     _, L = _parabola_points(origin_point, target_point, arc_height, None)
 
     a = float(np.clip(ease_in_accel, 0.0, 10.0)) / 10.0
@@ -292,7 +299,7 @@ def get_durations(origin_point, target_point, arc_height,
     s = np.concatenate([[0.0], np.cumsum(0.5 * (v[1:] + v[:-1]) * np.diff(tau))])
     mean_v = float(s[-1])                     # == average of v over [0, 1]
     s_norm = s / s[-1]
-    T = L / max(cruise * mean_v, 1e-6)
+    T = float(duration) if duration is not None else L / max(cruise * mean_v, 1e-6)
 
     ss = np.linspace(0.0, 1.0, PATH_WAYPOINTS)
     tau_k = np.interp(ss, s_norm, tau)
@@ -449,7 +456,7 @@ def _trigger_time(pts, durs, cycle_n):
     return None
 
 
-def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
+def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, cruise_dur_max):
     """Scripted flinch: approach part-way, recoil, wait, re-approach the moved cube."""
     rx, ry = PICK_ORIENTATION_DEG[:2]
     n = len(pts)
@@ -481,7 +488,9 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
     after = current_pos(arm)
     h2 = _arc_height(_chord_len(after, new_cube), d_max)
     p2 = get_path(after, new_cube, h2, rng)
-    d2 = get_durations(after, new_cube, h2, EASE_IN, EASE_OUT)
+    cruise_dur2 = sum(get_durations(after, new_cube, h2, EASE_IN, EASE_OUT))
+    t2 = cruise_dur2 * (1.0 - ARC_TIME_EQUALIZATION) + cruise_dur_max * ARC_TIME_EQUALIZATION
+    d2 = get_durations(after, new_cube, h2, EASE_IN, EASE_OUT, duration=t2)
     if not _send_arc(arm, p2, d2, "  nudge re-approach"):
         return False
 
@@ -491,7 +500,10 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
         segments[nxt]["origin"] = new_cube
         hc = _arc_height(_chord_len(new_cube, segments[nxt]["target"]), d_max)
         paths[nxt] = get_path(new_cube, segments[nxt]["target"], hc, rng)
-        all_durs[nxt] = get_durations(new_cube, segments[nxt]["target"], hc, EASE_IN, EASE_OUT)
+        cruise_durc = sum(get_durations(new_cube, segments[nxt]["target"], hc, EASE_IN, EASE_OUT))
+        tc = cruise_durc * (1.0 - ARC_TIME_EQUALIZATION) + cruise_dur_max * ARC_TIME_EQUALIZATION
+        all_durs[nxt] = get_durations(new_cube, segments[nxt]["target"], hc, EASE_IN, EASE_OUT,
+                                      duration=tc)
     return True
 
 
@@ -599,15 +611,32 @@ def main():
     print(f"widest move {d_max:.1f} cm -> apex {MAX_HEIGHT_TRAJECTORY:.1f} cm  "
           f"(shared parabola a = {-MAX_HEIGHT_TRAJECTORY / (d_max / 2.0) ** 2:.4f})")
 
+    # ARC_TIME_EQUALIZATION blends each reach/carry arc's own CRUISE_SPEED_CM_S
+    # duration toward the WIDEST arc's own duration at that speed
+    cruise_dur_max = 0.0
+    for seg in segments:
+        if seg["kind"] == "leadout":
+            continue
+        h = _arc_height(_chord_len(seg["origin"], seg["target"]), d_max)
+        cruise_dur_max = max(cruise_dur_max,
+                             sum(get_durations(seg["origin"], seg["target"], h, EASE_IN, EASE_OUT)))
+    print(f"widest reach/carry arc takes {cruise_dur_max:.2f}s at CRUISE_SPEED_CM_S "
+          f"(ARC_TIME_EQUALIZATION={ARC_TIME_EQUALIZATION:.2f} blends every arc toward this)")
+
     # ---- precompute every arc + its durations --------------------------------
     paths, all_durs = [], []
     for seg in segments:
         ei = EASE_IN + float(rng.uniform(-1.0, 1.0)) * EASE_JITTER * VARIATION
         eo = EASE_OUT + float(rng.uniform(-1.0, 1.0)) * EASE_JITTER * VARIATION
-        cruise = LEADOUT_SPEED_CM_S if seg["kind"] == "leadout" else CRUISE_SPEED_CM_S
         h = _arc_height(_chord_len(seg["origin"], seg["target"]), d_max)
         paths.append(get_path(seg["origin"], seg["target"], h, rng))
-        all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo, cruise=cruise))
+        if seg["kind"] == "leadout":
+            all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo,
+                                          cruise=LEADOUT_SPEED_CM_S))
+            continue
+        cruise_dur = sum(get_durations(seg["origin"], seg["target"], h, ei, eo))
+        t_i = cruise_dur * (1.0 - ARC_TIME_EQUALIZATION) + cruise_dur_max * ARC_TIME_EQUALIZATION
+        all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo, duration=t_i))
 
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
 
@@ -662,7 +691,8 @@ def main():
                   f"cube #{seg['k'] + 1}  -> {tuple(round(v, 1) for v in seg['target'])} ===")
 
             if kind == "reach" and ci == NUDGE_CYCLE:
-                if not run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
+                if not run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max,
+                                 cruise_dur_max):
                     print("\naborting run."); go_home(arm); return 1
                 if not _grip(arm, GRIP_CLOSED_DEG, "close on cube (new position)"):
                     return 1

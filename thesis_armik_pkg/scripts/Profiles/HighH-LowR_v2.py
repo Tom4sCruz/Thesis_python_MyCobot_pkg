@@ -124,8 +124,13 @@ J6_LOCK_DEG = HOME[5]             # 0.0
 # arm runs out of reach around world z ~ 17-18 cm near the workspace edge.
 MAX_HEIGHT_TRAJECTORY = 15.0
 MIN_ARC_HEIGHT_CM = 2.0          # floor, so short moves still clear the table / other cubes
-CRUISE_SPEED_CM_S = 25.0          # peak tip speed; the ease dials stretch the move time
+CRUISE_SPEED_CM_S = 25.0          # lead-out only now; see ARC_DURATION_S for reach/carry arcs
 LEADOUT_SPEED_CM_S = 10.0        # the final arc back toward HOME is slower / gentler
+ARC_DURATION_S = 1.5   # target total time (s) for every reach/carry arc, regardless of
+                       # chord length -- a longer arc moves FASTER to fit the same time,
+                       # instead of a fixed cm/s cruise making it take proportionally
+                       # longer. Tune to taste. The lead-out arc keeps its own
+                       # LEADOUT_SPEED_CM_S (one arc per run, nothing to hold equal to).
 EASE_IN = 5.0                    # [0,10] start-of-move acceleration shape. 0 = abrupt,
 EASE_OUT = 5.0                   # [0,10] end-of-move deceleration shape.  10 = long, gentle S
 PATH_WAYPOINTS = 30              # samples per arc
@@ -157,6 +162,11 @@ GRIP_SETTLE_S = 0.35           # quiet time after a gripper command: it must LAN
                               # jaws start moving. Tunable down to GRIP_MIN_GAP_S, not below.
 GRIP_MIN_GAP_S = 0.2          # hard floor -- pymycobot silently drops a gripper command
                               # that is not followed by a short quiet gap (why 0.0 failed).
+GRIP_LEAD_S = 0.15   # fire the gripper this many seconds BEFORE the arc's planned end
+                     # (on a background thread, like TRIGGER_BOXES) so it finishes
+                     # actuating right as the arm physically stops, instead of visibly
+                     # afterward. Tune on hardware to match measured command->actuation
+                     # lag; too large and it fires while still short of the target.
 REACH_TOL_CM = 3.0             # has_reached_* tolerance, per axis
 LEADOUT_PAUSE_S = 0.5         # deliberate beat between the last release and homing
 
@@ -296,9 +306,12 @@ def get_path(origin_point, target_point, arc_height, rng=None):
 
 def get_durations(origin_point, target_point, arc_height,
                   ease_in_accel=EASE_IN, ease_out_accel=EASE_OUT,
-                  cruise=CRUISE_SPEED_CM_S):
+                  duration=None, cruise=None):
     """PATH_WAYPOINTS-1 segment durations (s) for the arc between the two points,
-    shaped by the EASE_IN / EASE_OUT dials (0..10, no physical meaning)."""
+    shaped by the EASE_IN / EASE_OUT dials (0..10, no physical meaning). Total
+    time is `duration` seconds if given (e.g. ARC_DURATION_S -- same for every
+    arc regardless of length); otherwise derived from a `cruise` cm/s speed
+    (falls back to CRUISE_SPEED_CM_S), which makes longer arcs take longer."""
     _, L = _parabola_points(origin_point, target_point, arc_height, None)
 
     a = float(np.clip(ease_in_accel, 0.0, 10.0)) / 10.0
@@ -323,7 +336,11 @@ def get_durations(origin_point, target_point, arc_height,
     s = np.concatenate([[0.0], np.cumsum(0.5 * (v[1:] + v[:-1]) * np.diff(tau))])
     mean_v = float(s[-1])                     # == average of v over [0, 1]
     s_norm = s / s[-1]
-    T = L / max(cruise * mean_v, 1e-6)
+    if duration is not None:
+        T = float(duration)
+    else:
+        c = CRUISE_SPEED_CM_S if cruise is None else cruise
+        T = L / max(c * mean_v, 1e-6)
 
     ss = np.linspace(0.0, 1.0, PATH_WAYPOINTS)
     tau_k = np.interp(ss, s_norm, tau)
@@ -453,8 +470,7 @@ def _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
 
     fired = False
     if th.is_alive() and th.exc is None:
-        print(f"  {label}: trigger box entered ~t={time.perf_counter()-t0:.2f}s "
-              f"-> gripper {grip_deg:.0f}")
+        print(f"  {label}: gripper fires ~t={time.perf_counter()-t0:.2f}s -> {grip_deg:.0f}")
         _fire_gripper(arm, grip_deg)
         fired = True
 
@@ -465,7 +481,7 @@ def _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
         print(f"  {label}: send_path (threaded) REFUSED -- {arm.last_error}")
         return False
     if not fired:
-        print(f"  {label}: path ended before the box -- firing gripper {grip_deg:.0f} now")
+        print(f"  {label}: path ended before the fire time -- firing gripper {grip_deg:.0f} now")
         _fire_gripper(arm, grip_deg)
     time.sleep(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S))
     pl = arm.last_plan
@@ -516,7 +532,7 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
     after = current_pos(arm)
     h2 = _arc_height(_chord_len(after, new_cube), d_max)
     p2 = get_path(after, new_cube, h2, rng)
-    d2 = get_durations(after, new_cube, h2, EASE_IN, EASE_OUT)
+    d2 = get_durations(after, new_cube, h2, EASE_IN, EASE_OUT, duration=ARC_DURATION_S)
     if not _send_arc(arm, p2, d2, "  nudge re-approach"):
         return False
 
@@ -526,7 +542,8 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
         segments[nxt]["origin"] = new_cube
         hc = _arc_height(_chord_len(new_cube, segments[nxt]["target"]), d_max)
         paths[nxt] = get_path(new_cube, segments[nxt]["target"], hc, rng)
-        all_durs[nxt] = get_durations(new_cube, segments[nxt]["target"], hc, EASE_IN, EASE_OUT)
+        all_durs[nxt] = get_durations(new_cube, segments[nxt]["target"], hc, EASE_IN, EASE_OUT,
+                                      duration=ARC_DURATION_S)
     return True
 
 
@@ -636,10 +653,14 @@ def main():
     for seg in segments:
         ei = EASE_IN + float(rng.uniform(-1.0, 1.0)) * EASE_JITTER * VARIATION
         eo = EASE_OUT + float(rng.uniform(-1.0, 1.0)) * EASE_JITTER * VARIATION
-        cruise = LEADOUT_SPEED_CM_S if seg["kind"] == "leadout" else CRUISE_SPEED_CM_S
         h = _arc_height(_chord_len(seg["origin"], seg["target"]), d_max)
         paths.append(get_path(seg["origin"], seg["target"], h, rng))
-        all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo, cruise=cruise))
+        if seg["kind"] == "leadout":
+            all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo,
+                                          cruise=LEADOUT_SPEED_CM_S))
+        else:
+            all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo,
+                                          duration=ARC_DURATION_S))
 
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
 
@@ -701,24 +722,19 @@ def main():
                 continue
 
             t_fire = _trigger_time(pts, durs, ci)
-            if t_fire is not None:
-                if not _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
-                    print("\naborting run."); go_home(arm); return 1
-                continue
+            if t_fire is None:
+                t_fire = max(sum(durs) - GRIP_LEAD_S, 0.0)
 
-            if not _send_arc(arm, pts, durs, label):
+            if not _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
                 print("\naborting run."); go_home(arm); return 1
 
             cur = current_pos(arm)
             reached = (has_reached_cube(cur, seg["target"]) if kind == "reach"
                        else has_reached_target(cur, seg["target"]))
-            if reached:
-                if not _grip(arm, grip_deg, "close on cube" if kind == "reach" else "release cube"):
-                    return 1
-            else:
+            if not reached:
                 print(f"  !! tip at {tuple(round(v, 2) for v in cur)}, expected "
                       f"{tuple(round(v, 1) for v in seg['target'])} +/- {REACH_TOL_CM} cm "
-                      f"-- gripper NOT fired")
+                      f"(gripper already fired)")
 
         print("\nall cubes placed. homing...")
         go_home(arm)

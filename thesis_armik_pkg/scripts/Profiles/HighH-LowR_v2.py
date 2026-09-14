@@ -124,13 +124,13 @@ J6_LOCK_DEG = HOME[5]             # 0.0
 # arm runs out of reach around world z ~ 17-18 cm near the workspace edge.
 MAX_HEIGHT_TRAJECTORY = 15.0
 MIN_ARC_HEIGHT_CM = 2.0          # floor, so short moves still clear the table / other cubes
-CRUISE_SPEED_CM_S = 25.0          # lead-out only now; see ARC_DURATION_S for reach/carry arcs
+CRUISE_SPEED_CM_S = 25.0          # pace basis for every reach/carry arc -- the WIDEST arc's
+                                 # own duration at this cruise speed becomes the shared
+                                 # duration every reach/carry arc gets (main() computes
+                                 # arc_duration_s), so no arc is ever pushed faster than
+                                 # this already-smooth pace; shorter arcs get relatively
+                                 # gentler instead of independently finishing sooner.
 LEADOUT_SPEED_CM_S = 10.0        # the final arc back toward HOME is slower / gentler
-ARC_DURATION_S = 1.5   # target total time (s) for every reach/carry arc, regardless of
-                       # chord length -- a longer arc moves FASTER to fit the same time,
-                       # instead of a fixed cm/s cruise making it take proportionally
-                       # longer. Tune to taste. The lead-out arc keeps its own
-                       # LEADOUT_SPEED_CM_S (one arc per run, nothing to hold equal to).
 EASE_IN = 5.0                    # [0,10] start-of-move acceleration shape. 0 = abrupt,
 EASE_OUT = 5.0                   # [0,10] end-of-move deceleration shape.  10 = long, gentle S
 PATH_WAYPOINTS = 30              # samples per arc
@@ -501,7 +501,7 @@ def _trigger_time(pts, durs, cycle_n):
     return None
 
 
-def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
+def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, arc_duration_s):
     """Scripted flinch: approach part-way, recoil, wait, re-approach the moved cube."""
     rx, ry = PICK_ORIENTATION_DEG[:2]
     n = len(pts)
@@ -532,7 +532,7 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
     after = current_pos(arm)
     h2 = _arc_height(_chord_len(after, new_cube), d_max)
     p2 = get_path(after, new_cube, h2, rng)
-    d2 = get_durations(after, new_cube, h2, EASE_IN, EASE_OUT, duration=ARC_DURATION_S)
+    d2 = get_durations(after, new_cube, h2, EASE_IN, EASE_OUT, duration=arc_duration_s)
     if not _send_arc(arm, p2, d2, "  nudge re-approach"):
         return False
 
@@ -543,7 +543,7 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
         hc = _arc_height(_chord_len(new_cube, segments[nxt]["target"]), d_max)
         paths[nxt] = get_path(new_cube, segments[nxt]["target"], hc, rng)
         all_durs[nxt] = get_durations(new_cube, segments[nxt]["target"], hc, EASE_IN, EASE_OUT,
-                                      duration=ARC_DURATION_S)
+                                      duration=arc_duration_s)
     return True
 
 
@@ -648,6 +648,19 @@ def main():
     print(f"widest move {d_max:.1f} cm -> apex {MAX_HEIGHT_TRAJECTORY:.1f} cm  "
           f"(shared parabola a = {-MAX_HEIGHT_TRAJECTORY / (d_max / 2.0) ** 2:.4f})")
 
+    # every reach/carry arc shares the WIDEST one's own duration at CRUISE_SPEED_CM_S,
+    # so nothing is ever pushed faster than that already-smooth pace
+    arc_duration_s = 0.0
+    for seg in segments:
+        if seg["kind"] == "leadout":
+            continue
+        h = _arc_height(_chord_len(seg["origin"], seg["target"]), d_max)
+        arc_duration_s = max(arc_duration_s,
+                             sum(get_durations(seg["origin"], seg["target"], h,
+                                               EASE_IN, EASE_OUT, cruise=CRUISE_SPEED_CM_S)))
+    print(f"every reach/carry arc takes {arc_duration_s:.2f}s "
+          f"(the widest move's own pace at CRUISE_SPEED_CM_S)")
+
     # ---- precompute every arc + its durations --------------------------------
     paths, all_durs = [], []
     for seg in segments:
@@ -660,7 +673,7 @@ def main():
                                           cruise=LEADOUT_SPEED_CM_S))
         else:
             all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo,
-                                          duration=ARC_DURATION_S))
+                                          duration=arc_duration_s))
 
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
 
@@ -715,7 +728,8 @@ def main():
                   f"cube #{seg['k'] + 1}  -> {tuple(round(v, 1) for v in seg['target'])} ===")
 
             if kind == "reach" and ci == NUDGE_CYCLE:
-                if not run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max):
+                if not run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max,
+                                 arc_duration_s):
                     print("\naborting run."); go_home(arm); return 1
                 if not _grip(arm, GRIP_CLOSED_DEG, "close on cube (new position)"):
                     return 1

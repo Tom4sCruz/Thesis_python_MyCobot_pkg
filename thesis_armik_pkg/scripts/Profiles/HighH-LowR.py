@@ -29,11 +29,8 @@ returns to HOME.
 
 GRIPPER TIMING
 --------------
-By default the gripper fires at the END of each reach / carry cycle (a clean
-pause at the cube, like a hand). Optionally a TRIGGER_BOXES entry fires it
-*during* a cycle, the moment the tip enters the box: that cycle's send_path
-then runs on a background thread so the arm never stops. Empty TRIGGER_BOXES
-(the default) keeps everything single-threaded.
+The gripper fires at the END of each reach / carry cycle (a clean pause at
+the cube, like a hand), right after the arc finishes -- no background thread.
 
 Everything you tune is a CONSTANT below. The cube coordinates,
 PICK_ORIENTATION_DEG and MAX_HEIGHT_TRAJECTORY are PLACEHOLDERS -- measure them
@@ -50,7 +47,6 @@ _sys.path.insert(
 
 import argparse
 import math
-import threading
 import time
 
 import numpy as np
@@ -156,12 +152,6 @@ GRIP_MIN_GAP_S = 0.2          # hard floor -- pymycobot silently drops a gripper
                               # that is not followed by a short quiet gap (why 0.0 failed).
 REACH_TOL_CM = 3.0             # has_reached_* tolerance, per axis
 LEADOUT_PAUSE_S = 0.5         # deliberate beat between the last release and homing
-
-# -- gripper trigger boxes (optional) ------------------------------------------
-# [[(cx,cy,cz), (l,w,h), cycle_n], ...] -- on cycle cycle_n, the gripper fires
-# the moment the tip enters this box (that cycle runs on a background thread so
-# the arm keeps moving). Empty -> gripper always fires at the cycle end.
-TRIGGER_BOXES = []
 
 N_CYCLES = len(CUBES_INITIAL_POINTS) * 2
 
@@ -320,15 +310,6 @@ def _within(xyz, centre, half_extents):
     return bool(np.all(d <= np.asarray(half_extents, float)))
 
 
-def is_in_trigger_box(end_effector_coords, cycle_n):
-    for entry in TRIGGER_BOXES:
-        centre, dims, cyc = entry
-        if cyc == cycle_n and _within(end_effector_coords, centre,
-                                      np.asarray(dims, float) / 2.0):
-            return True
-    return False
-
-
 def has_reached_cube(end_effector_coords, cube_xyz):
     return _within(end_effector_coords, cube_xyz, (REACH_TOL_CM,) * 3)
 
@@ -392,68 +373,10 @@ def _send_arc(arm, pts, durs, label):
     pl = arm.last_plan
     print(f"  {label}: {pl.path_length_cm:.1f} cm, {pl.duration_s:.2f} s, "
           f"peak {pl.peak_joint_dps:.0f} deg/s")
+    if arm.last_execution and arm.last_execution.late_deadlines:
+        print(f"  !! {arm.last_execution.late_deadlines} late control-loop "
+              f"deadline(s) during this arc")
     return True
-
-
-class _PathThread(threading.Thread):
-    def __init__(self, arm, kw):
-        super().__init__(daemon=True)
-        self.arm, self.kw = arm, kw
-        self.result, self.exc = None, None
-
-    def run(self):
-        try:
-            self.result = self.arm.send_path(**self.kw)
-        except BaseException as exc:                       # noqa: BLE001
-            self.exc, self.result = exc, 0
-
-
-def _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
-    """Run the arc on a background thread and fire the gripper at t_fire so the
-    arm never stops."""
-    rx, ry = PICK_ORIENTATION_DEG[:2]
-    kw = dict(x=[p[0] for p in pts[1:]], y=[p[1] for p in pts[1:]],
-              z=[p[2] for p in pts[1:]], rx=rx, ry=ry, rz=_yaw(pts[1:]),
-              durations=list(durs))
-    th = _PathThread(arm, kw)
-    t0 = time.perf_counter()
-    th.start()
-
-    while time.perf_counter() - t0 < t_fire and th.is_alive():
-        time.sleep(0.02)
-
-    fired = False
-    if th.is_alive() and th.exc is None:
-        print(f"  {label}: trigger box entered ~t={time.perf_counter()-t0:.2f}s "
-              f"-> gripper {grip_deg:.0f}")
-        _fire_gripper(arm, grip_deg)
-        fired = True
-
-    th.join()
-    if th.exc is not None:
-        raise th.exc
-    if not th.result:
-        print(f"  {label}: send_path (threaded) REFUSED -- {arm.last_error}")
-        return False
-    if not fired:
-        print(f"  {label}: path ended before the box -- firing gripper {grip_deg:.0f} now")
-        _fire_gripper(arm, grip_deg)
-    time.sleep(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S))
-    pl = arm.last_plan
-    print(f"  {label}: {pl.path_length_cm:.1f} cm, {pl.duration_s:.2f} s, "
-          f"peak {pl.peak_joint_dps:.0f} deg/s")
-    return True
-
-
-def _trigger_time(pts, durs, cycle_n):
-    """Cumulative time at the first arc sample inside an active trigger box for
-    this cycle, or None."""
-    t = 0.0
-    for i in range(1, len(pts)):
-        t += durs[i - 1]
-        if is_in_trigger_box(pts[i], cycle_n):
-            return t
-    return None
 
 
 def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, cruise_dur_max):
@@ -696,12 +619,6 @@ def main():
                     print("\naborting run."); go_home(arm); return 1
                 if not _grip(arm, GRIP_CLOSED_DEG, "close on cube (new position)"):
                     return 1
-                continue
-
-            t_fire = _trigger_time(pts, durs, ci)
-            if t_fire is not None:
-                if not _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
-                    print("\naborting run."); go_home(arm); return 1
                 continue
 
             if not _send_arc(arm, pts, durs, label):

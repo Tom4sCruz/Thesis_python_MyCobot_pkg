@@ -113,8 +113,14 @@ ORIENT_LOCK_SIGN = 1.0            # flip to -1.0 if "base" yaws the gripper the 
 # Keep MAX_HEIGHT_TRAJECTORY reachable at PICK_ORIENTATION_DEG: gripper-down the
 # arm runs out of reach around world z ~ 17-18 cm near the workspace edge.
 MAX_HEIGHT_TRAJECTORY = 15.0
-MIN_ARC_HEIGHT_CM = 2.0          # floor, so short moves still clear the table / other cubes
-CRUISE_SPEED_CM_S = 25.0          # peak tip speed; the ease dials stretch the move time
+MIN_ARC_HEIGHT_CM = 8.0          # floor, so short moves still clear the table / other cubes --
+                                 # also keeps the elbow (J3) from folding past its real limit
+                                 # while holding a fixed straight-down orientation on short,
+                                 # close-to-base carries; 2.0 let some short arcs' shared-parabola
+                                 # apex drop to ~2.8cm, which needs J3 well past its real hardware
+                                 # limit to hold PICK_ORIENTATION_DEG that low -- confirmed via
+                                 # direct IK reproduction of every reach/carry arc in this run
+CRUISE_SPEED_CM_S = 15.0          # peak tip speed; the ease dials stretch the move time
 LEADOUT_SPEED_CM_S = 10.0        # the final arc back toward HOME is slower / gentler
 ARC_TIME_EQUALIZATION = 0.5   # 0..1: blends each reach/carry arc's own duration at
                               # CRUISE_SPEED_CM_S (0 = today, duration grows with arc
@@ -328,7 +334,9 @@ def has_reached_target(end_effector_coords, target_xyz):
 def go_home(arm):
     """Homing move, with the duration scaled to the joint distance so a long
     return from the far side is not crammed into HOME_MOVE_S (which makes
-    move_joints -- no speed pre-check -- outrun the servos and shake)."""
+    move_joints -- no speed pre-check -- outrun the servos and shake).
+    Returns bool -- move_joints() can refuse (e.g. the arm's current pose is
+    already outside a joint's soft limit), and that must not pass silently."""
     try:
         dq = max(abs(a - b) for a, b in zip(arm.get_angles(), HOME))
     except Exception:
@@ -336,7 +344,10 @@ def go_home(arm):
     dur = max(HOME_MOVE_S, dq / HOME_RETURN_DPS)
     if dur > HOME_MOVE_S + 0.05:
         print(f"  homing over {dur:.1f}s (joint travel {dq:.0f} deg)")
-    arm.move_joints(HOME, duration=dur)
+    if not arm.move_joints(HOME, duration=dur):
+        print(f"  homing REFUSED -- {arm.last_error}")
+        return False
+    return True
 
 
 def _fire_gripper(arm, deg):
@@ -588,7 +599,9 @@ def main():
             time.sleep(1.5)
 
         print("homing...")
-        go_home(arm)
+        if not go_home(arm):
+            print("\nhoming failed -- fix the arm's position (see error above), then try again.")
+            return 1
         time.sleep(SETTLE_S)
         print(f"start pose (tip, cm/deg): {[round(v, 2) for v in arm.get_coords()]}")
 
@@ -640,7 +653,8 @@ def main():
                       f"{tuple(round(v, 1) for v in seg['target'])} +/- {REACH_TOL_CM} cm")
 
         print("\nall cubes placed. homing...")
-        go_home(arm)
+        if not go_home(arm):
+            print(f"  final homing failed -- {arm.last_error}")
         return 0
 
     except KeyboardInterrupt:

@@ -159,13 +159,24 @@ MIN_BASE_DIST_MM = 60.0
 # Joint limits
 # ---------------------------------------------------------------------------
 
+# Must never exceed pymycobot's own hard-coded MyCobot280 validation table
+# (pymycobot.error.RobotLimit.robot_limit["MyCobot280"]) -- these are this
+# package's SOFT limits (used by IK's clamp / check_joint_limits), pymycobot
+# enforces its own HARD ones independently on every send_angles() call, and
+# nothing keeps the two in sync automatically. Widening a row past the real
+# hardware limit doesn't get you more reach -- it just means IK will
+# occasionally hand back an angle pymycobot then rejects at send time
+# (MyCobot280DataException), since armik's own check passes but the
+# firmware's separate check doesn't. Set to the hardware limit exactly (not
+# narrower) so IK gets the most real reach without ever exceeding it; J5's
+# range is genuinely asymmetric on the real hardware, not a typo.
 JOINT_LIMITS_DEG = [
-    (-175.0, 175.0),
+    (-168.0, 168.0),
+    (-140.0, 140.0),
     (-150.0, 150.0),
-    (-160.0, 160.0),
-    (-175.0, 175.0),
-    (-175.0, 175.0),
-    (-160.0, 160.0),
+    (-150.0, 150.0),
+    (-155.0, 160.0),
+    (-180.0, 180.0),
 ]
 
 JOINT_LIMIT_MARGIN_DEG = 3.0

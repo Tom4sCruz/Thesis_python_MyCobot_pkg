@@ -64,7 +64,7 @@ HOME_RETURN_DPS = 35.0            # deg/s -- a big return gets proportionally MO
                                  # move_joints (no speed pre-check) does not outrun the
                                  # servos and shake. Lower if the last homing still shakes.
 SETTLE_S = 0.3
-PREFLIGHT = True
+PREFLIGHT = False #True
 RANDOM_SEED = None                # int for a repeatable run, None for fresh each time
 
 # -- cubes (MEASURE AND REPLACE) ----------------------------------------------
@@ -74,16 +74,19 @@ Z_CUBE_COORD = -4.0
 
 CUBES_INITIAL_POINTS = [          # a row on the pick side
     (14.0, 23.0, Z_CUBE_COORD),
-    (14.0, 16.5, Z_CUBE_COORD),
+    (14.0, 15.5, Z_CUBE_COORD),
     (14.0, 10.0, Z_CUBE_COORD),
     #(15.0, 19.0, Z_CUBE_COORD),
 ]
-CUBES_TARGET_POINTS = [           # deterministic, deliberately uneven drop points
+CUBES_INITIAL_POINTS = CUBES_INITIAL_POINTS[::-1]
+
+CUBES_TARGET_POINTS = [           # clean, evenly-spaced drop row, uniform z -- no overshoot
     (14.0, -23.0, Z_CUBE_COORD),
-    (14.0, -16.5, Z_CUBE_COORD),
+    (14.0, -15.5, Z_CUBE_COORD),
     (14.0, -10.0, Z_CUBE_COORD),
     #(15.0, -19.0, Z_CUBE_COORD),
 ]
+CUBES_TARGET_POINTS = CUBES_TARGET_POINTS[::-1]
 
 # Gripper orientation (rx, ry, rz DEG) held for EVERY move so the gripper stays
 # pointing straight down. CALIBRATION: jog to gripper-straight-down, read

@@ -140,7 +140,7 @@ SINGLE_JOINT_DELAY_BETWEEN_POINTS = 2  # seconds
 # This now bounds the TOOL TIP (see TOOL_OFFSET_MM), not the bare flange. 480 =
 # ~280 mm flange radius + ~90 mm tool + margin. Raise it further for a longer
 # tool; lower it back toward 280-330 for a bare flange.
-MAX_REACH_MM = 480 #280.0
+MAX_REACH_MM = 500 #280.0
 
 # z of the base mounting plate, in mm, in the SAME frame get_coords() uses.
 # At or above this height, only the reach sphere is checked.
@@ -160,12 +160,12 @@ MIN_BASE_DIST_MM = 60.0
 # ---------------------------------------------------------------------------
 
 JOINT_LIMITS_DEG = [
-    (-168.0, 168.0),
-    (-135.0, 135.0),
-    (-150.0, 150.0),
-    (-145.0, 145.0),
-    (-165.0, 165.0),
     (-175.0, 175.0),
+    (-150.0, 150.0),
+    (-160.0, 160.0),
+    (-175.0, 175.0),
+    (-175.0, 175.0),
+    (-160.0, 160.0),
 ]
 
 JOINT_LIMIT_MARGIN_DEG = 3.0
@@ -280,7 +280,7 @@ STREAM_SPEED_GAIN = 1.6
 #   send_gripper(0)               -> closed
 #   send_gripper(MAX_GRIPPER_DEG) -> fully open
 MAX_GRIPPER_DEG = 120.0
-GRIPPER_DEFAULT_SPEED = 50   # pymycobot gripper speed, integer 1-100
+GRIPPER_DEFAULT_SPEED = 60   # pymycobot gripper speed, integer 1-100
 
 # ---------------------------------------------------------------------------
 # Cartesian API defaults
@@ -312,14 +312,24 @@ ROT_WEIGHT_MM_PER_DEG = 1.0
 # because the anchors are fighting the constraints.
 FREE_ANCHOR_WEIGHT = 2.0
 
-IK_MAX_ITERS = 120
+IK_MAX_ITERS = 200
 # Levenberg-Marquardt damping. Higher = more stable near singularities but
 # slower to converge. Tuned empirically: at 3.0 a plain 6-DOF move needed ~129
-# iterations (exceeding IK_MAX_ITERS and reporting a false "unreachable"); at
-# 1.0 the same move converges in ~16 iterations, and across a spread of seed
-# configurations including near-singular ones it solves 13/16 test targets
-# versus 3/16 at 3.0 -- with the remaining 3 being genuinely out of reach
-# (they still fail at 300 iterations).
+# iterations (exceeding the old IK_MAX_ITERS=120 and reporting a false
+# "unreachable"); at 1.0 the same move converges in ~16 iterations, and
+# across a spread of seed configurations including near-singular ones it
+# solves 13/16 test targets versus 3/16 at 3.0 -- with the remaining 3 being
+# genuinely out of reach (they still fail at 300 iterations).
+#
+# 120 was still too tight, though: a single large 6-DOF jump straight from
+# HOME (e.g. one profile script's "swing to the first cube" move, ~30 cm +
+# a big J1 rotation in one IK call, no intermediate seeding) needs ~130
+# iterations even at IK_DAMPING=1.0 to bring the LAST fraction of a degree
+# of rotation error under ROT_TOL_DEG -- it was reported as unreachable
+# purely from running out of iterations, not from any joint/reach limit.
+# 200 gives that case real margin without materially slowing planning (DLS
+# iterations are cheap; the cases that need this many are rare, one-shot
+# large jumps, not the common short/incremental solves).
 IK_DAMPING = 1.0
 IK_STEP_CLAMP_DEG = 5.0
 POS_TOL_MM = 0.5

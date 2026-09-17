@@ -509,7 +509,7 @@ class Arm:
                 desired[3:] = np.where(
                     mask[3:], wrap180(start[3:] + rot_delta * s[k]), start[3:]
                 )
-                q_k = ik.try_solve(desired, mask, q_seed, max_iters=80)
+                q_k = ik.try_solve(desired, mask, q_seed)
                 if q_k is None:
                     plan.error = (
                         f"unreachable along the straight line at {100.0*s[k]:.0f}% "
@@ -623,7 +623,7 @@ class Arm:
             for k in range(n_waypoints):
                 desired = start.copy()
                 desired[mask] = targets[k][mask]
-                q_k = ik.try_solve(desired, mask, q_seed, max_iters=100)
+                q_k = ik.try_solve(desired, mask, q_seed)
                 if q_k is None:
                     plan.error = (
                         f"waypoint {k+1} of {n_waypoints} unreachable "

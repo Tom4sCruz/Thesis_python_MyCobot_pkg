@@ -255,6 +255,12 @@ class ArmConnection:
         with self._lock:
             return self._mc.release_all_servos()
 
+    def focus_all_servos(self):
+        """Re-engage all servos after release_all_servos() -- they lock and
+        hold their current position again."""
+        with self._lock:
+            return self._mc.focus_all_servos()
+
     # -- gripper ----------------------------------------------------------------
 
     def set_gripper_value(

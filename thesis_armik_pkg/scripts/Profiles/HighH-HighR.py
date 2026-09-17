@@ -86,16 +86,16 @@ RANDOM_SEED = 0                   # fixed -> the same run every time ("High Robo
 Z_CUBE_COORD = -4.0
 
 CUBES_INITIAL_POINTS = [          # a row on the pick side
-    (15.0, 13.0, Z_CUBE_COORD),
-    (15.0, 15.0, Z_CUBE_COORD),
-    (15.0, 16.0, Z_CUBE_COORD),
-    (15.0, 19.0, Z_CUBE_COORD),
+    (14.0, 23.0, Z_CUBE_COORD),
+    (14.0, 16.5, Z_CUBE_COORD),
+    (14.0, 10.0, Z_CUBE_COORD),
+    #(15.0, 19.0, Z_CUBE_COORD),
 ]
 CUBES_TARGET_POINTS = [           # clean, evenly-spaced drop row, uniform z -- no overshoot
-    (15.0, -13.0, Z_CUBE_COORD),
-    (15.0, -15.0, Z_CUBE_COORD),
-    (15.0, -16.0, Z_CUBE_COORD),
-    (15.0, -19.0, Z_CUBE_COORD),
+    (14.0, -23.0, Z_CUBE_COORD),
+    (14.0, -16.5, Z_CUBE_COORD),
+    (14.0, -10.0, Z_CUBE_COORD),
+    #(15.0, -19.0, Z_CUBE_COORD),
 ]
 
 # Gripper orientation (rx, ry, rz DEG) held for EVERY move so the gripper stays

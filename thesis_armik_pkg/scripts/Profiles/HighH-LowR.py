@@ -73,16 +73,16 @@ RANDOM_SEED = None                # int for a repeatable run, None for fresh eac
 Z_CUBE_COORD = -4.0
 
 CUBES_INITIAL_POINTS = [          # a row on the pick side
-    (15.0, 10.0, Z_CUBE_COORD),
-    (15.0, 13.0, Z_CUBE_COORD),
-    (15.0, 16.0, Z_CUBE_COORD),
-    (15.0, 19.0, Z_CUBE_COORD),
+    (14.0, 23.0, Z_CUBE_COORD),
+    (14.0, 16.5, Z_CUBE_COORD),
+    (14.0, 10.0, Z_CUBE_COORD),
+    #(15.0, 19.0, Z_CUBE_COORD),
 ]
 CUBES_TARGET_POINTS = [           # deterministic, deliberately uneven drop points
-    (15.0, -10.0, Z_CUBE_COORD),
-    (15.0, -13.0, Z_CUBE_COORD),
-    (15.0, -16.0, Z_CUBE_COORD),
-    (15.0, -19.0, Z_CUBE_COORD),
+    (14.0, -23.0, Z_CUBE_COORD),
+    (14.0, -16.5, Z_CUBE_COORD),
+    (14.0, -10.0, Z_CUBE_COORD),
+    #(15.0, -19.0, Z_CUBE_COORD),
 ]
 
 # Gripper orientation (rx, ry, rz DEG) held for EVERY move so the gripper stays

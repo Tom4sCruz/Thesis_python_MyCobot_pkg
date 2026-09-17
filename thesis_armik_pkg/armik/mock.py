@@ -90,6 +90,9 @@ class MockMyCobot:
     def release_all_servos(self):
         return 1
 
+    def focus_all_servos(self):
+        return 1
+
     # -- test helpers -------------------------------------------------------
 
     def set_angles_directly(self, angles):

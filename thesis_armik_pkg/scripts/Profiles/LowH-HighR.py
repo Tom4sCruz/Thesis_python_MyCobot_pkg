@@ -70,17 +70,17 @@ PREFLIGHT = True
 Z_CUBE_COORD = -4.0
 
 CUBES_INITIAL_POINTS = [          # a row on the pick side, LISTED LEFT -> RIGHT
-    (15.0, 10.0, Z_CUBE_COORD),
-    (15.0, 13.0, Z_CUBE_COORD),
-    (15.0, 16.0, Z_CUBE_COORD),
-    (15.0, 19.0, Z_CUBE_COORD),
+    (14.0, 23.0, Z_CUBE_COORD),
+    (14.0, 16.5, Z_CUBE_COORD),
+    (14.0, 10.0, Z_CUBE_COORD),
+    #(15.0, 19.0, Z_CUBE_COORD),
 
 ]
 CUBES_TARGET_POINTS = [           # the drop row; cube picked k-th goes to slot k
-    (15.0, -10.0, Z_CUBE_COORD),
-    (15.0, -13.0, Z_CUBE_COORD),
-    (15.0, -16.0, Z_CUBE_COORD),
-    (15.0, -19.0, Z_CUBE_COORD),
+    (14.0, -23.0, Z_CUBE_COORD),
+    (14.0, -16.5, Z_CUBE_COORD),
+    (14.0, -10.0, Z_CUBE_COORD),
+    #(15.0, -19.0, Z_CUBE_COORD),
 ]
 
 # Gripper orientation (rx, ry, rz DEG) held for EVERY move. CALIBRATION: jog to
@@ -90,7 +90,7 @@ PICK_ORIENTATION_DEG = (180.0, 0.0, -45.0)
 APPROACH_HEIGHT_CM = 10.0          # hover height above a cube before descending
 
 # -- robotic motion --------------------------------------------------------------
-JOINT_SPEED_DPS = 60.0           # fast, CONSTANT deg/s for every single-joint move and
+JOINT_SPEED_DPS = 50.0           # fast, CONSTANT deg/s for every single-joint move and
                                 # for homing (clamped per joint to config.MAX_JOINT_SPEED_DPS)
 SEG_PLAN_S = 4.0               # generous per-waypoint duration handed to send_path ONLY so
                               # its blended pre-check passes; single-joint execution ignores it
@@ -105,7 +105,7 @@ RVIZ_BETWEEN_POINTS_S = 0.5
 
 # grab order -- deterministic. Arrange CUBES_INITIAL_POINTS left->right, or set
 # explicit indices here.
-PICK_ORDER = list(range(len(CUBES_INITIAL_POINTS)))
+PICK_ORDER = list(range(len(CUBES_INITIAL_POINTS)))[::-1] #list(range(len(CUBES_INITIAL_POINTS)))
 
 # -- phase joint order (1-based ids) ---------------------------------------------
 # The normal cycle is an explicit swing / descend / lift choreography (see the

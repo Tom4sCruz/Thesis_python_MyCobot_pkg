@@ -128,6 +128,14 @@ SWING_JOINT         = 1                 # transit between cubes turns J1 ONLY --
 LOWER_JOINT_ORDER = (1, 6, 5, 4, 3, 2)   # descending onto a cube/target
 RAISE_JOINT_ORDER = (1, 2, 3, 4, 5, 6)   # lifting away / traversing
 
+# -- jerk constants -------------------------------------------------------------
+JERK = 5.0
+TWITCH_FREQ = 0.0
+TWITCH_INTENSITY = 5.0
+
+config.JERK_SINGLE_JOINT_SUBSTEPS = 4
+
+
 # -- scripted nudge ("defective cube") ------------------------------------------
 NUDGE_CYCLE = -1                # EVEN (reach) cycle index whose cube is nudged; -1 = off
 NUDGE_OFFSET_CM = (3.0, 0.0, 0.0)   # where the nudged cube ends up
@@ -568,7 +576,10 @@ def main():
     # homing) stutters -- see armik/config.py JERK_SINGLE_JOINT_* / JERK_SUBSTEP_*
     # for the amplitude / velocity dials, seed via arm.jerk_seed or
     # config.JERK_SEED. Left off by default.
-    # arm.jerk = 5.0; arm.random_twitch = 0.2; arm.twitch_intensity = 5.0
+
+    arm.jerk = JERK
+    arm.random_twitch = TWITCH_FREQ
+    arm.twitch_intensity = TWITCH_INTENSITY
 
     bridge = None
     if args.rviz:

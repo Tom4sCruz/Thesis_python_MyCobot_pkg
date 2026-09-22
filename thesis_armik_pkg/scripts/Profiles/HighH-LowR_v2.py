@@ -86,17 +86,20 @@ RANDOM_SEED = None                # int for a repeatable run, None for fresh eac
 Z_CUBE_COORD = -4.0
 
 CUBES_INITIAL_POINTS = [          # a row on the pick side
-    (15.0, 10.0, Z_CUBE_COORD),
-    (15.0, 13.0, Z_CUBE_COORD),
-    (15.0, 16.0, Z_CUBE_COORD),
-    (15.0, 19.0, Z_CUBE_COORD),
+    (14.0, 23.0, Z_CUBE_COORD),
+    (14.0, 15.5, Z_CUBE_COORD),
+    (14.0, 10.0, Z_CUBE_COORD),
+    #(15.0, 19.0, Z_CUBE_COORD),
 ]
-CUBES_TARGET_POINTS = [           # deterministic, deliberately uneven drop points
-    (15.0, -10.0, Z_CUBE_COORD),
-    (15.0, -13.0, Z_CUBE_COORD),
-    (15.0, -16.0, Z_CUBE_COORD),
-    (15.0, -19.0, Z_CUBE_COORD),
+CUBES_INITIAL_POINTS = CUBES_INITIAL_POINTS[::-1]
+
+CUBES_TARGET_POINTS = [           # clean, evenly-spaced drop row, uniform z -- no overshoot
+    (14.0, -23.0, Z_CUBE_COORD),
+    (14.0, -15.5, Z_CUBE_COORD),
+    (14.0, -10.0, Z_CUBE_COORD),
+    #(15.0, -19.0, Z_CUBE_COORD),
 ]
+CUBES_TARGET_POINTS = CUBES_TARGET_POINTS[::-1]
 
 # Gripper orientation (rx, ry, rz DEG) held for EVERY move so the gripper stays
 # pointing straight down. CALIBRATION: jog to gripper-straight-down, read
@@ -123,7 +126,16 @@ J6_LOCK_DEG = HOME[5]             # 0.0
 # Keep MAX_HEIGHT_TRAJECTORY reachable at PICK_ORIENTATION_DEG: gripper-down the
 # arm runs out of reach around world z ~ 17-18 cm near the workspace edge.
 MAX_HEIGHT_TRAJECTORY = 15.0
-MIN_ARC_HEIGHT_CM = 2.0          # floor, so short moves still clear the table / other cubes
+MIN_ARC_HEIGHT_CM = 8.0          # floor, so short moves still clear the table / other cubes --
+                                 # also keeps the elbow (J3) from folding past its real limit
+                                 # while holding a fixed straight-down orientation on short,
+                                 # close-to-base carries (worse here since J6 is hard-frozen,
+                                 # one fewer DOF to satisfy the orientation constraint with).
+                                 # Same fix, same root cause, as HighH-LowR.py's own
+                                 # MIN_ARC_HEIGHT_CM this session -- 2.0 let a shared-parabola
+                                 # apex drop low enough to need J3 past its real hardware
+                                 # limit; confirmed via full-arc preflight after copying this
+                                 # script's cube/target positions from HighH-LowR.py.
 CRUISE_SPEED_CM_S = 25.0          # peak tip speed; the ease dials stretch the move time
 LEADOUT_SPEED_CM_S = 10.0        # the final arc back toward HOME is slower / gentler
 ARC_TIME_EQUALIZATION = 0.5   # 0..1: blends each reach/carry arc's own duration at

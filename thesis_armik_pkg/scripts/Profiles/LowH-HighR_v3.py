@@ -74,17 +74,16 @@ PREFLIGHT = True
 Z_CUBE_COORD = -4.0
 
 CUBES_INITIAL_POINTS = [          # a row on the pick side, LISTED LEFT -> RIGHT
-    (15.0, 10.0, Z_CUBE_COORD),
-    (15.0, 13.0, Z_CUBE_COORD),
-    (15.0, 16.0, Z_CUBE_COORD),
-    (15.0, 19.0, Z_CUBE_COORD),
-
+    (14.0, 23.0, Z_CUBE_COORD),
+    (14.0, 16.5, Z_CUBE_COORD),
+    (14.0, 10.0, Z_CUBE_COORD),
+    #(15.0, 19.0, Z_CUBE_COORD),
 ]
 CUBES_TARGET_POINTS = [           # the drop row; cube picked k-th goes to slot k
-    (15.0, -10.0, Z_CUBE_COORD),
-    (15.0, -13.0, Z_CUBE_COORD),
-    (15.0, -16.0, Z_CUBE_COORD),
-    (15.0, -19.0, Z_CUBE_COORD),
+    (14.0, -23.0, Z_CUBE_COORD),
+    (14.0, -16.5, Z_CUBE_COORD),
+    (14.0, -10.0, Z_CUBE_COORD),
+    #(15.0, -19.0, Z_CUBE_COORD),
 ]
 
 # Gripper orientation (rx, ry, rz DEG) held for EVERY move. CALIBRATION: jog to

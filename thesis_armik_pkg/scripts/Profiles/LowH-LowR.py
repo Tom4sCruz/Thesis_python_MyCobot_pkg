@@ -205,6 +205,57 @@ SHUFFLE_ORDER = True              # grab cubes in a random order (init<->target 
 # -- gripper timing chaos (see module docstring) -----------------------------------
 GRIP_CHAOS_SPREAD_S = 1.2         # offset drawn uniform in [-this, +this] each cycle
 
+# -- special cycles: three one-off trajectory/timing variants, each on ONE ----------
+# designated cycle (like HighH-LowR.py's NUDGE_CYCLE). -1 disables any of them.
+# Cycle indices: 0=reach1,1=carry1,2=reach2,3=carry2,4=reach3,5=carry3 (3 cubes).
+
+# 1) DIAGONAL ARC -- must be an EVEN (reach) cycle: the arm swings diagonally
+# past the direct bearing before curving in to the next cube, starting from
+# where it just placed the previous cube ("from the target position, reach
+# forward... then move to the next cube").
+DIAGONAL_ARC_CYCLE = 2
+DIAGONAL_REACH_CM = 12.0    # how far the initial diagonal swing travels
+DIAGONAL_ANGLE_DEG = 35.0   # angle of that swing off the direct bearing (0 = straight
+                            # at the target, 90 = pure sideways)
+DIAGONAL_APEX_CM = 10.0     # apex height of EACH sub-arc (out-swing and curve-back)
+DIAGONAL_BOW_CM = 2.0       # slight sideways bow on the curve-back sub-arc
+
+# 2) DETERMINISTIC DELAYED OPEN -- must be an ODD (carry) cycle: unlike every
+# other cycle's RANDOM gripper-timing offset, this one deterministically
+# withholds the release until a fixed, tunable FRACTION of the very next
+# arc's own duration has elapsed (0.75 -> fires 3/4 of the way through the
+# return-to-next-cube leg). Reuses the same deferred-gripper ("pending")
+# machinery every other cycle already uses -- see the module docstring.
+DELAYED_OPEN_CYCLE = 3
+DELAYED_OPEN_FRACTION = 0.75   # 0..1
+
+# 3) ROLLERCOASTER -- must be an ODD (carry) cycle: instead of one direct
+# arc, the arm swings forward-then-back ROLLERCOASTER_PASSES times, apex
+# height alternating high/low each leg, before finally settling on the
+# target -- "grab the cube, move towards target, then back and forward
+# again, in a rollercoaster loop fashion."
+ROLLERCOASTER_CYCLE = 5
+ROLLERCOASTER_PASSES = 2          # forward/back oscillations before finally settling
+# forward/back fractions (of the origin->target chord) are RANGES, not fixed values,
+# and get re-rolled on every retry inside _draw_valid_rollercoaster() alongside
+# ease/speed -- unlike the diagonal arc's fixed geometry, a back-and-forth path that
+# revisits the SAME stretch of a chord multiple times (rather than crossing it once,
+# monotonically, like every other arc in this profile) can land in a genuinely hard
+# IK region for some cube/target pairs regardless of apex height or ease/speed --
+# confirmed empirically: neither helped, but a different BACK_FRAC did. This mirrors
+# random_style()'s role for the default 2-waypoint case -- the geometry itself needs
+# retry diversity here, not just timing.
+ROLLERCOASTER_BACK_FRAC_MIN, ROLLERCOASTER_BACK_FRAC_MAX = 0.10, 0.40
+ROLLERCOASTER_FORWARD_FRAC_MIN, ROLLERCOASTER_FORWARD_FRAC_MAX = 0.60, 0.90
+ROLLERCOASTER_HEIGHT_LOW_CM = 8.0    # matches APEX_LOW_MIN_CM's own safe floor (see its
+                                     # comment above) -- a low pass on a long, near-base-
+                                     # crossing chord needs the same clearance a normal low-
+                                     # to-ground arc does, confirmed against the same chord
+                                     # that originally forced that floor
+ROLLERCOASTER_HEIGHT_HIGH_CM = 12.0   # capped like APEX_WIDE_MAX_CM -- same reach-ceiling
+                                      # risk applies to a high rollercoaster pass
+ROLLERCOASTER_BOW_CM = 3.0
+
 # -- gripper ---------------------------------------------------------------------
 GRIP_OPEN_DEG = 120.0           # 0 = closed .. config.MAX_GRIPPER_DEG = full open
 GRIP_CLOSED_DEG = 65.0          # tune to the cube width
@@ -350,6 +401,91 @@ def get_durations(origin_point, target_point, arc_height, bow,
     return np.maximum(np.diff(t_k), MIN_SEGMENT_S).tolist()
 
 
+def _build_multi_arc(waypoints, apexes, bows):
+    """Concatenate a _parabola_points() sub-arc between each consecutive
+    pair in `waypoints` (len N), using per-segment apex/bow from `apexes`/
+    `bows` (len N-1). Returns (pts, total_length_cm) in the same
+    pts[0]=start convention as get_path() -- the shared boundary point
+    between consecutive sub-arcs is de-duplicated. Used by the diagonal-arc
+    and rollercoaster special cycles, which need more than one sub-arc."""
+    all_pts = [tuple(float(v) for v in waypoints[0])]
+    total_L = 0.0
+    for i in range(len(waypoints) - 1):
+        sub_pts, L = _parabola_points(waypoints[i], waypoints[i + 1], apexes[i], bows[i])
+        all_pts.extend(sub_pts[1:])
+        total_L += L
+    return all_pts, total_L
+
+
+def _multi_arc_durations(waypoints, apexes, bows, ease_in, ease_out, cruise):
+    """Matching durations for _build_multi_arc(): one EASE-shaped
+    get_durations() call per sub-segment, concatenated. Ease is only
+    applied on the true first/last sub-segments (interior ones get abrupt
+    0.0 ease) so the whole multi-arc reads as one continuous accel/decel
+    envelope, not a stutter-stop at each interior waypoint -- send_path()'s
+    own Hermite blending (already used by _send_arc) carries velocity
+    through the interior points regardless."""
+    durs = []
+    n = len(waypoints) - 1
+    for i in range(n):
+        durs += get_durations(waypoints[i], waypoints[i + 1], apexes[i], bows[i],
+                              ease_in if i == 0 else 0.0,
+                              ease_out if i == n - 1 else 0.0,
+                              cruise)
+    return durs
+
+
+def _rotate_xy(vec, angle_deg):
+    a = math.radians(angle_deg)
+    c, s = math.cos(a), math.sin(a)
+    return np.array([c * vec[0] - s * vec[1], s * vec[0] + c * vec[1]])
+
+
+def diagonal_waypoints(origin, target):
+    """[origin, a diagonal 'reach forward' point, target] -- the arm swings
+    DIAGONAL_REACH_CM off the direct origin->target bearing (rotated
+    DIAGONAL_ANGLE_DEG from it) before curving back in to the real target.
+    The diagonal point stays at origin's height; each sub-arc's own
+    parabolic lift gives the move its vertical character.
+
+    The rotation can go to either side of the direct bearing; which side is
+    picked dynamically, whichever keeps the diagonal point FARTHER from the
+    base. A fixed rotation sign can accidentally swing toward the base
+    depending on the specific origin/target geometry, forcing an
+    unreachable close-in fold to hold a fixed orientation there -- the
+    geometry-shape version of the same class of issue already fixed twice
+    in this profile for apex height and cruise speed."""
+    o, t = np.asarray(origin, float), np.asarray(target, float)
+    chord = t[:2] - o[:2]
+    chord_dir = chord / (np.linalg.norm(chord) + 1e-9)
+    cand_a = o[:2] + _rotate_xy(chord_dir, DIAGONAL_ANGLE_DEG) * DIAGONAL_REACH_CM
+    cand_b = o[:2] + _rotate_xy(chord_dir, -DIAGONAL_ANGLE_DEG) * DIAGONAL_REACH_CM
+    diag_xy = cand_a if np.linalg.norm(cand_a) >= np.linalg.norm(cand_b) else cand_b
+    diag_pt = (float(diag_xy[0]), float(diag_xy[1]), float(o[2]))
+    return [tuple(float(v) for v in o), diag_pt, tuple(float(v) for v in t)]
+
+
+def rollercoaster_waypoints(origin, target, forward_frac, back_frac):
+    """origin -> (forward, back) x ROLLERCOASTER_PASSES -> target. Forward
+    legs reach `forward_frac` of the way to the target, back legs retreat
+    to `back_frac` -- alternating apex heights (paired 1:1 by the caller)
+    give the "hill and valley" look. forward_frac/back_frac are passed in
+    (not read from the module constants directly) because
+    _draw_valid_rollercoaster() re-rolls them within
+    ROLLERCOASTER_*_FRAC_MIN/MAX on every retry -- see the note above those
+    constants for why this path shape needs geometry retries, not just
+    ease/speed ones."""
+    o, t = np.asarray(origin, float), np.asarray(target, float)
+    wps = [tuple(float(v) for v in o)]
+    for _ in range(ROLLERCOASTER_PASSES):
+        fwd = o + (t - o) * forward_frac
+        back = o + (t - o) * back_frac
+        wps.append(tuple(float(v) for v in fwd))
+        wps.append(tuple(float(v) for v in back))
+    wps.append(tuple(float(v) for v in t))
+    return wps
+
+
 def _tail_split_index(durs, lead_s):
     """Largest i such that the remaining travel from pts[i] to the arc's end
     (sum(durs[i:])) is still >= lead_s -- firing the gripper exactly when the
@@ -409,6 +545,81 @@ def _draw_valid_move(arm, origin, target, rng, cruise_override=None):
             return pts, durs, desc
 
     pts, durs, desc, ok = _try(8.0, 8.0, cruise_override or 6.0)
+    return pts, durs, desc + f" [fallback after {MOVE_DRAW_MAX_TRIES} tries]"
+
+
+def _draw_valid_diagonal(arm, origin, target, rng):
+    """Like _draw_valid_move(), for DIAGONAL_ARC_CYCLE: the waypoint
+    geometry is fixed (diagonal_waypoints()) -- only ease/speed are
+    re-rolled per retry against the same live arm.plan_path() check."""
+    rx, ry = PICK_ORIENTATION_DEG[:2]
+    waypoints = diagonal_waypoints(origin, target)
+    apexes = [DIAGONAL_APEX_CM, DIAGONAL_APEX_CM]
+    bows = [0.0, DIAGONAL_BOW_CM]
+
+    def _try(ei, eo, cruise):
+        pts, _ = _build_multi_arc(waypoints, apexes, bows)
+        durs = _multi_arc_durations(waypoints, apexes, bows, ei, eo, cruise)
+        desc = f"diagonal ease=({ei:.1f}/{eo:.1f}) speed={cruise:.1f}cm/s"
+        pl = arm.plan_path(x=[p[0] for p in pts[1:]], y=[p[1] for p in pts[1:]],
+                           z=[p[2] for p in pts[1:]], rx=rx, ry=ry, rz=_yaw(pts[1:]),
+                           durations=durs)
+        return pts, durs, desc, pl.ok
+
+    for _ in range(MOVE_DRAW_MAX_TRIES):
+        ei = float(rng.uniform(EASE_MIN, EASE_MAX))
+        eo = float(rng.uniform(EASE_MIN, EASE_MAX))
+        cruise = float(rng.uniform(CRUISE_SPEED_MIN_CM_S, CRUISE_SPEED_MAX_CM_S))
+        pts, durs, desc, ok = _try(ei, eo, cruise)
+        if ok:
+            return pts, durs, desc
+
+    pts, durs, desc, ok = _try(8.0, 8.0, 6.0)
+    return pts, durs, desc + f" [fallback after {MOVE_DRAW_MAX_TRIES} tries]"
+
+
+def _draw_valid_rollercoaster(arm, origin, target, rng):
+    """Like _draw_valid_move(), for ROLLERCOASTER_CYCLE. Unlike the diagonal
+    arc, the waypoint geometry here is NOT fixed across retries: a
+    back-and-forth path revisits the same stretch of the origin->target
+    chord multiple times (rather than crossing it once, monotonically, like
+    every other arc in this profile), which can land in a genuinely hard IK
+    region for some cube/target pairs regardless of apex height or ease/
+    speed -- confirmed empirically while tuning this. So forward_frac/
+    back_frac are ALSO re-rolled (within ROLLERCOASTER_*_FRAC_MIN/MAX) on
+    every retry, alongside ease/speed and the final landing segment's
+    random_style() apex/bow."""
+    rx, ry = PICK_ORIENTATION_DEG[:2]
+
+    def _try(ei, eo, cruise, fwd_frac, back_frac):
+        waypoints = rollercoaster_waypoints(origin, target, fwd_frac, back_frac)
+        n_seg = len(waypoints) - 1
+        h, bow, _ = random_style(rng)
+        apexes = [(ROLLERCOASTER_HEIGHT_HIGH_CM if i % 2 == 0 else ROLLERCOASTER_HEIGHT_LOW_CM)
+                  for i in range(n_seg - 1)] + [h]
+        bows = [ROLLERCOASTER_BOW_CM if i % 2 == 0 else -ROLLERCOASTER_BOW_CM
+                for i in range(n_seg - 1)] + [bow]
+        pts, _ = _build_multi_arc(waypoints, apexes, bows)
+        durs = _multi_arc_durations(waypoints, apexes, bows, ei, eo, cruise)
+        desc = (f"rollercoaster ease=({ei:.1f}/{eo:.1f}) speed={cruise:.1f}cm/s "
+                f"fwd={fwd_frac:.2f} back={back_frac:.2f}")
+        pl = arm.plan_path(x=[p[0] for p in pts[1:]], y=[p[1] for p in pts[1:]],
+                           z=[p[2] for p in pts[1:]], rx=rx, ry=ry, rz=_yaw(pts[1:]),
+                           durations=durs)
+        return pts, durs, desc, pl.ok
+
+    for _ in range(MOVE_DRAW_MAX_TRIES):
+        ei = float(rng.uniform(EASE_MIN, EASE_MAX))
+        eo = float(rng.uniform(EASE_MIN, EASE_MAX))
+        cruise = float(rng.uniform(CRUISE_SPEED_MIN_CM_S, CRUISE_SPEED_MAX_CM_S))
+        fwd_frac = float(rng.uniform(ROLLERCOASTER_FORWARD_FRAC_MIN, ROLLERCOASTER_FORWARD_FRAC_MAX))
+        back_frac = float(rng.uniform(ROLLERCOASTER_BACK_FRAC_MIN, ROLLERCOASTER_BACK_FRAC_MAX))
+        pts, durs, desc, ok = _try(ei, eo, cruise, fwd_frac, back_frac)
+        if ok:
+            return pts, durs, desc
+
+    pts, durs, desc, ok = _try(8.0, 8.0, 6.0, ROLLERCOASTER_FORWARD_FRAC_MAX,
+                              ROLLERCOASTER_BACK_FRAC_MIN)
     return pts, durs, desc + f" [fallback after {MOVE_DRAW_MAX_TRIES} tries]"
 
 
@@ -583,6 +794,15 @@ def main():
     if len(CUBES_INITIAL_POINTS) != len(TARGET_POSITIONS):
         print("CUBES_INITIAL_POINTS and TARGET_POSITIONS must be the same length.")
         return 1
+    if DIAGONAL_ARC_CYCLE >= 0 and DIAGONAL_ARC_CYCLE % 2 != 0:
+        print(f"DIAGONAL_ARC_CYCLE must be an EVEN (reach) cycle, got {DIAGONAL_ARC_CYCLE}.")
+        return 1
+    if DELAYED_OPEN_CYCLE >= 0 and DELAYED_OPEN_CYCLE % 2 != 1:
+        print(f"DELAYED_OPEN_CYCLE must be an ODD (carry) cycle, got {DELAYED_OPEN_CYCLE}.")
+        return 1
+    if ROLLERCOASTER_CYCLE >= 0 and ROLLERCOASTER_CYCLE % 2 != 1:
+        print(f"ROLLERCOASTER_CYCLE must be an ODD (carry) cycle, got {ROLLERCOASTER_CYCLE}.")
+        return 1
 
     if not args.mock and not args.yes:
         print("This will move the robot arm and actuate the gripper. Clear the workspace.")
@@ -621,9 +841,14 @@ def main():
         # (reachability + MAX_JOINT_SPEED_DPS) before committing to it -- see the note
         # above EASE_MIN/EASE_MAX. Purely planning; no motion happens here.
         paths, all_durs, styles = [], [], []
-        for seg in segments:
-            cruise_override = LEADOUT_SPEED_CM_S if seg["kind"] == "leadout" else None
-            pts, durs, desc = _draw_valid_move(arm, seg["origin"], seg["target"], rng, cruise_override)
+        for ci, seg in enumerate(segments):
+            if ci == DIAGONAL_ARC_CYCLE and seg["kind"] == "reach":
+                pts, durs, desc = _draw_valid_diagonal(arm, seg["origin"], seg["target"], rng)
+            elif ci == ROLLERCOASTER_CYCLE and seg["kind"] == "carry":
+                pts, durs, desc = _draw_valid_rollercoaster(arm, seg["origin"], seg["target"], rng)
+            else:
+                cruise_override = LEADOUT_SPEED_CM_S if seg["kind"] == "leadout" else None
+                pts, durs, desc = _draw_valid_move(arm, seg["origin"], seg["target"], rng, cruise_override)
             paths.append(pts)
             all_durs.append(durs)
             styles.append(desc)
@@ -699,23 +924,34 @@ def main():
                     return 1
                 pending = None
 
-            # this cycle's own gripper action, timed with a fresh random offset
-            offset = float(rng.uniform(-GRIP_CHAOS_SPREAD_S, GRIP_CHAOS_SPREAD_S))
-            if offset <= 0.0:
-                split = _tail_split_index(durs, -offset)
-                if split > 0:
-                    if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (approach)"):
-                        print("\naborting run."); go_home(arm); return 1
-                    pts, durs = pts[split:], durs[split:]
-                if not _grip(arm, grip_deg, f"{action} (offset {offset:+.2f}s)"):
-                    return 1
-                if not _send_arc(arm, pts, durs, f"{label} (final)"):
-                    print("\naborting run."); go_home(arm); return 1
-            else:
+            # this cycle's own gripper action -- DELAYED_OPEN_CYCLE forces a
+            # deterministic, tunable-fraction defer instead of the usual random offset
+            if ci == DELAYED_OPEN_CYCLE and kind == "carry":
                 if not _send_arc(arm, pts, durs, label):
                     print("\naborting run."); go_home(arm); return 1
-                pending = (grip_deg, action, offset)
-                print(f"  gripper action deferred ~{offset:.2f}s into the next leg")
+                next_durs = all_durs[ci + 1] if ci + 1 < len(all_durs) else []
+                forced_offset = DELAYED_OPEN_FRACTION * sum(next_durs)
+                pending = (grip_deg, action, forced_offset)
+                print(f"  gripper action DELIBERATELY delayed to "
+                      f"{DELAYED_OPEN_FRACTION * 100:.0f}% into the next leg")
+            else:
+                # timed with a fresh random offset
+                offset = float(rng.uniform(-GRIP_CHAOS_SPREAD_S, GRIP_CHAOS_SPREAD_S))
+                if offset <= 0.0:
+                    split = _tail_split_index(durs, -offset)
+                    if split > 0:
+                        if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (approach)"):
+                            print("\naborting run."); go_home(arm); return 1
+                        pts, durs = pts[split:], durs[split:]
+                    if not _grip(arm, grip_deg, f"{action} (offset {offset:+.2f}s)"):
+                        return 1
+                    if not _send_arc(arm, pts, durs, f"{label} (final)"):
+                        print("\naborting run."); go_home(arm); return 1
+                else:
+                    if not _send_arc(arm, pts, durs, label):
+                        print("\naborting run."); go_home(arm); return 1
+                    pending = (grip_deg, action, offset)
+                    print(f"  gripper action deferred ~{offset:.2f}s into the next leg")
 
             cur = current_pos(arm)
             reached = (has_reached_cube(cur, seg["target"]) if kind == "reach"

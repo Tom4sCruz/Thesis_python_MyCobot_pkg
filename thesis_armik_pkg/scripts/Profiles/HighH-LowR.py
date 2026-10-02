@@ -54,7 +54,7 @@ import numpy as np
 from armik import Arm, Plan, config, pose_coords
 from _gaze import gaze_waypoints, gaze_then_level_waypoints, look_at_rpy, ease_to_rpy
 from _celebrate import (build_straight_arm_oscillation_waypoints, celebration_durations,
-                        min_feasible_duration_s)
+                        min_feasible_duration_s, solve_j6_level)
 
 # ===========================================================================
 # CONSTANTS
@@ -213,34 +213,38 @@ NUDGE_CUBE_PREVIEW_CM = tuple(
 # A gentle dip-and-rise: base (J1) fixed at 90deg, reference pose dead
 # straight (J2=J3=J4=0) so the gripper points EXACTLY at world +X with no
 # trade-off, and the shoulder/elbow/wrist-pitch chain moves only in the
-# world YZ-plane. Closed-form 2-link planar IK (shoulder+elbow) positions
-# the wrist-pitch pivot on the vertical line; wrist-pitch itself cancels
-# shoulder+elbow's cumulative tilt so the tip's pointing direction never
-# drifts (not just its X-component -- see _celebrate.py). Direct joint-
-# space motion; the ordinary Cartesian send_path()/plan_coords() can't do
-# this (the straight pose is a real kinematic singularity).
+# world YZ-plane. J4 (wrist-pitch) is STATIC -- it doesn't compensate
+# anything (an earlier version had it chase shoulder+elbow's motion every
+# waypoint, exact in simulation but unable to track that fast/precisely on
+# real hardware). Shoulder+elbow (J2, J3) solve directly for the TIP's own
+# position on the vertical line; J6 (tool-roll) keeps the gripper level --
+# see _celebrate.py for why that's a different (and, here, exact) job from
+# what J4 used to do. Direct joint-space motion; the ordinary Cartesian
+# send_path()/plan_coords() can't do this (the straight pose is a real
+# kinematic singularity).
 CELEBRATE_ENABLED = True
 CELEBRATE_BASE_J1_DEG = 90.0        # world azimuth the arm swings to first;
                                      # flip to -90 if it should face the other way
-CELEBRATE_STAGING_J4_DEG = 0.0      # reference pose is fully straight (J2=J3=J4=0)
+CELEBRATE_J4_STATIC_DEG = 0.0       # wrist-pitch -- held fixed, does not compensate
 CELEBRATE_STAGING_J5_DEG = -90.0    # this reference pose gives EXACT +X pointing
                                      # with no trade-off at all (tip lands ~203mm
                                      # off the vertical line, but that's just the
                                      # fixed "head and neck" length laid out along
                                      # +X, not a tunable compromise -- see _celebrate.py)
-CELEBRATE_J6_DEG = 0.0              # held fixed throughout; purely cosmetic
+CELEBRATE_LEVEL_AXIS_INDEX = 0      # which tool-frame axis (0 or 1) J6 keeps level --
+                                     # whichever matches the real gripper's physical
+                                     # finger-open/width direction; flip to 1 if the
+                                     # gripper levels sideways instead of upright
 CELEBRATE_STAGING_DURATION_S = 3.0  # move_joints() time into the straight pose;
                                      # 2.0s peaked ~126 deg/s on J1 (comparable to
                                      # the fastest reach/carry arcs), read as abrupt
                                      # for a move meant to look deliberate
-CELEBRATE_DIP_MM = 30.0              # how far the wrist pivot dips below the
-                                     # reference height each swing -- PLACEHOLDER;
-                                     # the reference sits at this 2-link sub-chain's
-                                     # full-extension singularity, so it can only
-                                     # dip DOWN, and small dips need disproportionately
-                                     # large elbow swings (square-root-type relation
-                                     # near full extension): ~16deg elbow for 2mm,
-                                     # ~25deg for 5mm, ~44deg for 15mm
+CELEBRATE_DIP_MM = 30.0              # how far the gripper dips below the reference
+                                     # height each swing -- PLACEHOLDER; the reference
+                                     # sits at this sub-chain's full-extension
+                                     # singularity, so it can only dip DOWN, and small
+                                     # dips need disproportionately large J2/J3 swings
+                                     # (square-root-type relation near full extension)
 CELEBRATE_FINAL_DIP_MM = 40.0        # "slightly bent" resting dip, instead of
                                      # snapping back fully straight
 CELEBRATE_ELBOW_BRANCH_SIGN = 1.0   # flip to -1.0 if the elbow bends the visually
@@ -248,9 +252,9 @@ CELEBRATE_ELBOW_BRANCH_SIGN = 1.0   # flip to -1.0 if the elbow bends the visual
 CELEBRATE_CYCLES = 2                # number of full dip-and-rise oscillations
 CELEBRATE_EASE_IN = 1.0             # [0,10] -- see EASE_IN's doc above
 CELEBRATE_EASE_OUT = 1.0            # [0,10] -- see EASE_OUT's doc above
-CELEBRATE_OSCILLATE_WAYPOINTS = 20  # samples across all CELEBRATE_CYCLES
-CELEBRATE_SETTLE_WAYPOINTS = 10     # samples for the final eased settle
-CELEBRATE_DURATION_S = 6.0          # total time, staging move excluded
+CELEBRATE_OSCILLATE_WAYPOINTS = 40  # samples across all CELEBRATE_CYCLES
+CELEBRATE_SETTLE_WAYPOINTS = 20     # samples for the final eased settle
+CELEBRATE_DURATION_S = 5.0          # total time, staging move excluded
 
 # -- gripper ---------------------------------------------------------------------
 GRIP_OPEN_DEG = 120.0           # 0 = closed .. config.MAX_GRIPPER_DEG = full open
@@ -542,8 +546,10 @@ def _play_success_animation(arm):
     see _celebrate.py for why."""
     if not CELEBRATE_ENABLED:
         return True
-    staging_q = [CELEBRATE_BASE_J1_DEG, 0.0, 0.0, CELEBRATE_STAGING_J4_DEG,
-                CELEBRATE_STAGING_J5_DEG, CELEBRATE_J6_DEG]
+    staging_j6 = solve_j6_level(CELEBRATE_BASE_J1_DEG, 0.0, 0.0, CELEBRATE_J4_STATIC_DEG,
+                                CELEBRATE_STAGING_J5_DEG, CELEBRATE_LEVEL_AXIS_INDEX)
+    staging_q = [CELEBRATE_BASE_J1_DEG, 0.0, 0.0, CELEBRATE_J4_STATIC_DEG,
+                CELEBRATE_STAGING_J5_DEG, staging_j6]
     print("\n=== success animation ===")
     print("  moving to the straight staging pose...")
     if not arm.move_joints(staging_q, duration=CELEBRATE_STAGING_DURATION_S):
@@ -554,7 +560,8 @@ def _play_success_animation(arm):
         base_j1_deg=CELEBRATE_BASE_J1_DEG, dip_mm=CELEBRATE_DIP_MM,
         final_dip_mm=CELEBRATE_FINAL_DIP_MM, cycles=CELEBRATE_CYCLES,
         elbow_branch_sign=CELEBRATE_ELBOW_BRANCH_SIGN,
-        j5_deg=CELEBRATE_STAGING_J5_DEG, j6_deg=CELEBRATE_J6_DEG,
+        j4_static_deg=CELEBRATE_J4_STATIC_DEG, j5_deg=CELEBRATE_STAGING_J5_DEG,
+        level_axis_index=CELEBRATE_LEVEL_AXIS_INDEX,
         n_oscillate_waypoints=CELEBRATE_OSCILLATE_WAYPOINTS,
         n_settle_waypoints=CELEBRATE_SETTLE_WAYPOINTS)
     n_waypoints = CELEBRATE_OSCILLATE_WAYPOINTS + CELEBRATE_SETTLE_WAYPOINTS + 1

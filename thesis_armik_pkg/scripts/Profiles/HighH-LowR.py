@@ -233,7 +233,7 @@ CELEBRATE_STAGING_DURATION_S = 3.0  # move_joints() time into the straight pose;
                                      # 2.0s peaked ~126 deg/s on J1 (comparable to
                                      # the fastest reach/carry arcs), read as abrupt
                                      # for a move meant to look deliberate
-CELEBRATE_DIP_MM = 10.0              # how far the wrist pivot dips below the
+CELEBRATE_DIP_MM = 30.0              # how far the wrist pivot dips below the
                                      # reference height each swing -- PLACEHOLDER;
                                      # the reference sits at this 2-link sub-chain's
                                      # full-extension singularity, so it can only
@@ -241,16 +241,16 @@ CELEBRATE_DIP_MM = 10.0              # how far the wrist pivot dips below the
                                      # large elbow swings (square-root-type relation
                                      # near full extension): ~16deg elbow for 2mm,
                                      # ~25deg for 5mm, ~44deg for 15mm
-CELEBRATE_FINAL_DIP_MM = 20.0        # "slightly bent" resting dip, instead of
+CELEBRATE_FINAL_DIP_MM = 40.0        # "slightly bent" resting dip, instead of
                                      # snapping back fully straight
 CELEBRATE_ELBOW_BRANCH_SIGN = 1.0   # flip to -1.0 if the elbow bends the visually
                                      # wrong way
 CELEBRATE_CYCLES = 2                # number of full dip-and-rise oscillations
-CELEBRATE_EASE_IN = 1.0             # [0,10] -- see EASE_IN's doc above
-CELEBRATE_EASE_OUT = 1.0            # [0,10] -- see EASE_OUT's doc above
-CELEBRATE_OSCILLATE_WAYPOINTS = 30  # samples across all CELEBRATE_CYCLES
-CELEBRATE_SETTLE_WAYPOINTS = 10     # samples for the final eased settle
-CELEBRATE_DURATION_S = 5.0          # total time, staging move excluded
+CELEBRATE_EASE_IN = 2.0             # [0,10] -- see EASE_IN's doc above
+CELEBRATE_EASE_OUT = 2.0            # [0,10] -- see EASE_OUT's doc above
+CELEBRATE_OSCILLATE_WAYPOINTS = 60  # samples across all CELEBRATE_CYCLES
+CELEBRATE_SETTLE_WAYPOINTS = 30     # samples for the final eased settle
+CELEBRATE_DURATION_S = 4.0          # total time, staging move excluded
 
 # -- gripper ---------------------------------------------------------------------
 GRIP_OPEN_DEG = 120.0           # 0 = closed .. config.MAX_GRIPPER_DEG = full open

@@ -64,16 +64,15 @@ PREFLIGHT = True
 Z_CUBE_COORD = -4.0
 
 CUBES_INITIAL_POINTS = [          # a row on the pick side, LISTED LEFT -> RIGHT
-    (15.0, 10.0, Z_CUBE_COORD),
-    (15.0, 13.0, Z_CUBE_COORD),
-    (15.0, 16.0, Z_CUBE_COORD),
-    (15.0, 19.0, Z_CUBE_COORD),
+                                   # -- matches HighH-LowR.py's layout
+    (14.0, 10.0, Z_CUBE_COORD),
+    (14.0, 15.5, Z_CUBE_COORD),
+    (14.0, 23.0, Z_CUBE_COORD),
 ]
 CUBES_TARGET_POINTS = [           # the drop row; cube picked k-th goes to slot k
-    (15.0, -10.0, Z_CUBE_COORD),
-    (15.0, -13.0, Z_CUBE_COORD),
-    (15.0, -16.0, Z_CUBE_COORD),
-    (15.0, -19.0, Z_CUBE_COORD),
+    (14.0, -10.0, Z_CUBE_COORD),
+    (14.0, -15.5, Z_CUBE_COORD),
+    (14.0, -23.0, Z_CUBE_COORD),
 ]
 
 # Gripper orientation (rx, ry, rz DEG) held for EVERY move. CALIBRATION: jog to
@@ -90,19 +89,30 @@ DELAY_BETWEEN_JOINTS_S = 0.10  # -> config.SINGLE_JOINT_DELAY            (armik 
 DELAY_BETWEEN_POINTS_S = 0.30  # -> config.SINGLE_JOINT_DELAY_BETWEEN_POINTS (default 2.0!)
 
 # -- v2 coordinated grab/place -------------------------------------------------
-CARRY_HEIGHT_CM = 12.0        # height the end-effector is lifted/held at during the J1 transit
+CARRY_HEIGHT_CM = 8.0         # height the end-effector is lifted/held at during the J1 transit --
+                              # was 12.0; matching HighH-LowR.py's wider cube row (now spanning
+                              # y=+-23, not +-19) made the widest swing (straight-line Cartesian,
+                              # full pose constrained) go unreachable partway through at 12.0 --
+                              # confirmed 10.0+ fails, 8.0 is comfortably reachable end to end
 DESCENT_SPEED_CM_S = 4.0      # cm/s for the coordinated lift and grab/place descent
 
 # grab order -- deterministic. Arrange CUBES_INITIAL_POINTS left->right, or set
 # explicit indices here.
 PICK_ORDER = list(range(len(CUBES_INITIAL_POINTS)))
 
-# -- scripted nudge ("defective cube") ------------------------------------------
-NUDGE_CYCLE = -1                # EVEN (reach) cycle index whose cube is nudged; -1 = off
-NUDGE_OFFSET_CM = (3.0, 0.0, 0.0)   # where the nudged cube ends up
-NUDGE_POINT_TILT_DEG = 25.0    # pitch the gripper this far off straight-down, toward the cube
-NUDGE_AIM_SPEED_DPS = 40.0     # deg/s for the "point at it" move
-NUDGE_LOOK_S = 1.5            # hold the "regarding it" pose before moving on
+# -- scripted nudge (non-reactive: this profile has no sensing, so the cube
+# -- silently relocates but the arm's motion is completely unaffected) ---------
+NUDGE_CYCLE = 2                  # EVEN (reach) cycle index whose cube is nudged;
+                                 # -1 = off. 2 = cube #2 (the middle cube), same
+                                 # one HighH-LowR.py nudges
+NUDGE_OFFSET_CM = (3.0, 0.0, 0.0)   # where the nudged cube ends up (narrative/
+                                     # RViz-preview only -- see NUDGE_CUBE_PREVIEW_CM)
+
+# where the nudged cube visually ends up -- always fed to RvizBridge as the
+# yellow preview cube, independent of whether NUDGE_CYCLE is enabled this run
+NUDGE_CUBE_PREVIEW_CM = tuple(
+    float(c + o) for c, o in zip(CUBES_INITIAL_POINTS[1], NUDGE_OFFSET_CM)
+)
 
 # -- gripper ---------------------------------------------------------------------
 GRIP_OPEN_DEG = 120.0          # 0 = closed .. config.MAX_GRIPPER_DEG = full open
@@ -285,25 +295,13 @@ def _grip(arm, deg, label):
 
 def _staccato_kw(arm, pts):
     """send_path kwargs for a joint-by-joint move through `pts`, with a live
-    lift waypoint prepended. Used only by the nudge / trigger paths in v2."""
+    lift waypoint prepended. Used only by the trigger path in v2."""
     sent = [_approach(current_pos(arm))] + [tuple(map(float, p)) for p in pts]
     rx, ry, rz = PICK_ORIENTATION_DEG
     return sent, dict(
         x=[p[0] for p in sent], y=[p[1] for p in sent], z=[p[2] for p in sent],
         rx=rx, ry=ry, rz=rz, speed=JOINT_SPEED_DPS, durations=[SEG_PLAN_S] * len(sent),
     )
-
-
-def _send_staccato(arm, pts, label):
-    """Blocking one-joint-at-a-time move (armik J1..J6). Used by run_nudge."""
-    sent, kw = _staccato_kw(arm, pts)
-    r = arm.send_path(**kw)
-    if not r:
-        print(f"  {label}: send_path REFUSED -- {arm.last_error}")
-        return False
-    ex = arm.last_execution
-    print(f"  {label}: {len(sent)} waypoints, {ex.duration_s:.1f}s, {ex.setpoints} joint moves")
-    return True
 
 
 class _PathThread(threading.Thread):
@@ -350,30 +348,14 @@ def _send_staccato_with_trigger(arm, pts, cycle_n, grip_deg, label):
     return True
 
 
-def run_nudge(arm, seg, ci, segments):
-    """Scripted 'defective cube': reach, the cube moves, point the gripper at
-    its new spot, hold, then IGNORE it (its carry is skipped)."""
-    rx0, ry0, rz0 = PICK_ORIENTATION_DEG
-    print(f"  NUDGE cycle {ci}: reaching for cube #{seg['k']+1} ...")
-    if not _send_staccato(arm, [_approach(seg["target"])], "  nudge reach (hover)"):
-        return False
-
+def run_nudge(seg):
+    """The cube silently relocates (narrative/visual only -- see
+    NUDGE_CUBE_PREVIEW_CM for the RViz marker); this profile has no
+    sensing, so the arm's own reach/grip/carry for this cube is completely
+    unaffected and proceeds identically to every other cube."""
     new_cube = tuple(float(c + o) for c, o in zip(seg["target"], NUDGE_OFFSET_CM))
-    aim = _approach(new_cube)
-    print(f"  cube moved to {tuple(round(v, 1) for v in new_cube)} -- "
-          f"pointing the gripper at it, then ignoring it")
-    r = arm.send_path(x=[float(aim[0])], y=[float(aim[1])], z=[float(aim[2])],
-                      rx=rx0, ry=ry0 + NUDGE_POINT_TILT_DEG, rz=rz0,
-                      speed=NUDGE_AIM_SPEED_DPS, durations=[SEG_PLAN_S])
-    if not r:
-        print(f"  aim REFUSED -- {arm.last_error}")
-        return False
-    time.sleep(NUDGE_LOOK_S)
-
-    nxt = ci + 1
-    if nxt < len(segments) and segments[nxt]["kind"] == "carry":
-        segments[nxt]["kind"] = "skip"
-    return True
+    print(f"  (cube silently nudged to {tuple(round(v, 1) for v in new_cube)} -- "
+          f"arm doesn't react, continuing to {tuple(round(v, 1) for v in seg['target'])})")
 
 
 # ===========================================================================
@@ -387,9 +369,6 @@ def preflight(arm, segments):
     for i, (s, t) in enumerate(zip(CUBES_INITIAL_POINTS, CUBES_TARGET_POINTS)):
         checks += [(f"init{i+1}", s), (f"init{i+1}^", _approach(s)),
                    (f"tgt{i+1}", t), (f"tgt{i+1}^", _approach(t))]
-    if 0 <= NUDGE_CYCLE < len(segments):
-        nc = tuple(c + o for c, o in zip(segments[NUDGE_CYCLE]["target"], NUDGE_OFFSET_CM))
-        checks.append(("nudge^", _approach(nc)))
     bad = 0
     for name, (x, y, z) in checks:
         pl = arm.plan_coords(x=x, y=y, z=z, rx=rx, ry=ry, rz=rz,
@@ -462,7 +441,8 @@ def main():
     if 0 <= NUDGE_CYCLE < len(segments):
         nk = segments[NUDGE_CYCLE]["k"]
         print(f"NUDGE on cycle {NUDGE_CYCLE}: cube #{nk + 1} at {CUBES_INITIAL_POINTS[nk]} "
-              f"-- nudge THAT cube as the arm nears it; its carry is skipped")
+              f"-- nudged as soon as its own reach comes up; this profile has no "
+              f"sensing, so the arm reaches/grips/carries it exactly as if it never moved")
 
     paths = [get_path(s["origin"], s["target"]) for s in segments]
 
@@ -489,7 +469,8 @@ def main():
         cube_pts = [tuple(map(float, c)) for c in CUBES_INITIAL_POINTS]
         try:
             bridge = RvizBridge(arm.get_angles, path_xyz_cm=flat_path,
-                                cube_points=cube_pts, tip_source=arm.get_coords,
+                                cube_points=cube_pts, nudge_cube_point=NUDGE_CUBE_PREVIEW_CM,
+                                tip_source=arm.get_coords,
                                 gripper_source=arm.get_gripper_value)
             bridge.start()
             print("RViz bridge up: publishing /joint_states + /visualization_marker")
@@ -521,19 +502,13 @@ def main():
         for ci, seg in enumerate(segments):
             kind = seg["kind"]
 
-            if kind == "skip":
-                print(f"\n=== cycle {ci}  cube #{seg['k'] + 1} -- DEFECTIVE, carry skipped ===")
-                continue
-
             grip_deg = GRIP_CLOSED_DEG if kind == "reach" else GRIP_OPEN_DEG
             label = "reach & grasp" if kind == "reach" else "carry & place"
             print(f"\n=== cycle {ci}/{len(segments) - 1}  {label}  cube #{seg['k'] + 1}  "
                   f"-> {tuple(round(v, 1) for v in seg['target'])} ===")
 
             if kind == "reach" and ci == NUDGE_CYCLE:
-                if not run_nudge(arm, seg, ci, segments):
-                    print("\naborting run."); go_home(arm); return 1
-                continue
+                run_nudge(seg)
 
             pts = paths[ci]
             if _has_trigger(ci):

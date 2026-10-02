@@ -64,9 +64,7 @@ import time
 
 import numpy as np
 
-from armik import Arm, Plan, config, pose_coords
-from _gaze import gaze_waypoints, gaze_then_level_waypoints, look_at_rpy, ease_to_rpy
-from _celebrate import build_oscillation_waypoints, celebration_durations
+from armik import Arm, config, pose_coords
 
 # ===========================================================================
 # CONSTANTS
@@ -117,20 +115,6 @@ PICK_ORIENTATION_DEG = (180.0, 0.0, -45.0)
 #   "free"  : rz unconstrained -- IK keeps wrist motion minimal.
 ORIENT_LOCK = "world"
 ORIENT_LOCK_SIGN = 1.0            # flip to -1.0 if "base" yaws the gripper the wrong way
-
-# -- gaze (look-at) ----------------------------------------------------------
-# When enabled, the gripper tip points AT its current goal instead of holding
-# PICK_ORIENTATION_DEG -- the cube while reaching for it, the drop point while
-# carrying it there. Supersedes ORIENT_LOCK/_yaw() (and PICK_ORIENTATION_DEG's
-# rx/ry) on every arc that has a gaze target; the lead-out back to HOME has
-# none and keeps the old fixed orientation. See _gaze.py.
-GAZE_ENABLED = True
-GAZE_EASE_IN_S = 0.4              # seconds; 0 = snap onto a new target instantly,
-                                 # larger = slower lock-on when the gaze target switches
-GAZE_EASE_OUT_S = 0.3           # seconds before arrival that the gripper starts leveling
-                                 # out to PICK_ORIENTATION_DEG's pitch/roll, so every gazed
-                                 # arc still arrives gripper-straight-down; 0 = snap level
-                                 # only on the arc's very last waypoint
 
 # -- arc shape -------------------------------------------------------------------
 # z(u) = z0 + (z1-z0)*u + h*(1 - |2u-1|^ARC_SHAPE_DEGREE) -- ARC_SHAPE_DEGREE=2 is
@@ -222,51 +206,6 @@ NUDGE_SETTLE_S = 1.5           # pause after the recoil, "waiting for the cube t
 NUDGE_CUBE_PREVIEW_CM = tuple(
     float(c + o) for c, o in zip(CUBES_INITIAL_POINTS[NUDGED_CUBE], NUDGE_OFFSET_CM)
 )
-
-# -- success animation (played after the last cube is placed, replaces the
-# -- old lead-out-to-HOME ending entirely) -----------------------------------
-# A pure left-right shoulder wag: base (J1) fixed at 90deg so the shoulder/
-# elbow/wrist-pitch chain moves only in the world YZ-plane (zero diagonal/
-# depth component), gripper staying on one vertical line and upright
-# throughout. Direct joint-space motion -- see _celebrate.py for why the
-# ordinary Cartesian send_path()/plan_coords() can't do this (the straight-up
-# pose is a real kinematic singularity).
-CELEBRATE_ENABLED = True
-CELEBRATE_BASE_J1_DEG = 90.0        # world azimuth the arm swings to first;
-                                     # flip to -90 if it should face the other way
-CELEBRATE_STAGING_J4_DEG = 59.17    # PLACEHOLDER, FK-verified for straight-up
-CELEBRATE_STAGING_J5_DEG = -30.0    # was 27.79 -- this is the ONE joint that sets
-                                     # both the gripper's pointing direction AND
-                                     # the tip's constant X offset (tied together
-                                     # on this arm at base=90deg -- see
-                                     # _celebrate.py); -30 points the gripper
-                                     # roughly toward +X/the camera at the cost
-                                     # of a constant ~13.4cm tip offset off the
-                                     # pure vertical line (was 0 at 27.79)
-CELEBRATE_J6_DEG = 0.0              # held fixed throughout; purely cosmetic
-CELEBRATE_STAGING_DURATION_S = 5.0  # was 2.0 -- 2.0s peaked ~126 deg/s on J1
-                                     # (comparable to the fastest reach/carry
-                                     # arcs), read as abrupt for a move meant
-                                     # to look deliberate; 5.0s brings peak
-                                     # speed to ~50 deg/s
-CELEBRATE_SHOULDER_AMPLITUDE_DEG = 20.0   # J2 (shoulder) swing, each way
-CELEBRATE_DIRECTION_SIGN = 1.0      # flip to -1.0 if the first sweep goes CCW
-                                     # instead of CW
-CELEBRATE_CYCLES = 2                # number of full oscillations
-CELEBRATE_FINAL_SHOULDER_DEG = 15.0 # "slightly bent" resting J2 -- within the
-                                     # amplitude range, not a snap back to center
-CELEBRATE_Z_APEX_MM = 475.0         # center height target -- a few mm below the
-                                     # true singular apex (480.75mm)
-CELEBRATE_Z_SAG_COEFF = 0.02        # mm/deg^2 the height target gives up as the
-                                     # shoulder swings out -- must stay below the
-                                     # arm's own natural sag rate (~0.024,
-                                     # measured) to stay reachable with margin
-                                     # at CELEBRATE_SHOULDER_AMPLITUDE_DEG
-CELEBRATE_EASE_IN = 4.0             # [0,10] -- see EASE_IN's doc above
-CELEBRATE_EASE_OUT = 4.0            # [0,10] -- see EASE_OUT's doc above
-CELEBRATE_OSCILLATE_WAYPOINTS = 90  # samples across all CELEBRATE_CYCLES
-CELEBRATE_SETTLE_WAYPOINTS = 20     # samples for the final eased settle
-CELEBRATE_DURATION_S = 5.0          # total time, staging move excluded
 
 # -- gripper ---------------------------------------------------------------------
 GRIP_OPEN_DEG = 120.0           # 0 = closed .. config.MAX_GRIPPER_DEG = full open
@@ -481,9 +420,7 @@ def has_reached_target(end_effector_coords, target_xyz):
 def go_home(arm):
     """Homing move, with the duration scaled to the joint distance so a long
     return from the far side is not crammed into HOME_MOVE_S (which makes
-    move_joints -- no speed pre-check -- outrun the servos and shake).
-    Returns bool -- move_joints() can refuse (e.g. the arm's current pose is
-    already outside a joint's soft limit), and that must not pass silently."""
+    move_joints -- no speed pre-check -- outrun the servos and shake)."""
     try:
         dq = max(abs(a - b) for a, b in zip(arm.get_angles(), HOME))
     except Exception:
@@ -491,10 +428,7 @@ def go_home(arm):
     dur = max(HOME_MOVE_S, dq / HOME_RETURN_DPS)
     if dur > HOME_MOVE_S + 0.05:
         print(f"  homing over {dur:.1f}s (joint travel {dq:.0f} deg)")
-    if not arm.move_joints(HOME, duration=dur):
-        print(f"  homing REFUSED -- {arm.last_error}")
-        return False
-    return True
+    arm.move_joints(HOME, duration=dur)
 
 
 def _fire_gripper(arm, deg):
@@ -518,48 +452,16 @@ def _grip(arm, deg, label):
     return True
 
 
-def _send_arc(arm, pts, durs, label, gaze_target=None):
-    """Blocking parabolic move. pts[0] is the implicit start (not sent).
-    gaze_target: if given (and GAZE_ENABLED), the gripper tip points at this
-    3D point for the whole arc instead of holding PICK_ORIENTATION_DEG. A wide
-    carry occasionally asks for a look-at pose this arm's elbow/wrist can't
-    reach (or can only reach too fast) -- if the gazed send_path is REFUSED,
-    this falls back to the fixed PICK_ORIENTATION_DEG for THIS arc only,
-    rather than aborting the run."""
+def _send_arc(arm, pts, durs, label):
+    """Blocking parabolic move. pts[0] is the implicit start (not sent)."""
+    rx, ry = PICK_ORIENTATION_DEG[:2]
     if len(pts) < 2:
         print(f"  {label}: negligible, skipped")
         return True
-    tail = pts[1:]
-    xs = [p[0] for p in tail]
-    ys = [p[1] for p in tail]
-    zs = [p[2] for p in tail]
-
-    def _fixed_sequence():
-        rx0, ry0 = PICK_ORIENTATION_DEG[:2]
-        rz_raw = _yaw(tail)
-        rz_seq = rz_raw if isinstance(rz_raw, list) else [rz_raw] * len(tail)
-        return [(rx0, ry0, rz) for rz in rz_seq]
-
-    def _fixed_orientation():
-        # eases FROM the arm's actual current orientation (which, after a
-        # gazed arc, can be far from PICK_ORIENTATION_DEG) -- a no-op when
-        # it's already there, e.g. the whole run has GAZE_ENABLED=False.
-        start_rpy = arm.get_coords()[3:]
-        return ease_to_rpy(_fixed_sequence(), start_rpy, durs, GAZE_EASE_IN_S)
-
-    if GAZE_ENABLED and gaze_target is not None:
-        start_rpy = arm.get_coords()[3:]
-        rx, ry, rz = gaze_then_level_waypoints(
-            tail, gaze_target, _fixed_sequence(), start_rpy, durs,
-            GAZE_EASE_IN_S, GAZE_EASE_OUT_S)
-    else:
-        rx, ry, rz = _fixed_orientation()
-    r = arm.send_path(x=xs, y=ys, z=zs, rx=rx, ry=ry, rz=rz, durations=list(durs))
-    if not r and GAZE_ENABLED and gaze_target is not None:
-        print(f"  {label}: gaze pose unreachable ({arm.last_error}) "
-              f"-- retrying this arc with fixed orientation")
-        rx, ry, rz = _fixed_orientation()
-        r = arm.send_path(x=xs, y=ys, z=zs, rx=rx, ry=ry, rz=rz, durations=list(durs))
+    r = arm.send_path(
+        x=[p[0] for p in pts[1:]], y=[p[1] for p in pts[1:]], z=[p[2] for p in pts[1:]],
+        rx=rx, ry=ry, rz=_yaw(pts[1:]), durations=list(durs),
+    )
     if not r:
         print(f"  {label}: send_path REFUSED -- {arm.last_error}")
         return False
@@ -582,39 +484,13 @@ class _PathThread(threading.Thread):
             self.exc, self.result = exc, 0
 
 
-def _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label, gaze_target=None):
+def _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
     """Run the arc on a background thread and fire the gripper at t_fire so the
-    arm never stops. gaze_target: see _send_arc -- if the gazed path would be
-    REFUSED, this precomputes a fixed-orientation fallback BEFORE starting the
-    thread (there is no mid-flight retry once the background move has begun)."""
-    tail = pts[1:]
-    xs = [p[0] for p in tail]
-    ys = [p[1] for p in tail]
-    zs = [p[2] for p in tail]
-
-    def _fixed_sequence():
-        rx0, ry0 = PICK_ORIENTATION_DEG[:2]
-        rz_raw = _yaw(tail)
-        rz_seq = rz_raw if isinstance(rz_raw, list) else [rz_raw] * len(tail)
-        return [(rx0, ry0, rz) for rz in rz_seq]
-
-    def _fixed_orientation():
-        start_rpy = arm.get_coords()[3:]
-        return ease_to_rpy(_fixed_sequence(), start_rpy, durs, GAZE_EASE_IN_S)
-
-    if GAZE_ENABLED and gaze_target is not None:
-        start_rpy = arm.get_coords()[3:]
-        rx, ry, rz = gaze_then_level_waypoints(
-            tail, gaze_target, _fixed_sequence(), start_rpy, durs,
-            GAZE_EASE_IN_S, GAZE_EASE_OUT_S)
-        probe = arm.plan_path(x=xs, y=ys, z=zs, rx=rx, ry=ry, rz=rz, durations=list(durs))
-        if not probe.ok:
-            print(f"  {label}: gaze pose unreachable ({probe.error}) "
-                  f"-- using fixed orientation for this arc")
-            rx, ry, rz = _fixed_orientation()
-    else:
-        rx, ry, rz = _fixed_orientation()
-    kw = dict(x=xs, y=ys, z=zs, rx=rx, ry=ry, rz=rz, durations=list(durs))
+    arm never stops."""
+    rx, ry = PICK_ORIENTATION_DEG[:2]
+    kw = dict(x=[p[0] for p in pts[1:]], y=[p[1] for p in pts[1:]],
+              z=[p[2] for p in pts[1:]], rx=rx, ry=ry, rz=_yaw(pts[1:]),
+              durations=list(durs))
     th = _PathThread(arm, kw)
     t0 = time.perf_counter()
     th.start()
@@ -656,52 +532,12 @@ def _trigger_time(pts, durs, cycle_n):
     return None
 
 
-def _play_success_animation(arm):
-    """Played once the last cube is placed, replacing the old lead-out-to-
-    HOME ending entirely: move to the straight-up staging pose (base=90deg,
-    arm fully extended), then a pure left-right shoulder wag that settles
-    slightly bent. Direct joint-space motion -- see _celebrate.py for why."""
-    if not CELEBRATE_ENABLED:
-        return True
-    staging_q = [CELEBRATE_BASE_J1_DEG, 0.0, 0.0, CELEBRATE_STAGING_J4_DEG,
-                CELEBRATE_STAGING_J5_DEG, CELEBRATE_J6_DEG]
-    print("\n=== success animation ===")
-    print("  moving to the straight-up staging pose...")
-    if not arm.move_joints(staging_q, duration=CELEBRATE_STAGING_DURATION_S):
-        print(f"  success animation: staging move REFUSED -- {arm.last_error} (skipping)")
-        return True
-
-    q_osc = build_oscillation_waypoints(
-        base_j1_deg=CELEBRATE_BASE_J1_DEG,
-        shoulder_amplitude_deg=CELEBRATE_SHOULDER_AMPLITUDE_DEG,
-        direction_sign=CELEBRATE_DIRECTION_SIGN, cycles=CELEBRATE_CYCLES,
-        final_shoulder_deg=CELEBRATE_FINAL_SHOULDER_DEG,
-        z_apex_mm=CELEBRATE_Z_APEX_MM, z_sag_coeff=CELEBRATE_Z_SAG_COEFF,
-        j5_deg=CELEBRATE_STAGING_J5_DEG, j6_deg=CELEBRATE_J6_DEG,
-        j3_seed_deg=0.0, j4_seed_deg=CELEBRATE_STAGING_J4_DEG,
-        n_oscillate_waypoints=CELEBRATE_OSCILLATE_WAYPOINTS,
-        n_settle_waypoints=CELEBRATE_SETTLE_WAYPOINTS)
-    durs = celebration_durations(
-        CELEBRATE_EASE_IN, CELEBRATE_EASE_OUT, CELEBRATE_DURATION_S,
-        CELEBRATE_OSCILLATE_WAYPOINTS + CELEBRATE_SETTLE_WAYPOINTS + 1)
-
-    q_waypoints = np.vstack([np.asarray(staging_q, dtype=float)[None, :], q_osc])
-    timestamps = np.concatenate([[0.0], np.cumsum(durs)])
-    plan = Plan(ok=True, q_waypoints=q_waypoints, timestamps=timestamps,
-               duration_s=float(timestamps[-1]))
-    ex = arm._execute(plan)
-    if not ex.ok:
-        print(f"  success animation: oscillation REFUSED -- {ex.error}")
-    return True
-
-
 def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs):
     """Scripted flinch: approach part-way, recoil, wait, re-approach the moved cube."""
     n = len(pts)
     cut = max(2, int(round(NUDGE_AT_FRACTION * (n - 1))) + 1)
-    gaze = seg["gaze"]                 # the original cube -- kept through approach + recoil
     print(f"  NUDGE: approaching to {int(NUDGE_AT_FRACTION*100)}% ...")
-    if not _send_arc(arm, pts[:cut], durs[:cut - 1], "  nudge approach", gaze_target=gaze):
+    if not _send_arc(arm, pts[:cut], durs[:cut - 1], "  nudge approach"):
         return False
 
     here = current_pos(arm)
@@ -719,7 +555,7 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs):
                           cruise=NUDGE_RECOIL_SPEED_CM_S, n_waypoints=NUDGE_RECOIL_WAYPOINTS,
                           degree=2)
     arm.jerk = NUDGE_RECOIL_JERK
-    ok = _send_arc(arm, rpts, rdurs, "  recoil", gaze_target=gaze)
+    ok = _send_arc(arm, rpts, rdurs, "  recoil")
     arm.jerk = 0.0
     if not ok:
         return False
@@ -734,7 +570,7 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs):
     p2 = get_path(after, new_cube, h2, rng, n_waypoints=POST_NUDGE_WAYPOINTS, degree=2)
     d2 = get_durations(after, new_cube, h2, cruise=POST_NUDGE_SPEED_CM_S,
                        n_waypoints=POST_NUDGE_WAYPOINTS, degree=2)
-    if not _send_arc(arm, p2, d2, "  nudge re-approach", gaze_target=new_cube):
+    if not _send_arc(arm, p2, d2, "  nudge re-approach"):
         return False
 
     # the following carry cycle must start from where the cube actually is now
@@ -752,29 +588,22 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs):
 # ===========================================================================
 
 def preflight(arm, segments, paths):
-    rx0, ry0 = PICK_ORIENTATION_DEG[:2]
+    rx, ry = PICK_ORIENTATION_DEG[:2]
     print("\n--- preflight: planning every cube point + arc apex (no motion) ---")
-    # (name, (x,y,z), gaze_target_or_None) -- direct cube/target points keep the
-    # fixed-down probe (point == target there, so "look at it" is undefined; the
-    # fixed pose is a sufficient reachability proxy for arrival anyway).
     checks = []
     for i, (s, t) in enumerate(zip(CUBES_INITIAL_POINTS, CUBES_TARGET_POINTS)):
-        checks += [(f"init{i+1}", s, None), (f"tgt{i+1}", t, None)]
+        checks += [(f"init{i+1}", s), (f"tgt{i+1}", t)]
     if NUDGE_ENABLED:
         # the nudged cube also gets grabbed at init + offset
         for i, s in enumerate(CUBES_INITIAL_POINTS):
             checks.append((f"init{i+1}+nudge",
-                           tuple(c + o for c, o in zip(s, NUDGE_OFFSET_CM)), None))
+                           tuple(c + o for c, o in zip(s, NUDGE_OFFSET_CM))))
     for ci, (seg, pts) in enumerate(zip(segments, paths)):
         apex = max(pts, key=lambda p: p[2])         # highest point of the arc
-        checks.append((f"apex c{ci}", apex, seg["gaze"]))
+        checks.append((f"apex c{ci}", apex))
     bad = 0
-    for name, (x, y, z), gaze in checks:
-        if GAZE_ENABLED and gaze is not None:
-            rx, ry, rz = look_at_rpy((x, y, z), gaze)
-        else:
-            rx, ry, rz = rx0, ry0, _yaw_one((x, y))
-        pl = arm.plan_coords(x=x, y=y, z=z, rx=rx, ry=ry, rz=rz,
+    for name, (x, y, z) in checks:
+        pl = arm.plan_coords(x=x, y=y, z=z, rx=rx, ry=ry, rz=_yaw_one((x, y)),
                              speed=config.DEFAULT_SPEED_CM_S)
         err = (pl.error or "").lower()
         if pl.ok:
@@ -799,14 +628,11 @@ def _build_segments(order, home_tip):
     prev_target = home_tip
     for k in order:
         segs.append({"kind": "reach", "origin": prev_target,
-                     "target": CUBES_INITIAL_POINTS[k], "k": int(k),
-                     "gaze": CUBES_INITIAL_POINTS[k]})
+                     "target": CUBES_INITIAL_POINTS[k], "k": int(k)})
         segs.append({"kind": "carry", "origin": CUBES_INITIAL_POINTS[k],
-                     "target": CUBES_TARGET_POINTS[k], "k": int(k),
-                     "gaze": CUBES_TARGET_POINTS[k]})
+                     "target": CUBES_TARGET_POINTS[k], "k": int(k)})
         prev_target = CUBES_TARGET_POINTS[k]
-    segs.append({"kind": "leadout", "origin": prev_target, "target": home_tip, "k": None,
-                 "gaze": None})
+    segs.append({"kind": "leadout", "origin": prev_target, "target": home_tip, "k": None})
     return segs
 
 
@@ -911,8 +737,9 @@ def main():
             pts, durs = paths[ci], all_durs[ci]
 
             if kind == "leadout":
+                print(f"\n=== lead-out arc -> HOME ===")
                 time.sleep(LEADOUT_PAUSE_S)
-                _play_success_animation(arm)
+                _send_arc(arm, pts, durs, "lead-out")
                 break
 
             grip_deg = GRIP_CLOSED_DEG if kind == "reach" else GRIP_OPEN_DEG
@@ -929,12 +756,11 @@ def main():
 
             t_fire = _trigger_time(pts, durs, ci)
             if t_fire is not None:
-                if not _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label,
-                                              gaze_target=seg["gaze"]):
+                if not _send_arc_with_trigger(arm, pts, durs, t_fire, grip_deg, label):
                     print("\naborting run."); go_home(arm); return 1
                 continue
 
-            if not _send_arc(arm, pts, durs, label, gaze_target=seg["gaze"]):
+            if not _send_arc(arm, pts, durs, label):
                 print("\naborting run."); go_home(arm); return 1
 
             cur = current_pos(arm)
@@ -948,7 +774,8 @@ def main():
                       f"{tuple(round(v, 1) for v in seg['target'])} +/- {REACH_TOL_CM} cm "
                       f"-- gripper NOT fired")
 
-        print("\nall cubes placed.")
+        print("\nall cubes placed. homing...")
+        go_home(arm)
         return 0
 
     except KeyboardInterrupt:

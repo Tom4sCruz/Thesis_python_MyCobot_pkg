@@ -68,7 +68,7 @@ HOME_RETURN_DPS = 35.0            # deg/s -- a big return gets proportionally MO
                                  # servos and shake. Lower if the last homing still shakes.
 SETTLE_S = 0.3
 PREFLIGHT = False #True
-RANDOM_SEED = None                # int for a repeatable run, None for fresh each time
+RANDOM_SEED = 1                # int for a repeatable run, None for fresh each time
 
 # -- cubes (MEASURE AND REPLACE) ----------------------------------------------
 # (x, y, z) CM, at the GRIPPER TIP, base frame, z from the table.
@@ -179,7 +179,7 @@ NUDGE_RECOIL_EASE_IN = 0.0     # [0,10] recoil-specific ease-in (see EASE_IN doc
                               # the hop reaches NUDGE_RECOIL_SPEED_CM_S almost immediately
                               # instead of spending much of its short travel ramping up
 NUDGE_RECOIL_EASE_OUT = 0.3    # [0,10] recoil-specific ease-out -- ditto, slowing into the stop
-NUDGE_RECOIL_WAYPOINTS = 10      # fewer than PATH_WAYPOINTS -- get_durations floors a move's
+NUDGE_RECOIL_WAYPOINTS = 5     # fewer than PATH_WAYPOINTS -- get_durations floors a move's
                               # total time at (n_waypoints-1)*MIN_SEGMENT_S regardless of
                               # cruise speed, so the recoil's short hop needs far fewer
                               # segments than a full reach/carry arc to actually reach
@@ -246,11 +246,11 @@ CELEBRATE_FINAL_DIP_MM = 40.0        # "slightly bent" resting dip, instead of
 CELEBRATE_ELBOW_BRANCH_SIGN = 1.0   # flip to -1.0 if the elbow bends the visually
                                      # wrong way
 CELEBRATE_CYCLES = 2                # number of full dip-and-rise oscillations
-CELEBRATE_EASE_IN = 2.0             # [0,10] -- see EASE_IN's doc above
-CELEBRATE_EASE_OUT = 2.0            # [0,10] -- see EASE_OUT's doc above
-CELEBRATE_OSCILLATE_WAYPOINTS = 60  # samples across all CELEBRATE_CYCLES
-CELEBRATE_SETTLE_WAYPOINTS = 30     # samples for the final eased settle
-CELEBRATE_DURATION_S = 4.0          # total time, staging move excluded
+CELEBRATE_EASE_IN = 1.0             # [0,10] -- see EASE_IN's doc above
+CELEBRATE_EASE_OUT = 1.0            # [0,10] -- see EASE_OUT's doc above
+CELEBRATE_OSCILLATE_WAYPOINTS = 20  # samples across all CELEBRATE_CYCLES
+CELEBRATE_SETTLE_WAYPOINTS = 10     # samples for the final eased settle
+CELEBRATE_DURATION_S = 6.0          # total time, staging move excluded
 
 # -- gripper ---------------------------------------------------------------------
 GRIP_OPEN_DEG = 120.0           # 0 = closed .. config.MAX_GRIPPER_DEG = full open

@@ -125,9 +125,9 @@ ORIENT_LOCK_SIGN = 1.0            # flip to -1.0 if "base" yaws the gripper the 
 # rx/ry) on every arc that has a gaze target; the lead-out back to HOME has
 # none and keeps the old fixed orientation. See _gaze.py.
 GAZE_ENABLED = True
-GAZE_EASE_IN_S = 0.4              # seconds; 0 = snap onto a new target instantly,
+GAZE_EASE_IN_S = 2.0              # seconds; 0 = snap onto a new target instantly,
                                  # larger = slower lock-on when the gaze target switches
-GAZE_EASE_OUT_S = 0.3           # seconds before arrival that the gripper starts leveling
+GAZE_EASE_OUT_S = 1.0           # seconds before arrival that the gripper starts leveling
                                  # out to PICK_ORIENTATION_DEG's pitch/roll, so every gazed
                                  # arc still arrives gripper-straight-down; 0 = snap level
                                  # only on the arc's very last waypoint

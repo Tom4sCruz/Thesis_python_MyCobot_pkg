@@ -111,7 +111,7 @@ HOME_RETURN_DPS = 35.0            # deg/s -- a big return gets proportionally MO
                                  # servos and shake. Lower if the last homing still shakes.
 SETTLE_S = 0.3
 PREFLIGHT = True                  # on by default here -- see module docstring
-RANDOM_SEED = None                # int for a repeatable run, None for fresh each time (default:
+RANDOM_SEED = 1                # int for a repeatable run, None for fresh each time (default:
                                   # fresh -- "never traces the same trajectory twice")
 
 # -- cubes (MEASURE AND REPLACE) ----------------------------------------------
@@ -200,7 +200,8 @@ MIN_SEGMENT_S = 0.02
 MOVE_DRAW_MAX_TRIES = 12           # re-roll attempts before _draw_valid_move() falls back
 
 # -- order ------------------------------------------------------------------------
-SHUFFLE_ORDER = True              # grab cubes in a random order (init<->target pairing kept)
+SHUFFLE_ORDER = False             # grab cubes in a random order (init<->target pairing kept)
+PICKUP_ORDER = [0,2,1]
 
 # -- gripper timing chaos (see module docstring) -----------------------------------
 GRIP_CHAOS_SPREAD_S = 1.2         # offset drawn uniform in [-this, +this] each cycle
@@ -873,7 +874,7 @@ def main():
 
     rng = np.random.default_rng(RANDOM_SEED)
     n = len(CUBES_INITIAL_POINTS)
-    order = list(rng.permutation(n)) if SHUFFLE_ORDER else list(range(n))
+    order = list(rng.permutation(n)) if SHUFFLE_ORDER else PICKUP_ORDER
 
     p_home = pose_coords(HOME)                       # mm/deg (Z_RELATIVE_TO_JOINT1 assumed False)
     home_tip = (p_home[0] / 10.0, p_home[1] / 10.0, p_home[2] / 10.0)

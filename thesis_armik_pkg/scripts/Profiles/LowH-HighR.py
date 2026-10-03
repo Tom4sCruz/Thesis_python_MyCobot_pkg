@@ -23,10 +23,12 @@ industrial robot would:
     CUBES_TARGET_POINTS[k] in that order -- they end in a row;
   * NO overshoot -- each joint is driven until it is within
     config.SINGLE_JOINT_TOL_DEG of target, then stopped;
-  * one cube is NUDGED mid-run (scripted): the arm reaches for it, the cube
-    moves, the arm POINTS ITS GRIPPER at the new spot, holds a beat, then
-    IGNORES it -- that cube's carry is skipped and it is left behind
-    ("defective"). Fully scripted; the arm has no sensors.
+  * one cube is NUDGED mid-run (scripted): the arm swings in and descends
+    normally, then STOPS J2 mid-descent (NUDGE_AT_FRACTION of the way down),
+    holds for NUDGE_WAIT_S as if watching the cube move, raises J2 back up,
+    then swings on to the NEXT cube instead -- the nudged cube's reach and
+    carry are both skipped; it is left behind ("defective"). Fully
+    scripted; the arm has no sensors.
 
     python3 scripts/Profiles/LowH-HighR.py --mock --yes      # no hardware
     python3 scripts/Profiles/LowH-HighR.py --port /dev/ttyTHS1
@@ -131,6 +133,11 @@ NUDGE_CYCLE = 2                  # EVEN (reach) cycle index whose cube is nudged
                                  # one HighH-LowR.py nudges
 NUDGE_OFFSET_CM = (3.0, 0.0, 0.0)   # where the nudged cube ends up (narrative/
                                      # RViz-preview only -- see NUDGE_CUBE_PREVIEW_CM)
+NUDGE_AT_FRACTION = 0.65          # fraction of J2's descent toward the cube completed
+                                 # before the arm stops (0..1) -- mirrors
+                                 # HighH-LowR.py's NUDGE_AT_FRACTION
+NUDGE_WAIT_S = 2.5           # how long the arm holds there before raising J2 back
+                                 # up and swinging on to the next cube
 
 # where the nudged cube visually ends up -- always fed to RvizBridge as the
 # yellow preview cube, independent of whether NUDGE_CYCLE is enabled this run
@@ -397,14 +404,38 @@ def _send_staccato_with_trigger(arm, pts, cycle_n, grip_deg, label):
     return True
 
 
-def run_nudge(seg):
-    """The cube silently relocates (narrative/visual only -- see
-    NUDGE_CUBE_PREVIEW_CM for the RViz marker); this profile has no
-    sensing, so the arm's own reach/grip/carry for this cube is completely
-    unaffected and proceeds identically to every other cube."""
-    new_cube = tuple(float(c + o) for c, o in zip(seg["target"], NUDGE_OFFSET_CM))
-    print(f"  (cube silently nudged to {tuple(round(v, 1) for v in new_cube)} -- "
-          f"arm doesn't react, continuing to {tuple(round(v, 1) for v in seg['target'])})")
+def run_nudge_descend(arm, point, label):
+    """Scripted nudge: descend normally through J6..J3 (DESCEND_JOINT_ORDER's
+    wrist/upper-arm steps), then stop J2 -- the joint that actually lowers
+    the gripper -- at NUDGE_AT_FRACTION of the way down, wait NUDGE_WAIT_S
+    (the cube supposedly moves during this pause), then raise J2 back up.
+    The gripper never reaches the cube, so this cube's reach and carry are
+    both skipped; it is left behind."""
+    q = _plan_pose_q(arm, point[0], point[1], point[2], label)
+    if q is None:
+        return False
+    if not _step_joints(arm, DESCEND_JOINT_ORDER[:-1], q, False, label):
+        return False
+    a_cur = float(arm.get_angles()[1])          # J2, 0-indexed
+    a_goal = float(q[1])
+    a_mid = a_cur + NUDGE_AT_FRACTION * (a_goal - a_cur)
+    print(f"  {label}: NUDGE -- stopping J2 {int(NUDGE_AT_FRACTION * 100)}% of the "
+          f"way down ({a_cur:.1f} -> {a_mid:.1f} of {a_goal:.1f} deg)")
+    if abs(a_mid - a_cur) > config.SINGLE_JOINT_TOL_DEG:
+        try:
+            arm._drive_joint(2, a_mid, JOINT_SPEED_DPS, label)
+        except ArmError as exc:
+            print(f"  {label}: {exc}")
+            return False
+    print(f"  cube moved -- waiting {NUDGE_WAIT_S:.1f}s, then giving up")
+    time.sleep(NUDGE_WAIT_S)
+    print(f"  {label}: raising J2 back up")
+    try:
+        arm._drive_joint(2, a_cur, JOINT_SPEED_DPS, label)
+    except ArmError as exc:
+        print(f"  {label}: {exc}")
+        return False
+    return True
 
 
 # ===========================================================================
@@ -493,8 +524,9 @@ def main():
     if 0 <= NUDGE_CYCLE < len(segments):
         nk = segments[NUDGE_CYCLE]["k"]
         print(f"NUDGE on cycle {NUDGE_CYCLE}: cube #{nk + 1} at {CUBES_INITIAL_POINTS[nk]} "
-              f"-- nudged as soon as its own reach comes up; this profile has no "
-              f"sensing, so the arm reaches/grips/carries it exactly as if it never moved")
+              f"-- J2's descent onto it stops at {int(NUDGE_AT_FRACTION * 100)}%, waits "
+              f"{NUDGE_WAIT_S:.1f}s, raises back up, then moves on to the next cube; "
+              f"this one is left behind")
 
     paths = [get_path(s["origin"], s["target"]) for s in segments]
 
@@ -554,16 +586,21 @@ def main():
         if not _grip(arm, GRIP_OPEN_DEG, "open before first pick"):
             return 1
 
+        skip_k = None
         for ci, seg in enumerate(segments):
             kind = seg["kind"]
+
+            if skip_k is not None and seg["k"] == skip_k:
+                print(f"\n=== cycle {ci}/{len(segments) - 1}  {kind}  cube #{seg['k'] + 1}  "
+                      f"-- SKIPPED (left behind after nudge) ===")
+                if kind == "carry":
+                    skip_k = None
+                continue
 
             grip_deg = GRIP_CLOSED_DEG if kind == "reach" else GRIP_OPEN_DEG
             label = "reach & grasp" if kind == "reach" else "carry & place"
             print(f"\n=== cycle {ci}/{len(segments) - 1}  {label}  cube #{seg['k'] + 1}  "
                   f"-> {tuple(round(v, 1) for v in seg['target'])} ===")
-
-            if kind == "reach" and ci == NUDGE_CYCLE:
-                run_nudge(seg)
 
             if _has_trigger(ci):
                 if not _send_staccato_with_trigger(arm, paths[ci], ci, grip_deg, label):
@@ -578,6 +615,17 @@ def main():
             if kind == "carry" or ci == 0:
                 if not _swing_j1(arm, tgt, f"{label}: swing J1"):
                     print("\naborting run."); go_home(arm); return 1
+
+            if kind == "reach" and ci == NUDGE_CYCLE:
+                if not run_nudge_descend(arm, tgt, f"{label}: descend"):
+                    print("\naborting run."); go_home(arm); return 1
+                skip_k = seg["k"]
+                nxt = ci + 2
+                if nxt < len(segments):
+                    if not _swing_j1(arm, segments[nxt]["target"],
+                                     "swing J1 -> next cube (after nudge)"):
+                        print("\naborting run."); go_home(arm); return 1
+                continue
 
             # DESCEND J6..J2 onto the cube / drop point (steps 2 / 5).
             if not _descend(arm, tgt, f"{label}: descend"):

@@ -61,10 +61,10 @@ relative to that "correct" moment:
     back, then drops it. On a reach, the close fires after the following
     lift/departure has already begun.
 
-Two cycles can override that randomness with a fixed, deterministic timing
-instead -- NORMAL_GRIP_CYCLE forces a reliable close right at arrival on
-one designated reach (offset pinned to 0s, bypassing the random draw), and
-EARLY_DROP_CYCLE forces a release at a fixed fraction of one designated
+Designated cycles can override that randomness with a fixed, deterministic
+timing instead -- NORMAL_GRIP_CYCLES forces a reliable close / release right
+at arrival on the listed cycles (offset pinned to 0s, bypassing the random
+draw), and EARLY_DROP_CYCLE forces a release at a fixed fraction of one designated
 carry's OWN duration (the early/within-this-arc mirror of
 DELAYED_OPEN_CYCLE's late/deferred-into-the-next-arc override, see below).
 
@@ -235,8 +235,8 @@ DIAGONAL_BOW_CM = 2.0       # slight sideways bow on the curve-back sub-arc
 # return-to-next-cube leg). Reuses the same deferred-gripper ("pending")
 # machinery every other cycle already uses -- see the module docstring.
 DELAYED_OPEN_CYCLE = 3
-DELAYED_OPEN_FRACTION = 0.5   # 0..1 -- drop midway through the leg to the next
-                              # cube, not 3/4 of the way there
+DELAYED_OPEN_FRACTION = 0.15  # 0..1 -- drop shortly after setting off toward the
+                              # next cube
 
 # 3) ROLLERCOASTER -- must be an ODD (carry) cycle: instead of forward/back
 # oscillation, the arm performs an actual vertical circular loop (a
@@ -283,11 +283,12 @@ SIDEWAYS_ARC_ANGLE = 45.0          # 0 = upright (pure vertical lift, no sway, l
                                     # arc); 90 = parallel to the ground (pure sideways sway,
                                     # no height change)
 
-# 5) DETERMINISTIC NORMAL GRIP -- must be an EVEN (reach) cycle: overrides
-# the usual RANDOM gripper-timing offset with a reliable close right at
-# arrival (offset = 0s) -- no early close before fully descending, and no
-# deferred lift-then-close into the next leg.
-NORMAL_GRIP_CYCLE = 0           # -1 disables
+# 5) DETERMINISTIC NORMAL GRIP -- any cycles (reach or carry): overrides the
+# usual RANDOM gripper-timing offset with a reliable action right at arrival
+# (offset = 0s) -- a reach closes on the cube, a carry releases at its target;
+# no early action mid-arc and none deferred into the next leg.
+# DELAYED_OPEN_CYCLE / EARLY_DROP_CYCLE win if a cycle is listed in both.
+NORMAL_GRIP_CYCLES = (0, 2, 4, 5)   # () disables
 
 # 6) DETERMINISTIC EARLY DROP -- must be an ODD (carry) cycle: the release
 # fires partway through THIS carry's own arc (a fixed fraction of its own
@@ -888,9 +889,6 @@ def main():
     if ROLLERCOASTER_CYCLE >= 0 and ROLLERCOASTER_CYCLE % 2 != 1:
         print(f"ROLLERCOASTER_CYCLE must be an ODD (carry) cycle, got {ROLLERCOASTER_CYCLE}.")
         return 1
-    if NORMAL_GRIP_CYCLE >= 0 and NORMAL_GRIP_CYCLE % 2 != 0:
-        print(f"NORMAL_GRIP_CYCLE must be an EVEN (reach) cycle, got {NORMAL_GRIP_CYCLE}.")
-        return 1
     if EARLY_DROP_CYCLE >= 0 and EARLY_DROP_CYCLE % 2 != 1:
         print(f"EARLY_DROP_CYCLE must be an ODD (carry) cycle, got {EARLY_DROP_CYCLE}.")
         return 1
@@ -920,17 +918,28 @@ def main():
     bridge = None
 
     try:
-        # power on FIRST -- _draw_valid_move() below needs a powered arm to plan
-        # against (arm.plan_path() refuses "arm reports power off" otherwise)
+        # power on FIRST -- homing and _draw_valid_move() below need a powered arm
+        # (arm.plan_path() refuses "arm reports power off" otherwise)
         if not arm.conn.is_power_on():
             print("powering on...")
             arm.conn.power_on()
             time.sleep(1.5)
 
+        print("homing...")
+        if not go_home(arm):
+            print("\nhoming failed -- fix the arm's position (see error above), then try again.")
+            return 1
+        time.sleep(SETTLE_S)
+        print(f"start pose (tip, cm/deg): {[round(v, 2) for v in arm.get_coords()]}")
+
         # ---- precompute every arc + its durations (style/ease/speed all fresh per move) ----
         # _draw_valid_move() validates each candidate arc against a live arm.plan_path()
         # (reachability + MAX_JOINT_SPEED_DPS) before committing to it -- see the note
         # above EASE_MIN/EASE_MAX. Purely planning; no motion happens here.
+        # Done AFTER homing on purpose: plan_path() plans from the arm's CURRENT
+        # pose, so the number of re-rolls (and with it every later draw from the
+        # shared rng) depends on where the arm is. From HOME it is the same every
+        # run, so RANDOM_SEED really reproduces the run.
         paths, all_durs, styles = [], [], []
         for ci, seg in enumerate(segments):
             if ci == DIAGONAL_ARC_CYCLE and seg["kind"] == "reach":
@@ -957,13 +966,6 @@ def main():
             except RuntimeError as exc:
                 print(exc)
                 bridge = None
-
-        print("homing...")
-        if not go_home(arm):
-            print("\nhoming failed -- fix the arm's position (see error above), then try again.")
-            return 1
-        time.sleep(SETTLE_S)
-        print(f"start pose (tip, cm/deg): {[round(v, 2) for v in arm.get_coords()]}")
 
         if PREFLIGHT and not preflight(arm, segments, paths, all_durs):
             print("\npreflight failed -- fix the cube/target coordinates or PICK_ORIENTATION_DEG. "
@@ -1039,8 +1041,8 @@ def main():
                     print("\naborting run."); go_home(arm); return 1
                 print(f"  gripper action DELIBERATELY dropped "
                       f"{EARLY_DROP_FRACTION * 100:.0f}% into this leg")
-            elif ci == NORMAL_GRIP_CYCLE and kind == "reach":
-                # deterministic, reliable close right at arrival (no early/late chaos)
+            elif ci in NORMAL_GRIP_CYCLES:
+                # deterministic, reliable close / release right at arrival (no early/late chaos)
                 split = _tail_split_index(durs, 0.0)
                 if split > 0:
                     if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (approach)"):

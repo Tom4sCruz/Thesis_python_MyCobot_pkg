@@ -28,6 +28,9 @@ other like a classic industrial robot -- but with a grab that actually works:
   * deliberate jerk is a STUTTER, as in LowH-HighR.py: every lift / swing /
     descent (and each homing joint) stops and continues at random points --
     nothing else is perturbed. See the jerk constants; JERK = 0 turns it off.
+  * the END-of-run homing is ONE coordinated multi-joint move (like
+    HighH-LowR.py's), stuttering the same way; the start-of-run / abort homing
+    stays one joint at a time.
 
     python3 scripts/Profiles/LowH-HighR_v2.py --mock --yes      # no hardware
     python3 scripts/Profiles/LowH-HighR_v2.py --port /dev/ttyTHS1
@@ -96,6 +99,8 @@ JOINT_SPEED_DPS = 60.0           # fast, CONSTANT deg/s for the J1 swing + homin
 SEG_PLAN_S = 4.0              # planning-only per-waypoint duration for send_path (nudge path)
 DELAY_BETWEEN_JOINTS_S = 0.0  # -> config.SINGLE_JOINT_DELAY            (armik default 0.15)
 DELAY_BETWEEN_POINTS_S = 0.00  # -> config.SINGLE_JOINT_DELAY_BETWEEN_POINTS (default 2.0!)
+HOME_MOVE_S = 2.5             # minimum duration of the final coordinated homing
+HOME_RETURN_DPS = 35.0        # deg/s -- a long return gets proportionally MORE time
 
 # -- v2 coordinated grab/place -------------------------------------------------
 CARRY_HEIGHT_CM = 8.0         # height the end-effector is lifted/held at during the J1 transit --
@@ -113,8 +118,8 @@ JERK = 5.0
 TWITCH_FREQ = 0.0
 TWITCH_INTENSITY = 5.0
 
-config.JERK_SINGLE_JOINT_SUBSTEPS = 4   # stops per joint while homing (as LowH-HighR.py)
-config.JERK_STREAM_STOPS = 4            # stops per coordinated lift / swing / descent
+config.JERK_SINGLE_JOINT_SUBSTEPS = 4   # stops per joint in the joint-by-joint homing (as LowH-HighR.py)
+config.JERK_STREAM_STOPS = 4            # stops per coordinated lift / swing / descent / final homing
 
 # grab order -- deterministic. Arrange CUBES_INITIAL_POINTS left->right, or set
 # explicit indices here.
@@ -127,7 +132,7 @@ NUDGE_CYCLE = 2                  # EVEN (reach) cycle index whose cube is nudged
                                  # one HighH-LowR.py nudges
 NUDGE_OFFSET_CM = (2.0, 0.0, 0.0)   # where the nudged cube ends up (narrative/
                                      # RViz-preview only -- see NUDGE_CUBE_PREVIEW_CM)
-NUDGE_AT_FRACTION = 0.5          # fraction of the vertical descent onto the cube
+NUDGE_AT_FRACTION = 0.65          # fraction of the vertical descent onto the cube
                                  # completed before the arm stops (0..1) -- mirrors
                                  # HighH-LowR.py's NUDGE_AT_FRACTION
 NUDGE_WAIT_S = 2.5               # how long the arm holds there before giving up on
@@ -226,6 +231,24 @@ def go_home(arm):
             print(f"  homing: J{j} would not move -- {exc}")
             return
         time.sleep(config.SINGLE_JOINT_DELAY)
+
+
+def go_home_coordinated(arm):
+    """End-of-run homing -- ONE coordinated multi-joint move (mirrors
+    HighH-LowR.py's go_home), duration scaled to the joint distance. Streamed,
+    so it stutters like the cube moves when jerk is armed
+    (config.JERK_STREAM_STOPS). Falls back to the joint-by-joint go_home() if
+    move_joints refuses."""
+    try:
+        dq = max(abs(a - b) for a, b in zip(arm.get_angles(), HOME))
+    except Exception:
+        dq = 0.0
+    dur = max(HOME_MOVE_S, dq / HOME_RETURN_DPS)
+    if dur > HOME_MOVE_S + 0.05:
+        print(f"  homing over {dur:.1f}s (joint travel {dq:.0f} deg)")
+    if not arm.move_joints(HOME, duration=dur):
+        print(f"  homing REFUSED -- {arm.last_error}; homing one joint at a time")
+        go_home(arm)
 
 
 def _coord_move(arm, x, y, z, label, speed=None):
@@ -486,7 +509,8 @@ def main():
     # Jerky motion: v2's cube moves are coordinated / streamed, so with
     # config.JERK_STREAM_STOPS set (see the jerk constants) each lift / swing /
     # descent STOPS and continues at random points -- no tremor; homing stutters
-    # the same way per joint. Seed via arm.jerk_seed or config.JERK_SEED.
+    # the same way (per joint, or across the final coordinated move). Seed via
+    # arm.jerk_seed or config.JERK_SEED.
     arm.jerk = JERK
     arm.random_twitch = TWITCH_FREQ
     arm.twitch_intensity = TWITCH_INTENSITY
@@ -581,7 +605,7 @@ def main():
                       f"-- gripper NOT fired")
 
         print("\ndone. homing...")
-        go_home(arm)
+        go_home_coordinated(arm)
         return 0
 
     except KeyboardInterrupt:

@@ -258,6 +258,15 @@ JERK_SUBSTEP_DWELL_S       = 0.10   # VELOCITY: gap between wobble sub-commands 
 #        stall-retry loop). AMPLITUDE / GAIN / SUBSTEP_SPEED_DPS are ignored.
 STUTTER_TYPE = 0
 
+# STOP-and-go for STREAMED moves (send_coords / send_path / move_joints outside
+# single-joint mode). 0 -> off: streamed jerk stays the tremor + uneven pace
+# above. > 0 (with jerk armed and STUTTER_TYPE = 0) -> the tremor is REPLACED by
+# this many halts per streamed move, at RANDOM fractions of the move's joint
+# travel (same seeded jerk rng), each JERK_SUBSTEP_DWELL_S long: the stream just
+# pauses, so the arm sits on its last setpoint, then carries on. Nothing else is
+# perturbed -- path, speed and end pose are the clean plan's.
+JERK_STREAM_STOPS = 0
+
 # ---------------------------------------------------------------------------
 # pymycobot interface
 # ---------------------------------------------------------------------------

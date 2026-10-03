@@ -894,14 +894,33 @@ class Arm:
         # clean so the move still ends exactly at the planned pose. Timing is
         # untouched -- pace unevenness rides on `speed`, not the schedule, so
         # total duration stays honest.
+        #
+        # With config.JERK_STREAM_STOPS > 0 (and STUTTER_TYPE = 0) the jitter is
+        # a STOP-and-go instead: no perturbation at all, the stream just pauses
+        # JERK_SUBSTEP_DWELL_S at random fractions of the move's joint travel
+        # (the streamed twin of _drive_joint's stutter-stop). The holds push the
+        # later deadlines back (`held`), so they are not counted as lateness.
         inj = self._make_jerk()
         soft = config.joint_limits_array()
+
+        stutter = (inj.active and config.STUTTER_TYPE == 0
+                   and config.JERK_STREAM_STOPS > 0)
+        stop_at: set[int] = set()
+        travel = None
+        if stutter and n > 2:
+            steps = np.max(np.abs(np.diff(np.asarray(wps, dtype=float), axis=0)), axis=1)
+            travel = np.cumsum(steps) / max(float(np.sum(steps)), 1e-9)   # travel[k-1] = fraction done at wps[k]
+            for _ in range(int(config.JERK_STREAM_STOPS)):
+                k_stop = int(np.searchsorted(travel, float(inj.rng.random()))) + 1
+                if 1 <= k_stop < n - 1:                    # never the final setpoint
+                    stop_at.add(k_stop)
+        held = 0.0
 
         try:
             t0 = time.perf_counter()
             prev_cmd = np.asarray(wps[0], dtype=float)
             for k in range(1, n):
-                deadline = t0 + timestamps[k]
+                deadline = t0 + held + timestamps[k]
                 now = time.perf_counter()
                 dt_k = max(timestamps[k] - timestamps[k - 1], 1e-6)
                 if now < deadline:
@@ -911,7 +930,7 @@ class Arm:
 
                 q_k = np.asarray(wps[k], dtype=float)
                 spd_factor = 1.0
-                if inj.active and k < n - 1:
+                if inj.active and not stutter and k < n - 1:
                     q_k = np.clip(q_k + inj.offsets(dt_k), soft[:, 0], soft[:, 1])
                     spd_factor = inj.speed_factor()
 
@@ -921,6 +940,11 @@ class Arm:
                 prev_cmd = q_k
                 ex.t_cmd.append(time.perf_counter() - t0)
                 ex.q_cmd.append([float(v) for v in q_k])
+
+                if k in stop_at:
+                    print(f"  stutter-stop ({100 * travel[k - 1]:.0f}% of the move)")
+                    time.sleep(config.JERK_SUBSTEP_DWELL_S)
+                    held += config.JERK_SUBSTEP_DWELL_S
 
             ex.duration_s = time.perf_counter() - t0
             ex.setpoints = len(ex.q_cmd)

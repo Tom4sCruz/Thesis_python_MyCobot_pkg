@@ -25,6 +25,9 @@ other like a classic industrial robot -- but with a grab that actually works:
     moves on to the NEXT cube instead -- the nudged cube's reach and carry
     are both skipped; it is left behind ("defective"). Fully scripted; the
     arm has no sensors.
+  * deliberate jerk is a STUTTER, as in LowH-HighR.py: every lift / swing /
+    descent (and each homing joint) stops and continues at random points --
+    nothing else is perturbed. See the jerk constants; JERK = 0 turns it off.
 
     python3 scripts/Profiles/LowH-HighR_v2.py --mock --yes      # no hardware
     python3 scripts/Profiles/LowH-HighR_v2.py --port /dev/ttyTHS1
@@ -101,6 +104,17 @@ CARRY_HEIGHT_CM = 8.0         # height the end-effector is lifted/held at during
                               # full pose constrained) go unreachable partway through at 12.0 --
                               # confirmed 10.0+ fails, 8.0 is comfortably reachable end to end
 DESCENT_SPEED_CM_S = 8.0      # cm/s for the coordinated lift and grab/place descent
+
+# -- jerk constants -------------------------------------------------------------
+# STOP-and-go only (config.STUTTER_TYPE = 0): JERK just ARMS it, its size does
+# nothing. Tune with the two counts below + config.JERK_SUBSTEP_DWELL_S (length
+# of each stop). JERK = 0 -> clean motion.
+JERK = 5.0
+TWITCH_FREQ = 0.0
+TWITCH_INTENSITY = 5.0
+
+config.JERK_SINGLE_JOINT_SUBSTEPS = 4   # stops per joint while homing (as LowH-HighR.py)
+config.JERK_STREAM_STOPS = 4            # stops per coordinated lift / swing / descent
 
 # grab order -- deterministic. Arrange CUBES_INITIAL_POINTS left->right, or set
 # explicit indices here.
@@ -469,11 +483,13 @@ def main():
     paths = [get_path(s["origin"], s["target"]) for s in segments]
 
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
-    # Jerky motion? Set these on the Arm -- v2's cube moves are coordinated /
-    # streamed, so the jerk tremor rides them per control tick; homing stutters
-    # too. Amplitude / velocity dials + seed: armik/config.py JERK_* /
-    # config.JERK_SEED. Left off by default.
-    # arm.jerk = 5.0; arm.random_twitch = 0.2; arm.twitch_intensity = 5.0
+    # Jerky motion: v2's cube moves are coordinated / streamed, so with
+    # config.JERK_STREAM_STOPS set (see the jerk constants) each lift / swing /
+    # descent STOPS and continues at random points -- no tremor; homing stutters
+    # the same way per joint. Seed via arm.jerk_seed or config.JERK_SEED.
+    arm.jerk = JERK
+    arm.random_twitch = TWITCH_FREQ
+    arm.twitch_intensity = TWITCH_INTENSITY
 
     bridge = None
     if args.rviz:

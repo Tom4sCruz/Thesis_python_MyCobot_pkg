@@ -61,6 +61,13 @@ relative to that "correct" moment:
     back, then drops it. On a reach, the close fires after the following
     lift/departure has already begun.
 
+Two cycles can override that randomness with a fixed, deterministic timing
+instead -- NORMAL_GRIP_CYCLE forces a reliable close right at arrival on
+one designated reach (offset pinned to 0s, bypassing the random draw), and
+EARLY_DROP_CYCLE forces a release at a fixed fraction of one designated
+carry's OWN duration (the early/within-this-arc mirror of
+DELAYED_OPEN_CYCLE's late/deferred-into-the-next-arc override, see below).
+
 One mechanism, no cube-state tracking: the script only ever controls WHEN
 the gripper opens or closes relative to the arm's motion; whatever
 actually happens to a cube at that moment is a real physical consequence,
@@ -228,7 +235,8 @@ DIAGONAL_BOW_CM = 2.0       # slight sideways bow on the curve-back sub-arc
 # return-to-next-cube leg). Reuses the same deferred-gripper ("pending")
 # machinery every other cycle already uses -- see the module docstring.
 DELAYED_OPEN_CYCLE = 3
-DELAYED_OPEN_FRACTION = 0.75   # 0..1
+DELAYED_OPEN_FRACTION = 0.5   # 0..1 -- drop midway through the leg to the next
+                              # cube, not 3/4 of the way there
 
 # 3) ROLLERCOASTER -- must be an ODD (carry) cycle: instead of forward/back
 # oscillation, the arm performs an actual vertical circular loop (a
@@ -274,6 +282,20 @@ SIDEWAYS_ARC_AMPLITUDE_CM = 12.0   # the parabola's peak magnitude before the an
 SIDEWAYS_ARC_ANGLE = 45.0          # 0 = upright (pure vertical lift, no sway, like a normal
                                     # arc); 90 = parallel to the ground (pure sideways sway,
                                     # no height change)
+
+# 5) DETERMINISTIC NORMAL GRIP -- must be an EVEN (reach) cycle: overrides
+# the usual RANDOM gripper-timing offset with a reliable close right at
+# arrival (offset = 0s) -- no early close before fully descending, and no
+# deferred lift-then-close into the next leg.
+NORMAL_GRIP_CYCLE = 0           # -1 disables
+
+# 6) DETERMINISTIC EARLY DROP -- must be an ODD (carry) cycle: the release
+# fires partway through THIS carry's own arc (a fixed fraction of its own
+# duration elapsed), dropping the cube mid-transit to its target -- the
+# early/within-this-arc mirror of DELAYED_OPEN_CYCLE's late/deferred-into-
+# the-next-arc override.
+EARLY_DROP_CYCLE = 1            # -1 disables
+EARLY_DROP_FRACTION = 0.5       # 0..1 -- fraction of THIS carry elapsed before the drop
 
 # -- gripper ---------------------------------------------------------------------
 GRIP_OPEN_DEG = 120.0           # 0 = closed .. config.MAX_GRIPPER_DEG = full open
@@ -866,6 +888,12 @@ def main():
     if ROLLERCOASTER_CYCLE >= 0 and ROLLERCOASTER_CYCLE % 2 != 1:
         print(f"ROLLERCOASTER_CYCLE must be an ODD (carry) cycle, got {ROLLERCOASTER_CYCLE}.")
         return 1
+    if NORMAL_GRIP_CYCLE >= 0 and NORMAL_GRIP_CYCLE % 2 != 0:
+        print(f"NORMAL_GRIP_CYCLE must be an EVEN (reach) cycle, got {NORMAL_GRIP_CYCLE}.")
+        return 1
+    if EARLY_DROP_CYCLE >= 0 and EARLY_DROP_CYCLE % 2 != 1:
+        print(f"EARLY_DROP_CYCLE must be an ODD (carry) cycle, got {EARLY_DROP_CYCLE}.")
+        return 1
 
     if not args.mock and not args.yes:
         print("This will move the robot arm and actuate the gripper. Clear the workspace.")
@@ -997,6 +1025,31 @@ def main():
                 pending = (grip_deg, action, forced_offset)
                 print(f"  gripper action DELIBERATELY delayed to "
                       f"{DELAYED_OPEN_FRACTION * 100:.0f}% into the next leg")
+            elif ci == EARLY_DROP_CYCLE and kind == "carry":
+                # deterministic early release, partway through THIS carry's own arc
+                lead_s = (1.0 - EARLY_DROP_FRACTION) * sum(durs)
+                split = _tail_split_index(durs, lead_s)
+                if split > 0:
+                    if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (approach)"):
+                        print("\naborting run."); go_home(arm); return 1
+                    pts, durs = pts[split:], durs[split:]
+                if not _grip(arm, grip_deg, f"{action} (dropped at {EARLY_DROP_FRACTION * 100:.0f}%)"):
+                    return 1
+                if not _send_arc(arm, pts, durs, f"{label} (final)"):
+                    print("\naborting run."); go_home(arm); return 1
+                print(f"  gripper action DELIBERATELY dropped "
+                      f"{EARLY_DROP_FRACTION * 100:.0f}% into this leg")
+            elif ci == NORMAL_GRIP_CYCLE and kind == "reach":
+                # deterministic, reliable close right at arrival (no early/late chaos)
+                split = _tail_split_index(durs, 0.0)
+                if split > 0:
+                    if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (approach)"):
+                        print("\naborting run."); go_home(arm); return 1
+                    pts, durs = pts[split:], durs[split:]
+                if not _grip(arm, grip_deg, f"{action} (normal grip)"):
+                    return 1
+                if not _send_arc(arm, pts, durs, f"{label} (final)"):
+                    print("\naborting run."); go_home(arm); return 1
             else:
                 # timed with a fresh random offset
                 offset = float(rng.uniform(-GRIP_CHAOS_SPREAD_S, GRIP_CHAOS_SPREAD_S))

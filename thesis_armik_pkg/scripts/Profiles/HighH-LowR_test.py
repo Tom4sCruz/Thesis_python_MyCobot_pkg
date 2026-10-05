@@ -305,9 +305,11 @@ GRIP_CLOSE_DELAY_S = 0.6         # seconds after the return to the look configur
                                  # that the gripper begins to close -- late enough to be clear
                                  # of the cube it just dropped
 GRIP_MOVING_REPEATS = 2          # how many times a gripper command fired during motion is
-                                 # sent: a guard against the firmware dropping a gripper
-                                 # packet with other traffic right behind it. Raise if the
-                                 # gripper misses commands, 1 if the arm hitches when it fires
+                                 # sent. armik writes it without waiting for a reply and keeps
+                                 # config.MIN_COMMAND_GAP_S of quiet around it (a blocking send
+                                 # stalled the stream 0.5-1.6 s on the arm; a write <1 ms after
+                                 # a setpoint was sometimes ignored). The repeat is a second
+                                 # line of defence: raise it if the gripper still misses
 GRIP_MOVING_REPEAT_GAP_S = 0.1   # gap between those sends
 
 N_CYCLES = len(CUBES_INITIAL_POINTS) * 2

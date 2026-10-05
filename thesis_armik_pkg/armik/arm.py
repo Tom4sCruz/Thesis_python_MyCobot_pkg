@@ -91,6 +91,7 @@ class Execution:
     duration_s: float = 0.0
     setpoints: int = 0
     late_deadlines: int = 0
+    blocked_sends: int = 0      # sends that took longer than one control tick
     t_cmd: list[float] = field(default_factory=list)
     q_cmd: list[list[float]] = field(default_factory=list)
 
@@ -935,7 +936,15 @@ class Arm:
                     spd_factor = inj.speed_factor()
 
                 step_dps = float(np.max(np.abs(q_k - prev_cmd)) / dt_k)
+                t_send = time.perf_counter()
                 self.conn.send_angles(q_k, max(step_dps * gain * spd_factor, 1.0))
+                blocked = time.perf_counter() - t_send
+                if blocked > 1.0 / self.control_rate_hz:
+                    # the serial call itself stalled the stream (a reply that
+                    # never came, or another thread holding the port) -- say
+                    # so, a stutter here is the link's doing, not the plan's
+                    ex.blocked_sends += 1
+                    print(f"  !! setpoint {k}/{n - 1}: send blocked {blocked * 1000:.0f} ms")
 
                 prev_cmd = q_k
                 ex.t_cmd.append(time.perf_counter() - t0)

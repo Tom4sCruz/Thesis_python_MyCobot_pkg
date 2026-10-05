@@ -15,12 +15,20 @@ Everything that touches the serial port goes through here, for three reasons:
    This module owns the float-deg/s -> firmware-integer conversion and reports
    the quantisation error rather than hiding it.
 
+4. pymycobot's default call WAITS for the firmware's reply (up to 0.5 s, then
+   re-sends). A lost reply therefore freezes whatever is streaming. Setpoints
+   and gripper commands are written without waiting instead (config.ASYNC_SEND
+   / ASYNC_GRIPPER), with a short guaranteed quiet time after each such write
+   (config.MIN_COMMAND_GAP_S) so the next command -- from any thread -- never
+   lands while the firmware is still busy with it. See the notes in config.py.
+
 Anything this module does not wrap is still reachable through `.raw`, which is
 the live pymycobot object, under the same lock.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 import time
@@ -91,6 +99,24 @@ class ArmConnection:
             self._mc = MyCobot280(port, baudrate)
             time.sleep(0.1)
 
+        # No-wait writes (see point 4 in the module docstring). Detected once:
+        # the mock and older pymycobot releases have no _async, and then every
+        # call below simply stays synchronous.
+        self._last_nowait_write = 0.0
+        self._nowait_angles = False
+        self._grip_genre = None
+        try:
+            self._nowait_angles = (
+                "_async" in inspect.signature(self._mc.send_angles).parameters)
+        except (TypeError, ValueError):
+            pass
+        if self._nowait_angles and hasattr(self._mc, "_mesg"):
+            try:
+                from pymycobot.common import ProtocolCode
+                self._grip_genre = ProtocolCode.SET_GRIPPER_VALUE
+            except Exception as exc:
+                log.debug("no-wait gripper unavailable: %s", exc)
+
         try:
             self.set_fresh_mode(1)
         except Exception as exc:
@@ -108,10 +134,22 @@ class ArmConnection:
         """Hold this when using .raw, so you don't collide with a running move."""
         return self._lock
 
+    # -- write spacing ------------------------------------------------------
+
+    def _settle(self) -> None:
+        """Call with the lock held, before any write: waits out the rest of
+        config.MIN_COMMAND_GAP_S since the last no-wait write, so this command
+        is not sent while the firmware is still handling that one. A no-op
+        when nothing was written without waiting recently."""
+        wait = self._last_nowait_write + config.MIN_COMMAND_GAP_S - time.perf_counter()
+        if wait > 0:
+            time.sleep(wait)
+
     # -- state --------------------------------------------------------------
 
     def is_power_on(self) -> bool:
         with self._lock:
+            self._settle()
             try:
                 return bool(self._mc.is_power_on())
             except Exception as exc:
@@ -176,6 +214,7 @@ class ArmConnection:
         being retried.
         """
         with self._lock:
+            self._settle()
             for attempt in range(retries):
                 try:
                     angles = self._mc.get_angles()
@@ -196,6 +235,7 @@ class ArmConnection:
         our DH table -- never in the control path.
         """
         with self._lock:
+            self._settle()
             for _ in range(4):
                 try:
                     c = self._mc.get_coords()
@@ -226,7 +266,14 @@ class ArmConnection:
         # match what the arm actually received.
         payload = [round(float(a), 2) for a in angles]
         with self._lock:
-            self._mc.send_angles(payload, conv.firmware_speed)
+            self._settle()
+            if self._nowait_angles and config.ASYNC_SEND:
+                try:
+                    self._mc.send_angles(payload, conv.firmware_speed, _async=True)
+                finally:
+                    self._last_nowait_write = time.perf_counter()
+            else:
+                self._mc.send_angles(payload, conv.firmware_speed)
         return conv
 
     def send_angle(self, joint_id: int, angle_deg: float, deg_per_s: float) -> SpeedConversion:
@@ -240,11 +287,13 @@ class ArmConnection:
             )
         conv = dps_to_firmware_speed(deg_per_s)
         with self._lock:
+            self._settle()
             self._mc.send_angle(joint_id, round(float(angle_deg), 2), conv.firmware_speed)
         return conv
 
     def stop(self):
         with self._lock:
+            self._settle()
             try:
                 return self._mc.stop()
             except Exception as exc:
@@ -275,6 +324,10 @@ class ArmConnection:
         shared serial lock. The return value is whatever pymycobot returns
         (often None on real hardware) -- success is the absence of an exception,
         not a truthy result.
+
+        With config.ASYNC_GRIPPER (and a pymycobot that supports it) the
+        command is written WITHOUT waiting for a reply, so it can be fired
+        while a stream is running without stalling it; returns None then.
         """
         value = int(value)
         if not 0 <= value <= 100:
@@ -286,12 +339,21 @@ class ArmConnection:
                 f"{config.FIRMWARE_SPEED_MAX}, got {speed}"
             )
         with self._lock:
+            self._settle()
+            if self._grip_genre is not None and config.ASYNC_GRIPPER:
+                args = (value, speed) if gripper_type is None else (value, speed, gripper_type)
+                try:
+                    self._mc._mesg(self._grip_genre, *args, _async=True)
+                finally:
+                    self._last_nowait_write = time.perf_counter()
+                return None
             if gripper_type is None:
                 return self._mc.set_gripper_value(value, speed)
             return self._mc.set_gripper_value(value, speed, gripper_type)
 
     def is_gripper_moving(self) -> bool:
         with self._lock:
+            self._settle()
             try:
                 return bool(self._mc.is_gripper_moving())
             except Exception as exc:
@@ -303,6 +365,7 @@ class ArmConnection:
         device did not report one. Thin wrapper over pymycobot's
         get_gripper_value under the shared serial lock."""
         with self._lock:
+            self._settle()
             try:
                 if gripper_type is None:
                     v = self._mc.get_gripper_value()

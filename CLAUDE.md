@@ -39,7 +39,7 @@ python3 scripts/Profiles/<name>.py --mock --yes --rviz     # simulate + stream t
 1. `config.py` — DH table, joint limits, and every tuning constant (single-joint timing, jerk dials, IK weights). **Read this first** — almost all package behavior is a constant here, not code.
 2. `kinematics.py` — FK, geometric/task Jacobian, Euler↔matrix, `check_joint_limits`/`check_workspace_bounds`.
 3. `ik.py` — weighted damped-least-squares IK with partial (per-axis) constraints.
-4. `connection.py` — `ArmConnection`: thread-safe wrapper around pymycobot (or the mock), converts float deg/s to the firmware's integer 0–100 speed field.
+4. `connection.py` — `ArmConnection`: thread-safe wrapper around pymycobot (or the mock), converts float deg/s to the firmware's integer 0–100 speed field. Streamed setpoints and gripper commands are written **without waiting for the firmware's reply** (`config.ASYNC_SEND` / `ASYNC_GRIPPER`): pymycobot's default call waits up to 0.5 s for a reply and re-sends, and an occasional lost reply froze the stream mid-move (the long-standing random stutter; measured with `scripts/diag_stream.py`). `config.MIN_COMMAND_GAP_S` keeps a short quiet time after each such write, because the firmware drops a command that arrives right behind another.
 5. `mock.py` — `MockMyCobot`, an offline stand-in with instantaneous/perfect tracking, used whenever `--mock` is passed.
 6. `blending.py` — Hermite multi-waypoint blending, used by `Arm.send_path`.
 7. `jerk.py` — `JerkInjector`, the deliberate-jitter engine (tremor/twitch/stutter) — the *opposite* of the package's internal min-jerk smoothing, used to make motion visibly shaky for comparison. All-zero dials = byte-identical smooth motion.

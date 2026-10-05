@@ -290,6 +290,27 @@ CONTROL_RATE_HZ = 25.0
 # before the next setpoint rather than lagging the whole trajectory.
 STREAM_SPEED_GAIN = 1.6
 
+# --- do not wait for the firmware's reply on time-critical writes -----------
+# pymycobot's default (synchronous) call clears the input buffer, writes, then
+# waits up to 0.5 s for a matching reply and RE-SENDS the command up to 3 times
+# if none comes. Measured on the arm (scripts/diag_stream.py, pymycobot
+# 4.0.4b5): a send normally takes ~8 ms, but about 1 call in 100 loses its reply
+# and blocks the full ~0.5 s -- inside a 25 Hz stream that is a freeze followed
+# by a burst of catch-up setpoints, i.e. the random stutter. A blocking gripper
+# command fired during motion stalled the stream for 0.5-1.6 s the same way.
+# Written without waiting (pymycobot's _async=True) the same calls take ~3 ms
+# and never block. Set either flag False to get the old synchronous call back.
+ASYNC_SEND = True       # Arm._execute's streamed setpoints (ArmConnection.send_angles)
+ASYNC_GRIPPER = True    # ArmConnection.set_gripper_value / Arm.send_gripper
+
+# Minimum quiet time after a no-wait write before ANYTHING else is written.
+# The firmware drops a command that arrives while it is still handling the
+# previous one: in the same measurements a gripper command written <1 ms after
+# a setpoint was sometimes ignored, while the synchronous version (whose reply
+# wait leaves a ~7 ms gap) was not. At 25 Hz this never delays a setpoint by
+# more than this value.
+MIN_COMMAND_GAP_S = 0.012
+
 # ---------------------------------------------------------------------------
 # Gripper
 # ---------------------------------------------------------------------------

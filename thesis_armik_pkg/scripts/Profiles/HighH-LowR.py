@@ -566,32 +566,60 @@ def _arc_from(origin, target, d_max, cruise_dur_max, rng):
 
 
 def _eased_joint_move(arm, q_waypoints, speed_dps, ease_in, ease_out, label):
-    """One eased joint-space stroke from the arm's current pose through
+    """One eased joint-space stroke from the arm's current pose along
     q_waypoints (rows evenly spaced along the stroke; the last row is the
     goal). Takes (largest total joint travel) / speed_dps seconds, shaped by
-    the [0,10] ease dials like every arc (celebration_durations). Direct
-    arm._execute(), which applies no hardware speed check of its own -- so the
-    timeline is stretched (never sped up) to keep every joint within
+    the [0,10] ease dials like every arc (celebration_durations).
+
+    The path is SAMPLED IN TIME, one setpoint per control tick
+    (config.CONTROL_RATE_HZ) -- q_waypoints only define the path's shape, not
+    how many setpoints are sent. Sending them as-is streamed short moves far
+    faster than the serial link can carry (a 0.15 s head swing as 30 setpoints
+    5 ms apart), which made the arm stutter.
+
+    Direct arm._execute(), which applies no hardware speed check of its own --
+    so the timeline is stretched (never sped up) to keep every joint within
     MAX_JOINT_SPEED_DPS. Returns bool."""
     q0 = np.asarray(arm.get_angles(), dtype=float)
-    rows = np.vstack([q0[None, :], np.asarray(q_waypoints, dtype=float)])
-    travel = float(np.max(np.sum(np.abs(np.diff(rows, axis=0)), axis=0)))
+    path = np.vstack([q0[None, :], np.asarray(q_waypoints, dtype=float)])
+    travel = float(np.max(np.sum(np.abs(np.diff(path, axis=0)), axis=0)))
     if travel < 0.5:
         return True
-    for r in rows[1:]:
+    for r in path[1:]:
         problems = check_joint_limits(r)
         if problems:
             print(f"  {label} REFUSED -- violates joint limits: {'; '.join(problems)}")
             return False
-    unit = celebration_durations(ease_in, ease_out, 1.0, len(rows))
-    total_s = max(travel / max(float(speed_dps), 1e-6), min_feasible_duration_s(rows, unit))
-    timestamps = np.concatenate([[0.0], np.cumsum([d * total_s for d in unit])])
-    plan = Plan(ok=True, q_waypoints=rows, timestamps=timestamps,
-                duration_s=float(timestamps[-1]))
+
+    # eased progress s(t): celebration_durations gives the time of evenly spaced
+    # progress steps; invert it to read progress at evenly spaced TIMES
+    s_grid = np.linspace(0.0, 1.0, 201)
+    t_grid = np.concatenate([[0.0], np.cumsum(celebration_durations(ease_in, ease_out, 1.0, 201))])
+    t_grid /= t_grid[-1]
+    idx = np.arange(len(path), dtype=float)
+
+    def _sample(total_s):
+        n = max(1, int(total_s * config.CONTROL_RATE_HZ))      # floor: never faster than the rate
+        t = np.linspace(0.0, total_s, n + 1)
+        u = np.interp(t / total_s, t_grid, s_grid) * (len(path) - 1)
+        rows = np.column_stack([np.interp(u, idx, path[:, j]) for j in range(path.shape[1])])
+        rows[0], rows[-1] = path[0], path[-1]
+        return t, rows
+
+    total_s = travel / max(float(speed_dps), 1e-6)
+    t, rows = _sample(total_s)
+    min_s = min_feasible_duration_s(rows, np.diff(t) / total_s)
+    if min_s > total_s + 1e-6:
+        total_s = min_s
+        t, rows = _sample(total_s)
+
+    plan = Plan(ok=True, q_waypoints=rows, timestamps=t, duration_s=float(t[-1]))
     ex = arm._execute(plan)
     if not ex.ok:
         print(f"  {label} REFUSED -- {ex.error}")
         return False
+    if ex.late_deadlines:
+        print(f"  !! {label}: {ex.late_deadlines} late control-loop deadline(s)")
     return True
 
 

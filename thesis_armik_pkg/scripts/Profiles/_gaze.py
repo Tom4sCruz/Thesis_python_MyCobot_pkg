@@ -48,7 +48,7 @@ import math
 
 import numpy as np
 
-from armik import kinematics
+from armik import config, kinematics
 
 _STRAIGHT_DOWN = np.array([
     [1.0, 0.0, 0.0],
@@ -303,3 +303,131 @@ def ease_to_rpy(target_rpy_sequence, start_rpy, durations, ease_in_s):
         ry_list.append(float(ry))
         rz_list.append(float(rz))
     return rx_list, ry_list, rz_list
+
+
+# ---------------------------------------------------------------------------
+# In-place "head turn" look (joint space)
+# ---------------------------------------------------------------------------
+
+def wrist_look_angles(q_deg, target_xyz_cm, min_tip_z_cm):
+    """Joint angles for LOOKING at target_xyz_cm (cm) from the current pose by
+    turning only the wrist (J4 pitch / J5 roll) -- J1..J3 and J6 stay as in
+    q_deg, like a head turning on a still neck. Returns (q_look, aim_error_deg),
+    or (None, None) if no admissible pose exists.
+
+    Why joint space: a Cartesian look-at with the tip held still is unreachable
+    from the low, far-out poses a grab / drop ends in (the wrist would have to
+    sit outside the arm's reach), so the tip is allowed to swing instead. J6
+    spins about the pointing axis itself and cannot change the aim.
+
+    Plain search, no solver: a coarse 3 deg grid over (J4, J5), then a 0.5 deg
+    refinement around the best cell. A pose is admissible if it is inside the
+    soft joint limits, passes kinematics.check_workspace_bounds and keeps the
+    tip at or above min_tip_z_cm. A small travel penalty picks the nearer of
+    two equally good aims."""
+    q0 = np.asarray(q_deg, dtype=float)
+    target_mm = np.asarray(target_xyz_cm, dtype=float) * 10.0
+    floor_mm = float(min_tip_z_cm) * 10.0
+    lim = config.joint_limits_array()
+    m = float(config.JOINT_LIMIT_MARGIN_DEG)
+
+    def _score(j4, j5):
+        q = q0.copy()
+        q[3], q[4] = j4, j5
+        T = kinematics.forward_kinematics(q)
+        tip = T[:3, 3]
+        if tip[2] < floor_mm or kinematics.check_workspace_bounds(tip) is not None:
+            return None
+        d = target_mm - tip
+        n = float(np.linalg.norm(d))
+        if n < 1e-6:
+            return None
+        err = math.degrees(math.acos(float(np.clip(np.dot(d / n, T[:3, 2]), -1.0, 1.0))))
+        return err + 0.02 * (abs(j4 - q0[3]) + abs(j5 - q0[4])), err, q
+
+    def _search(j4s, j5s, best):
+        for j4 in j4s:
+            for j5 in j5s:
+                r = _score(float(j4), float(j5))
+                if r is not None and (best is None or r[0] < best[0]):
+                    best = r
+        return best
+
+    lo4, hi4 = lim[3, 0] + m, lim[3, 1] - m
+    lo5, hi5 = lim[4, 0] + m, lim[4, 1] - m
+    best = _search(np.arange(lo4, hi4 + 1e-9, 3.0), np.arange(lo5, hi5 + 1e-9, 3.0), None)
+    if best is None:
+        return None, None
+    c4, c5 = best[2][3], best[2][4]
+    best = _search(np.clip(np.arange(c4 - 3.0, c4 + 3.01, 0.5), lo4, hi4),
+                   np.clip(np.arange(c5 - 3.0, c5 + 3.01, 0.5), lo5, hi5), best)
+    return [float(v) for v in best[2]], float(best[1])
+
+
+def wrist_track_angles(q_seq, target_xyz_cm, min_tip_z_cm, window_deg=6.0,
+                       hold_within_cm=4.0, smooth_rows=11):
+    """Keep LOOKING at target_xyz_cm (cm) while the arm moves: q_seq is a
+    sequence of joint poses (row 0 = the current pose, whose J4/J5 seed the
+    search); returns a copy with J4/J5 of every later row re-chosen so the
+    pointing axis follows the target. J1..J3 and J6 are taken from q_seq as
+    given.
+
+    Each row is a small local search (1 deg steps, +/- window_deg around the
+    previous row's wrist), so the wrist can only move a little per sample --
+    the aim catches up smoothly instead of snapping, and never jumps to a
+    different wrist branch. While the tip is within hold_within_cm of the
+    target the look direction is ill-defined (the target is right under the
+    gripper just after a drop), so the wrist simply holds. Candidates that put
+    the tip below min_tip_z_cm, outside the soft joint limits or outside the
+    workspace bounds are skipped; if none is left the wrist holds."""
+    rows = np.array(q_seq, dtype=float)
+    target_mm = np.asarray(target_xyz_cm, dtype=float) * 10.0
+    floor_mm = float(min_tip_z_cm) * 10.0
+    hold_mm = float(hold_within_cm) * 10.0
+    lim = config.joint_limits_array()
+    m = float(config.JOINT_LIMIT_MARGIN_DEG)
+    offs = np.arange(-float(window_deg), float(window_deg) + 1e-9, 1.0)
+
+    j4, j5 = float(rows[0, 3]), float(rows[0, 4])
+    for i in range(1, len(rows)):
+        q = rows[i].copy()
+        best = None
+        for d4 in offs:
+            c4 = j4 + d4
+            if not (lim[3, 0] + m <= c4 <= lim[3, 1] - m):
+                continue
+            for d5 in offs:
+                c5 = j5 + d5
+                if not (lim[4, 0] + m <= c5 <= lim[4, 1] - m):
+                    continue
+                q[3], q[4] = c4, c5
+                T = kinematics.forward_kinematics(q)
+                tip = T[:3, 3]
+                if tip[2] < floor_mm or kinematics.check_workspace_bounds(tip) is not None:
+                    continue
+                d = target_mm - tip
+                n = float(np.linalg.norm(d))
+                move = abs(d4) + abs(d5)
+                if n < hold_mm:
+                    cost = move
+                else:
+                    cost = math.degrees(math.acos(
+                        float(np.clip(np.dot(d / n, T[:3, 2]), -1.0, 1.0)))) + 0.05 * move
+                if best is None or cost < best[0]:
+                    best = (cost, c4, c5)
+        if best is not None:
+            j4, j5 = best[1], best[2]
+        rows[i, 3], rows[i, 4] = j4, j5
+
+    # The search moves in whole degrees and releases the hold all at once, so
+    # the raw wrist track is steppy. A centred moving average (edges padded
+    # with the end values, row 0 left exactly as given) turns it into a smooth
+    # head motion at the cost of a slightly later lock-on.
+    half = int(smooth_rows) // 2
+    if half > 0 and len(rows) > 2:
+        kernel = np.ones(2 * half + 1) / (2 * half + 1)
+        for j in (3, 4):
+            padded = np.concatenate([np.full(half, rows[0, j]), rows[:, j],
+                                     np.full(half, rows[-1, j])])
+            rows[1:, j] = np.convolve(padded, kernel, mode="valid")[1:]
+    return rows

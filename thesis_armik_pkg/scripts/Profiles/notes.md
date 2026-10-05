@@ -1,5 +1,5 @@
-# LowH-HighR_v2
-
-- have the arm come straight down to grab the cubes. When it lets go of a cube, have it rotate in such a way that the gripper will be on top of the next cube when it comes around. I want to still keep the main motion J0 (the base) rotating, but with a slight adjust of the other joints so that when the arm reaches its next target, the gripper is straight above that target.
-
-
+Phase #2: This is the phase where the robot grabs the cubes and places them on their
+respective target positions. For this phase, assuming that one cycle is when the robot
+starts to go towards a cube and places it on its target position, I want the robot to, in
+the beginning of each cube cycle, be at a given configuration and look towards the next
+cube the arm is going to grab; then, it will start moving while looking at the cube. With a given ease out, the arm will start positioning its gripper pointing down and parallel with the

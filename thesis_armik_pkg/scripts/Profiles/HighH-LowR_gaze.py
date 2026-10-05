@@ -222,7 +222,7 @@ NUDGE_CUBE_PREVIEW_CM = tuple(
 # what J4 used to do. Direct joint-space motion; the ordinary Cartesian
 # send_path()/plan_coords() can't do this (the straight pose is a real
 # kinematic singularity).
-CELEBRATE_ENABLED = True
+CELEBRATE_ENABLED = False
 CELEBRATE_BASE_J1_DEG = 90.0        # world azimuth the arm swings to first;
                                      # flip to -90 if it should face the other way
 CELEBRATE_J4_STATIC_DEG = 0.0       # wrist-pitch -- held fixed, does not compensate

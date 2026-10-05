@@ -1,31 +1,62 @@
 #!/usr/bin/env python3
 """
-MOVEMENT PROFILE: High-human / Low-robot  (parabolic rework)
-==========================================================
+MOVEMENT PROFILE: High-human / Low-robot  (look, then reach) -- TEST VARIANT
+============================================================================
 
-Move cubes from one side of the frame to the other, the way a person doing it
-casually would:
+TEST of HighH-LowR.py with the GRIPPER MOVING WHILE THE ARM MOVES:
+  * the arm looks around with its gripper CLOSED (GRIP_REST_DEG);
+  * the gripper OPENS as the arm travels toward a cube (GRIP_OPEN_DELAY_S
+    after the reach starts);
+  * after a drop, the gripper CLOSES again on the way back to the look
+    configuration, GRIP_CLOSE_DELAY_S after the return starts -- late enough
+    not to re-grab the cube just dropped -- so the arm always arrives there
+    closed;
+  * Phase 1 looks at the cubes' average, the targets' average, then straight
+    at the first cube.
+arm.move_joints() / arm.send_path() only return once the motion is over (they
+stream setpoints in a loop), so a gripper call written after them runs too
+late. Here the gripper command is sent from a short background thread while
+the stream runs -- see _GripTimer / _execute_plan.
 
-  * every move is a smooth PARABOLIC arc -- accelerate out of the start,
-    decelerate into the end;
-  * no two arcs are identical -- the apex height / position / a slight sideways
-    bow are jittered per move (VARIATION);
-  * the cubes are grabbed in a RANDOM order;
-  * they are dropped at fixed, deliberately uneven points (CUBES_TARGET_POINTS --
-    you bake the "looks like it over/undershot" appearance straight into those
-    coordinates);
-  * one cube is NUDGED mid-run: as the arm nears it, the arm RECOILS (a quick,
-    startled hop backwards), waits for the cube to "settle", then grabs it at
-    its new position. This is fully scripted -- the arm has no sensors.
+Move cubes from one side of the frame to the other the way a person would:
+LOOK at things first, reach in smooth parabolic arcs, and come back to a
+resting posture between cubes.
 
-    python3 scripts/Profiles/HighH-LowR.py --mock --yes      # no hardware
-    python3 scripts/Profiles/HighH-LowR.py --port /dev/ttyTHS1
+Everything is organised around ONE arm configuration, LOOK_CONFIG_J123_DEG
+(J1 base, J2, J3 only). J4..J6 -- the "head" -- are left free there, so the
+gripper can turn to look at cubes and target positions. A look is a wrist-only
+head turn (J4/J5, see _gaze.wrist_look_angles); the tip swings a little.
+
+PHASE 1 -- look around
+    From HOME the arm goes to the configuration and looks at the cubes (their
+    average position), then at the target positions (their average); the
+    next look is straight at the first cube (Phase 2, step 1).
+
+PHASE 2 -- one cycle per cube
+    1. at the configuration, the head swings to look at the cube it is about
+       to grab;
+    2. it reaches the cube and carries it to its target in parabolic arcs,
+       gazing at where it is going and turning the gripper straight down just
+       before it arrives (GAZE_EASE_IN_S / GAZE_EASE_OUT_S, as in
+       HighH-LowR_gaze.py);
+    3. it returns to the configuration while LOOKING BACK at the target
+       position it just left -- then step 1 again for the next cube.
+    One cube is NUDGED mid-run (scripted, no sensors): as the arm nears it the
+    arm RECOILS, waits for the cube to "settle", then grabs it at its new
+    position.
+
+PHASE 3 -- success nod
+    After the last cube's return, the head turns straight ahead
+    (NOD_WRIST_J456_DEG) and nods up and down with J4 only.
+
+    python3 scripts/Profiles/HighH-LowR_test.py --mock --yes      # no hardware
+    python3 scripts/Profiles/HighH-LowR_test.py --port /dev/ttyTHS1
 
 CYCLES
 ------
-N_CYCLES = 2 * (number of cubes). Even cycle 2k = reach cube k and close;
-odd cycle 2k+1 = carry cube k to its target and open. A final lead-out arc
-returns to HOME.
+N_CYCLES = 2 * (number of cubes). Even cycle 2k = look at + reach cube k and
+close; odd cycle 2k+1 = carry cube k to its target, open, and return to the
+configuration.
 
 GRIPPER TIMING
 --------------
@@ -47,14 +78,16 @@ _sys.path.insert(
 
 import argparse
 import math
+import threading
 import time
 
 import numpy as np
 
 from armik import Arm, Plan, config, pose_coords
-from _gaze import gaze_waypoints, gaze_then_level_waypoints, look_at_rpy, ease_to_rpy
-from _celebrate import (build_straight_arm_oscillation_waypoints, celebration_durations,
-                        min_feasible_duration_s, solve_j6_level)
+from _gaze import (gaze_waypoints, gaze_then_level_waypoints, look_at_rpy, ease_to_rpy,
+                   wrist_look_angles, wrist_track_angles)
+from armik.kinematics import check_joint_limits
+from _celebrate import celebration_durations, min_feasible_duration_s
 
 # ===========================================================================
 # CONSTANTS
@@ -109,8 +142,9 @@ ORIENT_LOCK_SIGN = 1.0            # flip to -1.0 if "base" yaws the gripper the 
 # When enabled, the gripper tip points AT its current goal instead of holding
 # PICK_ORIENTATION_DEG -- the cube while reaching for it, the drop point while
 # carrying it there. Supersedes ORIENT_LOCK/_yaw() (and PICK_ORIENTATION_DEG's
-# rx/ry) on every arc that has a gaze target; the lead-out back to HOME has
-# none and keeps the old fixed orientation. See _gaze.py.
+# rx/ry) on every arc that has a gaze target. False also turns off every look
+# (the head swings / look-back below): the wrist then just stays gripper-down.
+# See _gaze.py.
 GAZE_ENABLED = True
 GAZE_EASE_IN_S = 4.0              # seconds; 0 = snap onto a new target instantly,
                                  # larger = slower lock-on when the gaze target switches
@@ -118,6 +152,28 @@ GAZE_EASE_OUT_S = 2.0           # seconds before arrival that the gripper starts
                                  # out to PICK_ORIENTATION_DEG's pitch/roll, so every gazed
                                  # arc still arrives gripper-straight-down; 0 = snap level
                                  # only on the arc's very last waypoint
+
+# -- the LOOK configuration + head swings --------------------------------------
+# The arm starts every cube cycle (and Phase 1, and the final nod) in this
+# configuration. Only J1 (base), J2 and J3 are given: J4..J6 stay free so the
+# head can swing between the cubes and the target positions.
+LOOK_CONFIG_J123_DEG = [0.0, 0.0, -90.0]
+
+HEAD_SWING_SPEED_DPS = 60.0      # average speed of a head swing (largest joint travel / time)
+HEAD_SWING_EASE_IN = 5.0         # [0,10] acceleration into a swing -- see EASE_IN's doc below
+HEAD_SWING_EASE_OUT = 5.0        # [0,10] deceleration out of a swing
+HEAD_SWING_WAYPOINTS = 30        # samples per swing
+LOOK_PAUSE_S = 0.4               # beat held on each look before the next thing happens
+LOOK_MIN_TIP_Z_CM = Z_CUBE_COORD + 1.0   # a look may not swing the tip below this
+LOOK_MAX_AIM_ERROR_DEG = 5.0     # preflight fails if the head cannot aim this well from
+                                 # the configuration
+
+# Return to the configuration after a drop, looking back at that target the
+# whole way (J1..J3 travel to LOOK_CONFIG_J123_DEG, J4/J5 keep aiming).
+RETURN_SPEED_DPS = 45.0          # average speed of the return (largest joint travel / time)
+RETURN_EASE_IN = 5.0             # [0,10]
+RETURN_EASE_OUT = 5.0            # [0,10]
+RETURN_WAYPOINTS = 50            # samples along the return
 
 # -- arc + velocity profile --------------------------------------------------
 # All arcs are pieces of ONE shared parabola  y = a*x^2 + c  (b = 0, symmetric
@@ -143,7 +199,6 @@ MIN_ARC_HEIGHT_CM = 9.0          # floor, so short moves still clear the table /
                                  # confirmed the same way (plan_coords/ik.solve at every waypoint of
                                  # that arc, plus a full clean run)
 CRUISE_SPEED_CM_S = 22.0          # peak tip speed; the ease dials stretch the move time
-LEADOUT_SPEED_CM_S = 15.0        # the final arc back toward HOME is slower / gentler
 ARC_TIME_EQUALIZATION = 0.5   # 0..1: blends each reach/carry arc's own duration at
                               # CRUISE_SPEED_CM_S (0 = today, duration grows with arc
                               # length) toward the WIDEST arc's own duration at that
@@ -208,64 +263,52 @@ NUDGE_CUBE_PREVIEW_CM = tuple(
     float(c + o) for c, o in zip(CUBES_INITIAL_POINTS[NUDGED_CUBE], NUDGE_OFFSET_CM)
 )
 
-# -- success animation (played after the last cube is placed, replaces the
-# -- old lead-out-to-HOME ending entirely) -----------------------------------
-# A gentle dip-and-rise: base (J1) fixed at 90deg, reference pose dead
-# straight (J2=J3=J4=0) so the gripper points EXACTLY at world +X with no
-# trade-off, and the shoulder/elbow/wrist-pitch chain moves only in the
-# world YZ-plane. J4 (wrist-pitch) is STATIC -- it doesn't compensate
-# anything (an earlier version had it chase shoulder+elbow's motion every
-# waypoint, exact in simulation but unable to track that fast/precisely on
-# real hardware). Shoulder+elbow (J2, J3) solve directly for the TIP's own
-# position on the vertical line; J6 (tool-roll) keeps the gripper level --
-# see _celebrate.py for why that's a different (and, here, exact) job from
-# what J4 used to do. Direct joint-space motion; the ordinary Cartesian
-# send_path()/plan_coords() can't do this (the straight pose is a real
-# kinematic singularity).
-CELEBRATE_ENABLED = True
-CELEBRATE_BASE_J1_DEG = 90.0        # world azimuth the arm swings to first;
-                                     # flip to -90 if it should face the other way
-CELEBRATE_J4_STATIC_DEG = 0.0       # wrist-pitch -- held fixed, does not compensate
-CELEBRATE_STAGING_J5_DEG = -90.0    # this reference pose gives EXACT +X pointing
-                                     # with no trade-off at all (tip lands ~203mm
-                                     # off the vertical line, but that's just the
-                                     # fixed "head and neck" length laid out along
-                                     # +X, not a tunable compromise -- see _celebrate.py)
-CELEBRATE_LEVEL_AXIS_INDEX = 0      # which tool-frame axis (0 or 1) J6 keeps level --
-                                     # whichever matches the real gripper's physical
-                                     # finger-open/width direction; flip to 1 if the
-                                     # gripper levels sideways instead of upright
-CELEBRATE_STAGING_DURATION_S = 3.0  # move_joints() time into the straight pose;
-                                     # 2.0s peaked ~126 deg/s on J1 (comparable to
-                                     # the fastest reach/carry arcs), read as abrupt
-                                     # for a move meant to look deliberate
-CELEBRATE_DIP_MM = 30.0              # how far the gripper dips below the reference
-                                     # height each swing -- PLACEHOLDER; the reference
-                                     # sits at this sub-chain's full-extension
-                                     # singularity, so it can only dip DOWN, and small
-                                     # dips need disproportionately large J2/J3 swings
-                                     # (square-root-type relation near full extension)
-CELEBRATE_FINAL_DIP_MM = 40.0        # "slightly bent" resting dip, instead of
-                                     # snapping back fully straight
-CELEBRATE_ELBOW_BRANCH_SIGN = 1.0   # flip to -1.0 if the elbow bends the visually
-                                     # wrong way
-CELEBRATE_CYCLES = 2                # number of full dip-and-rise oscillations
-CELEBRATE_EASE_IN = 1.0             # [0,10] -- see EASE_IN's doc above
-CELEBRATE_EASE_OUT = 1.0            # [0,10] -- see EASE_OUT's doc above
-CELEBRATE_OSCILLATE_WAYPOINTS = 40  # samples across all CELEBRATE_CYCLES
-CELEBRATE_SETTLE_WAYPOINTS = 20     # samples for the final eased settle
-CELEBRATE_DURATION_S = 5.0          # total time, staging move excluded
+# -- success animation: a head NOD (Phase 3) ---------------------------------
+# Played at the configuration once the last cube is placed: the head first
+# swings to NOD_WRIST_J456_DEG, then nods with J4 only.
+NOD_ENABLED = True
+NOD_WRIST_J456_DEG = [90.0, 0.0, 0.0]   # wrist pose the nod is centred on. With the default
+                                        # configuration J4 = +90 points the gripper straight
+                                        # ahead (+X)
+NOD_SPEED_DPS = 40.0          # AVERAGE J4 speed of each stroke, deg/s (peak is higher
+                              # with strong ease)
+NOD_EASE_IN = 5.0             # [0,10] acceleration into each stroke -- see EASE_IN's doc above
+NOD_EASE_OUT = 5.0            # [0,10] deceleration out of each stroke -- see EASE_OUT's doc above
+NOD_START_DIRECTION = -1      # +1 = the first nod goes UP, -1 = it goes DOWN
+NOD_UP_COUNT = 2              # number of up nods
+NOD_DOWN_COUNT = 2            # number of down nods. Nods alternate from NOD_START_DIRECTION
+                              # until both counts are used up: opposite nods run extreme to
+                              # extreme through the centre; once only one direction is
+                              # left the head returns to the centre between repeats.
+                              # Always ends back at the centre
+NOD_UP_DEG = 15.0             # how far J4 tilts UP from the centre on an up nod
+NOD_DOWN_DEG = 15.0           # how far it tilts DOWN on a down nod
+NOD_UP_J4_SIGN = 1.0          # +1: increasing J4 tilts the gripper up (true for the
+                              # default pose); flip to -1 if it nods the wrong way
+NOD_WAYPOINTS_PER_STROKE = 20  # samples per stroke (one stroke = one key angle to the next)
 
 # -- gripper ---------------------------------------------------------------------
 GRIP_OPEN_DEG = 120.0           # 0 = closed .. config.MAX_GRIPPER_DEG = full open
-GRIP_CLOSED_DEG = 65.0          # tune to the cube width
-GRIP_SPEED = 90  #config.GRIPPER_DEFAULT_SPEED
+GRIP_CLOSED_DEG = 2.0          # tune to the cube width
+GRIP_SPEED = 10  #config.GRIPPER_DEFAULT_SPEED
 GRIP_SETTLE_S = 0.35           # quiet time after a gripper command: it must LAND and the
                               # jaws start moving. Tunable down to GRIP_MIN_GAP_S, not below.
 GRIP_MIN_GAP_S = 0.2          # hard floor -- pymycobot silently drops a gripper command
                               # that is not followed by a short quiet gap (why 0.0 failed).
 REACH_TOL_CM = 3.0             # has_reached_* tolerance, per axis
-LEADOUT_PAUSE_S = 0.5         # deliberate beat between the last release and homing
+
+# -- gripper WHILE the arm moves (what this test variant is about) --------------
+GRIP_REST_DEG = GRIP_CLOSED_DEG  # the "closed" gripper the arm looks around / rests with
+                                 # (lower, down to 0, for a tighter close)
+GRIP_OPEN_DELAY_S = 0.0          # seconds after a reach STARTS that the gripper begins to open
+GRIP_CLOSE_DELAY_S = 0.6         # seconds after the return to the look configuration STARTS
+                                 # that the gripper begins to close -- late enough to be clear
+                                 # of the cube it just dropped
+GRIP_MOVING_REPEATS = 2          # how many times a gripper command fired during motion is
+                                 # sent: a guard against the firmware dropping a gripper
+                                 # packet with other traffic right behind it. Raise if the
+                                 # gripper misses commands, 1 if the arm hitches when it fires
+GRIP_MOVING_REPEAT_GAP_S = 0.1   # gap between those sends
 
 N_CYCLES = len(CUBES_INITIAL_POINTS) * 2
 
@@ -444,20 +487,21 @@ def has_reached_target(end_effector_coords, target_xyz):
 # MOTION
 # ===========================================================================
 
-def go_home(arm):
-    """Homing move, with the duration scaled to the joint distance so a long
+def go_home(arm, target=HOME):
+    """Homing move to `target`, with the duration scaled to the joint
+    distance so a long
     return from the far side is not crammed into HOME_MOVE_S (which makes
     move_joints -- no speed pre-check -- outrun the servos and shake).
     Returns bool -- move_joints() can refuse (e.g. the arm's current pose is
     already outside a joint's soft limit), and that must not pass silently."""
     try:
-        dq = max(abs(a - b) for a, b in zip(arm.get_angles(), HOME))
+        dq = max(abs(a - b) for a, b in zip(arm.get_angles(), target))
     except Exception:
         dq = 0.0
     dur = max(HOME_MOVE_S, dq / HOME_RETURN_DPS)
     if dur > HOME_MOVE_S + 0.05:
         print(f"  homing over {dur:.1f}s (joint travel {dq:.0f} deg)")
-    if not arm.move_joints(HOME, duration=dur):
+    if not arm.move_joints(target, duration=dur):
         print(f"  homing REFUSED -- {arm.last_error}")
         return False
     return True
@@ -484,14 +528,76 @@ def _grip(arm, deg, label):
     return True
 
 
-def _send_arc(arm, pts, durs, label, gaze_target=None):
+def _arc_orientations(arm, tail, durs, gaze_target):
+    """(rx, ry, rz) for the waypoints `tail` of an arc starting at the arm's
+    current orientation: gazing at gaze_target and leveling out before arrival
+    (if GAZE_ENABLED and a target is given), else easing to the fixed
+    PICK_ORIENTATION_DEG / ORIENT_LOCK pose."""
+    rx0, ry0 = PICK_ORIENTATION_DEG[:2]
+    rz_raw = _yaw(tail)
+    rz_seq = rz_raw if isinstance(rz_raw, list) else [rz_raw] * len(tail)
+    fixed = [(rx0, ry0, rz) for rz in rz_seq]
+    start_rpy = arm.get_coords()[3:]
+    if GAZE_ENABLED and gaze_target is not None:
+        return gaze_then_level_waypoints(tail, gaze_target, fixed, start_rpy, durs,
+                                         GAZE_EASE_IN_S, GAZE_EASE_OUT_S)
+    # eases FROM the arm's actual current orientation (which, after a gazed
+    # arc, can be far from PICK_ORIENTATION_DEG) -- a no-op when it's already
+    # there, e.g. the whole run has GAZE_ENABLED=False.
+    return ease_to_rpy(fixed, start_rpy, durs, GAZE_EASE_IN_S)
+
+
+class _GripTimer(threading.Thread):
+    """Sends ONE gripper command while the arm is moving: started right before
+    a blocking stream, it waits delay_s and then calls arm.send_gripper from
+    this background thread (GRIP_MOVING_REPEATS times). ArmConnection puts
+    every serial write behind one lock, so the packet lands between two
+    setpoints. finish() -- called when the stream is over -- sends at once if
+    the delay has not elapsed yet, so the command is never lost."""
+
+    def __init__(self, arm, deg, delay_s, label):
+        super().__init__(daemon=True)
+        self.arm, self.deg, self.delay_s, self.label = arm, float(deg), float(delay_s), label
+        self._now = threading.Event()
+
+    def run(self):
+        self._now.wait(max(self.delay_s, 0.0))
+        print(f"  gripper -> {self.deg:.0f} deg ({self.label}, while moving)")
+        for i in range(max(int(GRIP_MOVING_REPEATS), 1)):
+            if i:
+                time.sleep(GRIP_MOVING_REPEAT_GAP_S)
+            self.arm.send_gripper(self.deg, speed=GRIP_SPEED)
+
+    def finish(self):
+        self._now.set()
+        self.join()
+
+
+def _execute_plan(arm, plan, grip=None):
+    """arm._execute(plan), with an optional gripper command fired DURING it.
+    grip = (deg, delay_s, label) or None. The timer starts with the stream, so
+    delay_s counts from the moment the arm actually starts moving."""
+    timer = _GripTimer(arm, *grip) if grip is not None else None
+    if timer is not None:
+        timer.start()
+    try:
+        return arm._execute(plan)
+    finally:
+        if timer is not None:
+            timer.finish()
+
+
+def _send_arc(arm, pts, durs, label, gaze_target=None, grip=None):
     """Blocking parabolic move. pts[0] is the implicit start (not sent).
     gaze_target: if given (and GAZE_ENABLED), the gripper tip points at this
     3D point for the whole arc instead of holding PICK_ORIENTATION_DEG. A wide
     carry occasionally asks for a look-at pose this arm's elbow/wrist can't
-    reach (or can only reach too fast) -- if the gazed send_path is REFUSED,
-    this falls back to the fixed PICK_ORIENTATION_DEG for THIS arc only,
-    rather than aborting the run."""
+    reach (or can only reach too fast) -- if the gazed plan is REFUSED, this
+    falls back to the fixed PICK_ORIENTATION_DEG for THIS arc only, rather
+    than aborting the run.
+    grip: optional (deg, delay_s, label) gripper command fired while the arc
+    runs. That is why this plans first (arm.plan_path) and then executes,
+    instead of arm.send_path(): the delay must not include the planning time."""
     if len(pts) < 2:
         print(f"  {label}: negligible, skipped")
         return True
@@ -500,103 +606,216 @@ def _send_arc(arm, pts, durs, label, gaze_target=None):
     ys = [p[1] for p in tail]
     zs = [p[2] for p in tail]
 
-    def _fixed_sequence():
-        rx0, ry0 = PICK_ORIENTATION_DEG[:2]
-        rz_raw = _yaw(tail)
-        rz_seq = rz_raw if isinstance(rz_raw, list) else [rz_raw] * len(tail)
-        return [(rx0, ry0, rz) for rz in rz_seq]
+    def _plan(gaze):
+        rx, ry, rz = _arc_orientations(arm, tail, durs, gaze)
+        return arm.plan_path(x=xs, y=ys, z=zs, rx=rx, ry=ry, rz=rz, durations=list(durs))
 
-    def _fixed_orientation():
-        # eases FROM the arm's actual current orientation (which, after a
-        # gazed arc, can be far from PICK_ORIENTATION_DEG) -- a no-op when
-        # it's already there, e.g. the whole run has GAZE_ENABLED=False.
-        start_rpy = arm.get_coords()[3:]
-        return ease_to_rpy(_fixed_sequence(), start_rpy, durs, GAZE_EASE_IN_S)
-
-    if GAZE_ENABLED and gaze_target is not None:
-        start_rpy = arm.get_coords()[3:]
-        rx, ry, rz = gaze_then_level_waypoints(
-            tail, gaze_target, _fixed_sequence(), start_rpy, durs,
-            GAZE_EASE_IN_S, GAZE_EASE_OUT_S)
-    else:
-        rx, ry, rz = _fixed_orientation()
-    r = arm.send_path(x=xs, y=ys, z=zs, rx=rx, ry=ry, rz=rz, durations=list(durs))
-    if not r and GAZE_ENABLED and gaze_target is not None:
-        print(f"  {label}: gaze pose unreachable ({arm.last_error}) "
+    arm.last_error = None
+    arm.last_execution = None
+    pl = _plan(gaze_target)
+    if not pl.ok and GAZE_ENABLED and gaze_target is not None:
+        print(f"  {label}: gaze pose unreachable ({pl.error}) "
               f"-- retrying this arc with fixed orientation")
-        rx, ry, rz = _fixed_orientation()
-        r = arm.send_path(x=xs, y=ys, z=zs, rx=rx, ry=ry, rz=rz, durations=list(durs))
-    if not r:
-        print(f"  {label}: send_path REFUSED -- {arm.last_error}")
+        pl = _plan(None)
+    arm.last_plan = pl
+    if not pl.ok:
+        arm.last_error = pl.error
+        print(f"  {label}: plan REFUSED -- {pl.error}")
         return False
-    pl = arm.last_plan
+    ex = _execute_plan(arm, pl, grip)
+    arm.last_execution = ex
+    if not ex.ok:
+        arm.last_error = ex.error
+        print(f"  {label}: execution ABORTED -- {ex.error}")
+        return False
     print(f"  {label}: {pl.path_length_cm:.1f} cm, {pl.duration_s:.2f} s, "
           f"peak {pl.peak_joint_dps:.0f} deg/s")
-    if arm.last_execution and arm.last_execution.late_deadlines:
-        print(f"  !! {arm.last_execution.late_deadlines} late control-loop "
+    if ex.late_deadlines:
+        print(f"  !! {ex.late_deadlines} late control-loop "
               f"deadline(s) during this arc")
     return True
 
 
-def _play_success_animation(arm):
-    """Played once the last cube is placed, replacing the old lead-out-to-
-    HOME ending entirely: move to the straight staging pose (base=90deg,
-    arm fully extended, gripper pointing exactly at +X), then a gentle
-    dip-and-rise that settles slightly bent. Direct joint-space motion --
-    see _celebrate.py for why."""
-    if not CELEBRATE_ENABLED:
+def _arc_from(origin, target, d_max, cruise_dur_max, rng):
+    """(pts, durs) of a reach / carry arc from `origin` -- same shared-parabola
+    height, ease jitter and ARC_TIME_EQUALIZATION as main()'s precompute."""
+    ei = EASE_IN + float(rng.uniform(-1.0, 1.0)) * EASE_JITTER * VARIATION
+    eo = EASE_OUT + float(rng.uniform(-1.0, 1.0)) * EASE_JITTER * VARIATION
+    h = _arc_height(_chord_len(origin, target), d_max)
+    pts = get_path(origin, target, h, rng)
+    cruise_dur = sum(get_durations(origin, target, h, ei, eo))
+    t_i = cruise_dur * (1.0 - ARC_TIME_EQUALIZATION) + cruise_dur_max * ARC_TIME_EQUALIZATION
+    return pts, get_durations(origin, target, h, ei, eo, duration=t_i)
+
+
+def _eased_joint_move(arm, q_waypoints, speed_dps, ease_in, ease_out, label, grip=None):
+    """One eased joint-space stroke from the arm's current pose through
+    q_waypoints (rows evenly spaced along the stroke; the last row is the
+    goal). Takes (largest total joint travel) / speed_dps seconds, shaped by
+    the [0,10] ease dials like every arc (celebration_durations). Direct
+    arm._execute(), which applies no hardware speed check of its own -- so the
+    timeline is stretched (never sped up) to keep every joint within
+    MAX_JOINT_SPEED_DPS. grip: optional (deg, delay_s, label) gripper command
+    fired while the stroke runs (sent at once if there is nothing to move).
+    Returns bool."""
+    q0 = np.asarray(arm.get_angles(), dtype=float)
+    rows = np.vstack([q0[None, :], np.asarray(q_waypoints, dtype=float)])
+    travel = float(np.max(np.sum(np.abs(np.diff(rows, axis=0)), axis=0)))
+    if travel < 0.5:
+        if grip is not None:
+            timer = _GripTimer(arm, *grip)
+            timer.start()
+            timer.finish()
         return True
-    staging_j6 = solve_j6_level(CELEBRATE_BASE_J1_DEG, 0.0, 0.0, CELEBRATE_J4_STATIC_DEG,
-                                CELEBRATE_STAGING_J5_DEG, CELEBRATE_LEVEL_AXIS_INDEX)
-    staging_q = [CELEBRATE_BASE_J1_DEG, 0.0, 0.0, CELEBRATE_J4_STATIC_DEG,
-                CELEBRATE_STAGING_J5_DEG, staging_j6]
-    print("\n=== success animation ===")
-    print("  moving to the straight staging pose...")
-    if not arm.move_joints(staging_q, duration=CELEBRATE_STAGING_DURATION_S):
-        print(f"  success animation: staging move REFUSED -- {arm.last_error} (skipping)")
-        return True
-
-    q_osc = build_straight_arm_oscillation_waypoints(
-        base_j1_deg=CELEBRATE_BASE_J1_DEG, dip_mm=CELEBRATE_DIP_MM,
-        final_dip_mm=CELEBRATE_FINAL_DIP_MM, cycles=CELEBRATE_CYCLES,
-        elbow_branch_sign=CELEBRATE_ELBOW_BRANCH_SIGN,
-        j4_static_deg=CELEBRATE_J4_STATIC_DEG, j5_deg=CELEBRATE_STAGING_J5_DEG,
-        level_axis_index=CELEBRATE_LEVEL_AXIS_INDEX,
-        n_oscillate_waypoints=CELEBRATE_OSCILLATE_WAYPOINTS,
-        n_settle_waypoints=CELEBRATE_SETTLE_WAYPOINTS)
-    n_waypoints = CELEBRATE_OSCILLATE_WAYPOINTS + CELEBRATE_SETTLE_WAYPOINTS + 1
-
-    q_waypoints = np.vstack([np.asarray(staging_q, dtype=float)[None, :], q_osc])
-
-    # CELEBRATE_DURATION_S is a minimum, not an exact value -- _execute()
-    # (unlike plan_path/send_path) applies no hardware speed check of its
-    # own, so a bigger CELEBRATE_DIP_MM/CYCLES can silently demand more
-    # deg/s than the real servo can deliver; stretch the timeline (never
-    # speed it up) so every joint stays within armik.config.MAX_JOINT_SPEED_DPS.
-    unit_durs = celebration_durations(CELEBRATE_EASE_IN, CELEBRATE_EASE_OUT, 1.0, n_waypoints)
-    min_duration_s = min_feasible_duration_s(q_waypoints, unit_durs)
-    duration_s = max(CELEBRATE_DURATION_S, min_duration_s)
-    if duration_s > CELEBRATE_DURATION_S + 1e-6:
-        print(f"  success animation: CELEBRATE_DURATION_S={CELEBRATE_DURATION_S:.1f}s too "
-              f"fast for this dip/cycle count -- auto-stretched to {duration_s:.1f}s")
-    durs = [d * duration_s for d in unit_durs]
-
-    timestamps = np.concatenate([[0.0], np.cumsum(durs)])
-    plan = Plan(ok=True, q_waypoints=q_waypoints, timestamps=timestamps,
-               duration_s=float(timestamps[-1]))
-    ex = arm._execute(plan)
+    for r in rows[1:]:
+        problems = check_joint_limits(r)
+        if problems:
+            print(f"  {label} REFUSED -- violates joint limits: {'; '.join(problems)}")
+            return False
+    unit = celebration_durations(ease_in, ease_out, 1.0, len(rows))
+    total_s = max(travel / max(float(speed_dps), 1e-6), min_feasible_duration_s(rows, unit))
+    timestamps = np.concatenate([[0.0], np.cumsum([d * total_s for d in unit])])
+    plan = Plan(ok=True, q_waypoints=rows, timestamps=timestamps,
+                duration_s=float(timestamps[-1]))
+    ex = _execute_plan(arm, plan, grip)
     if not ex.ok:
-        print(f"  success animation: oscillation REFUSED -- {ex.error}")
+        print(f"  {label} REFUSED -- {ex.error}")
+        return False
     return True
 
 
-def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, cruise_dur_max):
+def _line_to(q_from, q_to, n):
+    """n rows evenly spaced from q_from (excluded) to q_to (included)."""
+    a, b = np.asarray(q_from, dtype=float), np.asarray(q_to, dtype=float)
+    return a[None, :] + (b - a)[None, :] * np.linspace(0.0, 1.0, int(n) + 1)[1:, None]
+
+
+def _look_q(q_now, target):
+    """(q, aim_error_deg): the look configuration with the head (J4/J5)
+    pointed at `target`; J6 as it is now. With GAZE_ENABLED off, or if no
+    admissible head pose exists, the wrist is HOME's (gripper down) and the
+    error is None."""
+    q = [float(v) for v in q_now]
+    q[:3] = [float(v) for v in LOOK_CONFIG_J123_DEG]
+    if GAZE_ENABLED:
+        q_look, err = wrist_look_angles(q, target, LOOK_MIN_TIP_Z_CM)
+        if q_look is not None:
+            return q_look, err
+    q[3:] = [float(v) for v in HOME[3:]]
+    return q, None
+
+
+def _swing_head(arm, target, label):
+    """At (or on the way to) the look configuration, swing the head to look
+    at `target`, then hold LOOK_PAUSE_S. Returns bool."""
+    q_now = arm.get_angles()
+    q_look, err = _look_q(q_now, target)
+    if not _eased_joint_move(arm, _line_to(q_now, q_look, HEAD_SWING_WAYPOINTS),
+                             HEAD_SWING_SPEED_DPS, HEAD_SWING_EASE_IN, HEAD_SWING_EASE_OUT,
+                             label):
+        return False
+    aim = f"aim error {err:.1f} deg" if err is not None else "no look (gripper down)"
+    print(f"  {label}: {tuple(round(float(v), 1) for v in target)}  ({aim})")
+    time.sleep(LOOK_PAUSE_S)
+    return True
+
+
+def _phase_look_around(arm):
+    """Phase 1: go to the look configuration and look at the cubes (their
+    average position), then the target positions (their average). The look
+    that follows is the first cycle's own, straight at the first cube."""
+    cubes = tuple(float(v) for v in np.mean(np.asarray(CUBES_INITIAL_POINTS, float), axis=0))
+    targets = tuple(float(v) for v in np.mean(np.asarray(CUBES_TARGET_POINTS, float), axis=0))
+    for target, label in ((cubes, "look at the cubes"),
+                          (targets, "look at the targets")):
+        if not _swing_head(arm, target, label):
+            return False
+    return True
+
+
+def _return_looking_back(arm, target):
+    """After a drop: J1..J3 travel back to LOOK_CONFIG_J123_DEG (J6 back to
+    HOME's) while the head keeps looking at `target`, the place just left --
+    see _gaze.wrist_track_angles. Returns bool."""
+    q0 = np.asarray(arm.get_angles(), dtype=float)
+    q_end = q0.copy()
+    q_end[:3] = LOOK_CONFIG_J123_DEG
+    q_end[5] = HOME[5]
+    if GAZE_ENABLED:
+        rows = _line_to(q0, q_end, RETURN_WAYPOINTS)       # J4/J5 held, then re-aimed per row
+        floor_cm = current_pos(arm)[2] - 0.2               # never dip below the drop height
+        rows = wrist_track_angles(np.vstack([q0[None, :], rows]), target, floor_cm)[1:]
+    else:
+        q_end[3:5] = HOME[3:5]
+        rows = _line_to(q0, q_end, RETURN_WAYPOINTS)
+    # close the gripper on the way, once clear of the cube just dropped
+    if not _eased_joint_move(arm, rows, RETURN_SPEED_DPS, RETURN_EASE_IN, RETURN_EASE_OUT,
+                             "return", grip=(GRIP_REST_DEG, GRIP_CLOSE_DELAY_S, "close")):
+        return False
+    print("  returned to the look configuration"
+          + (", looking back at the target" if GAZE_ENABLED else ""))
+    return True
+
+
+def _nod_key_angles():
+    """J4 key angles (deg) of the nod, starting and ending at the nod centre
+    (NOD_WRIST_J456_DEG's J4) -- see the NOD_* constants for the sequencing
+    rules."""
+    centre = float(NOD_WRIST_J456_DEG[0])
+    extreme = {"up": centre + NOD_UP_J4_SIGN * NOD_UP_DEG,
+               "down": centre - NOD_UP_J4_SIGN * NOD_DOWN_DEG}
+    other = {"up": "down", "down": "up"}
+    left = {"up": int(NOD_UP_COUNT), "down": int(NOD_DOWN_COUNT)}
+    nxt = "up" if NOD_START_DIRECTION > 0 else "down"
+    keys, prev = [centre], None
+    while left["up"] + left["down"] > 0:
+        if left[nxt] == 0:
+            nxt = other[nxt]
+        if nxt == prev:                       # same direction again -> back to centre first
+            keys.append(centre)
+        keys.append(extreme[nxt])
+        left[nxt] -= 1
+        prev, nxt = nxt, other[nxt]
+    keys.append(centre)
+    return keys
+
+
+def _play_nod(arm):
+    """Phase 3: at the look configuration, swing the head to
+    NOD_WRIST_J456_DEG, then nod -- J4 only, each stroke eased by
+    NOD_EASE_IN / NOD_EASE_OUT at NOD_SPEED_DPS."""
+    base = np.asarray(list(LOOK_CONFIG_J123_DEG) + list(NOD_WRIST_J456_DEG), dtype=float)
+    if not _eased_joint_move(arm, _line_to(arm.get_angles(), base, HEAD_SWING_WAYPOINTS),
+                             HEAD_SWING_SPEED_DPS, HEAD_SWING_EASE_IN, HEAD_SWING_EASE_OUT,
+                             "nod pose"):
+        print("  nod skipped -- could not reach the nod pose")
+        return True
+    time.sleep(LOOK_PAUSE_S)
+    if not NOD_ENABLED:
+        return True
+
+    keys = _nod_key_angles()
+    print(f"  nodding: J4 {' -> '.join(f'{k:.0f}' for k in keys)} deg")
+    for a, b in zip(keys[:-1], keys[1:]):
+        if abs(b - a) < 1e-6:
+            continue
+        q_a, q_b = base.copy(), base.copy()
+        q_a[3], q_b[3] = a, b
+        if not _eased_joint_move(arm, _line_to(q_a, q_b, NOD_WAYPOINTS_PER_STROKE),
+                                 NOD_SPEED_DPS, NOD_EASE_IN, NOD_EASE_OUT, "nod"):
+            break
+    return True
+
+
+def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, cruise_dur_max,
+              grip=None):
     """Scripted flinch: approach part-way, recoil, wait, re-approach the moved cube."""
     n = len(pts)
     cut = max(2, int(round(NUDGE_AT_FRACTION * (n - 1))) + 1)
     gaze = seg["gaze"]                 # the original cube -- kept through approach + recoil
     print(f"  NUDGE: approaching to {int(NUDGE_AT_FRACTION*100)}% ...")
-    if not _send_arc(arm, pts[:cut], durs[:cut - 1], "  nudge approach", gaze_target=gaze):
+    if not _send_arc(arm, pts[:cut], durs[:cut - 1], "  nudge approach", gaze_target=gaze,
+                     grip=grip):
         return False
 
     here = current_pos(arm)
@@ -686,6 +905,26 @@ def preflight(arm, segments, paths):
             print(f"  BAD {name:14s} ({x:5.1f},{y:6.1f},{z:4.1f})  {pl.error}")
             bad += 1
     print(f"--- preflight: {len(checks) - bad}/{len(checks)} reachable ---")
+
+    # every look must be possible from LOOK_CONFIG_J123_DEG with the wrist alone
+    if GAZE_ENABLED:
+        looks = [("cubes avg", tuple(np.mean(np.asarray(CUBES_INITIAL_POINTS, float), axis=0))),
+                 ("targets avg", tuple(np.mean(np.asarray(CUBES_TARGET_POINTS, float), axis=0)))]
+        looks += [(f"init{i+1}", s) for i, s in enumerate(CUBES_INITIAL_POINTS)]
+        looks += [(f"tgt{i+1}", t) for i, t in enumerate(CUBES_TARGET_POINTS)]
+        q_cfg = list(LOOK_CONFIG_J123_DEG) + list(HOME[3:])
+        bad_looks = 0
+        for name, tgt in looks:
+            q_look, err = wrist_look_angles(q_cfg, tgt, LOOK_MIN_TIP_Z_CM)
+            if q_look is None or err > LOOK_MAX_AIM_ERROR_DEG:
+                print(f"  BAD look {name:12s} " + ("no admissible head pose" if q_look is None
+                                                  else f"aim error {err:.1f} deg"))
+                bad_looks += 1
+            else:
+                print(f"  OK  look {name:12s} aim error {err:.1f} deg")
+        print(f"--- preflight: {len(looks) - bad_looks}/{len(looks)} looks possible from "
+              f"LOOK_CONFIG_J123_DEG ---")
+        bad += bad_looks
     return bad == 0
 
 
@@ -693,19 +932,17 @@ def preflight(arm, segments, paths):
 # MAIN
 # ===========================================================================
 
-def _build_segments(order, home_tip):
+def _build_segments(order, look_tip):
+    """Reach / carry pairs. Every reach starts from the look configuration
+    (nominally look_tip -- the real start depends on where the head points)."""
     segs = []
-    prev_target = home_tip
     for k in order:
-        segs.append({"kind": "reach", "origin": prev_target,
+        segs.append({"kind": "reach", "origin": look_tip,
                      "target": CUBES_INITIAL_POINTS[k], "k": int(k),
                      "gaze": CUBES_INITIAL_POINTS[k]})
         segs.append({"kind": "carry", "origin": CUBES_INITIAL_POINTS[k],
                      "target": CUBES_TARGET_POINTS[k], "k": int(k),
                      "gaze": CUBES_TARGET_POINTS[k]})
-        prev_target = CUBES_TARGET_POINTS[k]
-    segs.append({"kind": "leadout", "origin": prev_target, "target": home_tip, "k": None,
-                 "gaze": None})
     return segs
 
 
@@ -749,7 +986,9 @@ def main():
               f"at {CUBES_INITIAL_POINTS[NUDGED_CUBE]} -- nudge THAT cube as soon as "
               f"its own reach comes up")
 
-    segments = _build_segments(order, home_tip)
+    p_look = pose_coords(list(LOOK_CONFIG_J123_DEG) + list(HOME[3:]))
+    look_tip = (p_look[0] / 10.0, p_look[1] / 10.0, p_look[2] / 10.0)
+    segments = _build_segments(order, look_tip)
 
     # the widest move sets the shared parabola; every shorter arc lifts less
     d_max = max((_chord_len(s["origin"], s["target"]) for s in segments), default=1.0) or 1.0
@@ -760,8 +999,6 @@ def main():
     # duration toward the WIDEST arc's own duration at that speed
     cruise_dur_max = 0.0
     for seg in segments:
-        if seg["kind"] == "leadout":
-            continue
         h = _arc_height(_chord_len(seg["origin"], seg["target"]), d_max)
         cruise_dur_max = max(cruise_dur_max,
                              sum(get_durations(seg["origin"], seg["target"], h, EASE_IN, EASE_OUT)))
@@ -775,10 +1012,6 @@ def main():
         eo = EASE_OUT + float(rng.uniform(-1.0, 1.0)) * EASE_JITTER * VARIATION
         h = _arc_height(_chord_len(seg["origin"], seg["target"]), d_max)
         paths.append(get_path(seg["origin"], seg["target"], h, rng))
-        if seg["kind"] == "leadout":
-            all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo,
-                                          cruise=LEADOUT_SPEED_CM_S))
-            continue
         cruise_dur = sum(get_durations(seg["origin"], seg["target"], h, ei, eo))
         t_i = cruise_dur * (1.0 - ARC_TIME_EQUALIZATION) + cruise_dur_max * ARC_TIME_EQUALIZATION
         all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo, duration=t_i))
@@ -820,32 +1053,38 @@ def main():
             go_home(arm)
             return 1
 
-        if not _grip(arm, GRIP_OPEN_DEG, "open before first pick"):
+        if not _grip(arm, GRIP_REST_DEG, "closed for looking around"):
             return 1
+
+        print("\n=== phase 1: looking around ===")
+        if not _phase_look_around(arm):
+            print("\naborting run."); go_home(arm); return 1
 
         for ci, seg in enumerate(segments):
             kind = seg["kind"]
-            pts, durs = paths[ci], all_durs[ci]
-
-            if kind == "leadout":
-                time.sleep(LEADOUT_PAUSE_S)
-                _play_success_animation(arm)
-                break
 
             grip_deg = GRIP_CLOSED_DEG if kind == "reach" else GRIP_OPEN_DEG
             label = "reach & grasp" if kind == "reach" else "carry & place"
             print(f"\n=== cycle {ci}/{N_CYCLES - 1}  {label}  "
                   f"cube #{seg['k'] + 1}  -> {tuple(round(v, 1) for v in seg['target'])} ===")
 
+            # a reach starts by looking at the cube from the look configuration;
+            # either way the arc starts from wherever the tip actually is
+            if kind == "reach" and not _swing_head(arm, seg["target"], "look at the cube"):
+                print("\naborting run."); go_home(arm); return 1
+            pts, durs = _arc_from(current_pos(arm), seg["target"], d_max, cruise_dur_max, rng)
+            # the gripper opens WHILE the arm travels to the cube
+            open_grip = (GRIP_OPEN_DEG, GRIP_OPEN_DELAY_S, "open") if kind == "reach" else None
+
             if kind == "reach" and NUDGE_ENABLED and seg["k"] == NUDGED_CUBE:
                 if not run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max,
-                                 cruise_dur_max):
+                                 cruise_dur_max, grip=open_grip):
                     print("\naborting run."); go_home(arm); return 1
                 if not _grip(arm, GRIP_CLOSED_DEG, "close on cube (new position)"):
                     return 1
                 continue
 
-            if not _send_arc(arm, pts, durs, label, gaze_target=seg["gaze"]):
+            if not _send_arc(arm, pts, durs, label, gaze_target=seg["gaze"], grip=open_grip):
                 print("\naborting run."); go_home(arm); return 1
 
             # grip IMMEDIATELY -- nothing (no position read, no extra round
@@ -860,7 +1099,13 @@ def main():
                 print(f"  !! tip at {tuple(round(v, 2) for v in cur)}, expected "
                       f"{tuple(round(v, 1) for v in seg['target'])} +/- {REACH_TOL_CM} cm")
 
+            # back to the look configuration, looking at the target just left
+            if kind == "carry" and not _return_looking_back(arm, seg["target"]):
+                print("\naborting run."); go_home(arm); return 1
+
         print("\nall cubes placed.")
+        print("\n=== phase 3: success nod ===")
+        _play_nod(arm)
         return 0
 
     except KeyboardInterrupt:

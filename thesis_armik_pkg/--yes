@@ -1,0 +1,43 @@
+pick order (cube indices): [0, 1, 2]
+orientation lock: world
+NUDGE enabled: cube #2 at (14.0, 15.5, -4.0) -- nudge THAT cube as soon as its own reach comes up
+widest move 46.0 cm -> apex 15.0 cm  (shared parabola a = -0.0284)
+widest reach/carry arc takes 3.46s at CRUISE_SPEED_CM_S (ARC_TIME_EQUALIZATION=0.50 blends every arc toward this)
+homing...
+start pose (tip, cm/deg): [16.92, -6.46, 10.34, -180.0, -0.0, -45.0]
+  gripper -> 120 deg (open before first pick)
+
+=== cycle 0/5  reach & grasp  cube #1  -> (14.0, 10.0, -4.0) ===
+  reach & grasp: 28.2 cm, 2.59 s, peak 110 deg/s
+  gripper -> 65 deg (close on cube)
+
+=== cycle 1/5  carry & place  cube #1  -> (14.0, -10.0, -4.0) ===
+  carry & place: 28.0 cm, 2.58 s, peak 125 deg/s
+  gripper -> 120 deg (release cube)
+
+=== cycle 2/5  reach & grasp  cube #2  -> (14.0, 15.5, -4.0) ===
+  NUDGE: approaching to 80% ...
+    nudge approach: 25.8 cm, 1.93 s, peak 110 deg/s
+  RECOIL -> (14.0, 7.3, 2.1)
+    recoil: 4.0 cm, 0.17 s, peak 107 deg/s
+  waiting 1.5s for the cube to settle ...
+  cube moved -> re-approaching (16.0, 15.5, -4.0)
+    nudge re-approach: 11.0 cm, 1.23 s, peak 70 deg/s
+  gripper -> 65 deg (close on cube (new position))
+
+=== cycle 3/5  carry & place  cube #2  -> (14.0, -15.5, -4.0) ===
+  carry & place: 37.0 cm, 2.85 s, peak 102 deg/s
+  gripper -> 120 deg (release cube)
+
+=== cycle 4/5  reach & grasp  cube #3  -> (14.0, 23.0, -4.0) ===
+  reach & grasp: 45.1 cm, 3.10 s, peak 98 deg/s
+  gripper -> 65 deg (close on cube)
+
+=== cycle 5/5  carry & place  cube #3  -> (14.0, -23.0, -4.0) ===
+  carry & place: 56.9 cm, 3.46 s, peak 128 deg/s
+  gripper -> 120 deg (release cube)
+
+=== success animation: nod ===
+  nodding: J4 90 -> 75 -> 105 -> 75 -> 105 -> 90 deg, 3.0s
+
+all cubes placed.

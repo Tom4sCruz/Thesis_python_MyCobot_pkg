@@ -139,8 +139,8 @@ CUBES_INITIAL_POINTS = CUBES_INITIAL_POINTS[::-1]
 
 CUBES_TARGET_POINTS = [           # clean, evenly-spaced drop row, uniform z -- no overshoot
     (14.0, -23.0, Z_CUBE_COORD),
-    (14.0, -15.5, Z_CUBE_COORD),
-    (14.0, -10.0, Z_CUBE_COORD),
+    (14.0, -16.5, Z_CUBE_COORD),
+    (14.0, -8.0, Z_CUBE_COORD),
     #(15.0, -19.0, Z_CUBE_COORD),
 ]
 CUBES_TARGET_POINTS = CUBES_TARGET_POINTS[::-1]
@@ -242,7 +242,7 @@ ARC_TIME_EQUALIZATION = 0.5   # 0..1: blends each reach/carry arc's own duration
                               # never pushed faster than the already-smooth cruise speed.
 EASE_IN = 2.0                    # [0,10] start-of-move acceleration shape. 0 = abrupt,
 EASE_OUT = 2.0                   # [0,10] end-of-move deceleration shape.  10 = long, gentle S
-PATH_WAYPOINTS = 180              # samples per arc
+PATH_WAYPOINTS = 200              # samples per arc
 MIN_SEGMENT_S = 0.02
 
 # -- per-move variation ("never the same twice") -----------------------------
@@ -260,7 +260,7 @@ NUDGE_ENABLED = True             # True enables the scripted nudge (fires on NUD
 NUDGED_CUBE = 1                  # 0, 1, or 2 -- which CUBES_INITIAL_POINTS cube gets
                                  # nudged; drives both the scripted recoil target and the
                                  # yellow RViz preview cube
-NUDGE_OFFSET_CM = (2.0, 0.0, 0.0)   # where the nudged cube ends up (relative to its point)
+NUDGE_OFFSET_CM = (5.0, 0.0, 0.0)   # where the nudged cube ends up (relative to its point)
 NUDGE_AT_FRACTION = 0.8         # fraction of the reach arc completed before the recoil
 NUDGE_RECOIL_CM = 2.0           # how far the arm hops back
 NUDGE_RECOIL_ARC_HEIGHT_CM = 0.0   # recoil path's apex above its own chord -- small, so
@@ -279,11 +279,11 @@ POST_NUDGE_ARC_HEIGHT_CM = 2.0   # re-approach-to-the-moved-cube arc's apex abov
                                 # chord -- bypasses _arc_height()'s shared-parabola floor
                                 # (MIN_ARC_HEIGHT_CM) so this short hop stays a gentle curve
                                 # toward the cube instead of a full lift-and-descend peak
-POST_NUDGE_SPEED_CM_S = 18.0    # re-approach cruise speed -- its own dial, independent of
+POST_NUDGE_SPEED_CM_S = 20.0    # re-approach cruise speed -- its own dial, independent of
                                 # CRUISE_SPEED_CM_S / ARC_TIME_EQUALIZATION (which every
                                 # normal arc uses), so it can be tuned without also
                                 # speeding up the rest of the run
-POST_NUDGE_WAYPOINTS = 10       # fewer than PATH_WAYPOINTS -- same reasoning as
+POST_NUDGE_WAYPOINTS = 60       # fewer than PATH_WAYPOINTS -- same reasoning as
                                 # NUDGE_RECOIL_WAYPOINTS: get_durations floors a move's total
                                 # time at (n_waypoints-1)*MIN_SEGMENT_S regardless of cruise
                                 # speed, so this short re-approach needs far fewer segments

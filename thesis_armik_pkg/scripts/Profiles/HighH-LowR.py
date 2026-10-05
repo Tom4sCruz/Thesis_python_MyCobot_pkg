@@ -131,9 +131,9 @@ CUBES_INITIAL_POINTS = [          # a row on the pick side
 CUBES_INITIAL_POINTS = CUBES_INITIAL_POINTS[::-1]
 
 CUBES_TARGET_POINTS = [           # clean, evenly-spaced drop row, uniform z -- no overshoot
-    (14.0, -23.0, Z_CUBE_COORD),
-    (14.0, -15.5, Z_CUBE_COORD),
-    (14.0, -10.0, Z_CUBE_COORD),
+    (12.0, -23.0, Z_CUBE_COORD),
+    (17.0, -16.5, Z_CUBE_COORD),
+    (14.0, -8.0, Z_CUBE_COORD),
     #(15.0, -19.0, Z_CUBE_COORD),
 ]
 CUBES_TARGET_POINTS = CUBES_TARGET_POINTS[::-1]
@@ -244,7 +244,7 @@ NUDGE_ENABLED = True             # True enables the scripted nudge (fires on NUD
 NUDGED_CUBE = 1                  # 0, 1, or 2 -- which CUBES_INITIAL_POINTS cube gets
                                  # nudged; drives both the scripted recoil target and the
                                  # yellow RViz preview cube
-NUDGE_OFFSET_CM = (2.0, 0.0, 0.0)   # where the nudged cube ends up (relative to its point)
+NUDGE_OFFSET_CM = (4.0, 0.0, 0.0)   # where the nudged cube ends up (relative to its point)
 NUDGE_AT_FRACTION = 0.8         # fraction of the reach arc completed before the recoil
 NUDGE_RECOIL_CM = 4.0           # how far the arm hops back
 NUDGE_RECOIL_ARC_HEIGHT_CM = 0.0   # recoil path's apex above its own chord -- small, so

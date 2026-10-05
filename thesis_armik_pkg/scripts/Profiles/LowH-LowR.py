@@ -117,7 +117,7 @@ HOME_RETURN_DPS = 35.0            # deg/s -- a big return gets proportionally MO
                                  # move_joints (no speed pre-check) does not outrun the
                                  # servos and shake. Lower if the last homing still shakes.
 SETTLE_S = 0.3
-PREFLIGHT = True                  # on by default here -- see module docstring
+PREFLIGHT = False                  # on by default here -- see module docstring
 RANDOM_SEED = 1                # int for a repeatable run, None for fresh each time (default:
                                   # fresh -- "never traces the same trajectory twice")
 

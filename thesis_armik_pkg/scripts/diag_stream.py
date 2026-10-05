@@ -50,8 +50,8 @@ from armik.connection import dps_to_firmware_speed
 HOME = [0.0, 0.0, -90.0, 0.0, 0.0, 0.0]
 LATENCY_CALLS = 40
 PAUSE_BETWEEN_MOVES_S = 1.5
-GRIP_A, GRIP_B = 90, 45          # gripper values (0-100) toggled in M5a / M5b
-GRIP_SPEED = 80
+GRIP_A, GRIP_B = 100, 5          # gripper values (0-100) toggled in M5a / M5b
+GRIP_SPEED = 20
 
 
 def _stats_ms(samples_s):
@@ -213,7 +213,7 @@ def main():
     ap.add_argument("--baud", type=int, default=config.DEFAULT_BAUDRATE)
     ap.add_argument("--mock", action="store_true")
     ap.add_argument("--yes", action="store_true", help="skip the safety prompt")
-    ap.add_argument("--swing-deg", type=float, default=35.0, help="J1 swing away from HOME")
+    ap.add_argument("--swing-deg", type=float, default=90.0, help="J1 swing away from HOME")
     ap.add_argument("--move-s", type=float, default=2.0, help="duration of each one-way move")
     ap.add_argument("--no-gripper", action="store_true", help="skip every gripper command")
     args = ap.parse_args()

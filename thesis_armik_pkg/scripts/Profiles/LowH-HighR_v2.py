@@ -68,7 +68,7 @@ from armik import Arm, ArmError, config, pose_coords
 # -- run / connection -----------------------------------------------------------
 HOME = [0.0, 0.0, -90.0, 0.0, 0.0, 0.0]
 SETTLE_S = 0.3
-PREFLIGHT = True
+PREFLIGHT = False
 
 # -- cubes (MEASURE AND REPLACE) ----------------------------------------------
 # (x, y, z) CM, at the GRIPPER TIP, base frame, z from the table.

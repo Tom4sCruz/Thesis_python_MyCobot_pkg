@@ -4,13 +4,19 @@ MOVEMENT PROFILE: High-human / Low-robot  (look, then reach) -- TEST VARIANT
 ============================================================================
 
 TEST of HighH-LowR.py with the GRIPPER MOVING WHILE THE ARM MOVES:
-  * the arm looks around with its gripper CLOSED (GRIP_REST_DEG);
+  * three gripper openings: GRIP_OPEN_DEG to approach / release a cube,
+    GRIP_CLOSED_DEG on a cube, and GRIP_LOOK_DEG (nearly shut) while it looks
+    around, returns to the look configuration, and nods;
   * the gripper OPENS as the arm travels toward a cube (GRIP_OPEN_DELAY_S
     after the reach starts);
-  * after a drop, the gripper CLOSES again on the way back to the look
-    configuration, GRIP_CLOSE_DELAY_S after the return starts -- late enough
-    not to re-grab the cube just dropped -- so the arm always arrives there
-    closed;
+  * at a cube / a target the arm WAITS for the gripper to finish closing /
+    opening before it moves off (GRIP_CLOSE_WAIT_S / GRIP_OPEN_WAIT_S);
+  * after a drop, the gripper goes to GRIP_LOOK_DEG on the way back to the
+    look configuration, GRIP_CLOSE_DELAY_S after the return starts -- late
+    enough not to re-grab the cube just dropped;
+  * on the LAST return the head looks back at the target only for the first
+    part (NOD_BLEND_START_FRAC), then turns toward the nod pose while the arm
+    is still travelling, so it arrives ready to nod;
   * Phase 1 looks at the cubes' average, the targets' average, then straight
     at the first cube.
 arm.move_joints() / arm.send_path() only return once the motion is over (they
@@ -287,24 +293,32 @@ NOD_DOWN_DEG = 15.0           # how far it tilts DOWN on a down nod
 NOD_UP_J4_SIGN = 1.0          # +1: increasing J4 tilts the gripper up (true for the
                               # default pose); flip to -1 if it nods the wrong way
 NOD_WAYPOINTS_PER_STROKE = 20  # samples per stroke (one stroke = one key angle to the next)
+NOD_BLEND_START_FRAC = 0.5    # on the LAST return: fraction of the way back after which the
+                              # head stops looking at the target and turns toward
+                              # NOD_WRIST_J456_DEG, arriving in the nod pose. 0 = from the
+                              # start, 1 = never (return first, then a separate swing)
 
 # -- gripper ---------------------------------------------------------------------
-GRIP_OPEN_DEG = 120.0           # 0 = closed .. config.MAX_GRIPPER_DEG = full open
-GRIP_CLOSED_DEG = 2.0          # tune to the cube width
+GRIP_OPEN_DEG = 120.0           # open, to approach / release a cube
+                                # (0 = shut .. config.MAX_GRIPPER_DEG = full open)
+GRIP_CLOSED_DEG = 65.0          # closed ON a cube -- tune to the cube width
+GRIP_LOOK_DEG = 10.0            # nearly shut: while looking around, on the way back to the
+                                # look configuration, and for the nod
 GRIP_SPEED = 10  #config.GRIPPER_DEFAULT_SPEED
 GRIP_SETTLE_S = 0.35           # quiet time after a gripper command: it must LAND and the
                               # jaws start moving. Tunable down to GRIP_MIN_GAP_S, not below.
 GRIP_MIN_GAP_S = 0.2          # hard floor -- pymycobot silently drops a gripper command
                               # that is not followed by a short quiet gap (why 0.0 failed).
+GRIP_CLOSE_WAIT_S = 1.0        # the arm stays still this long after closing on a cube, so the
+                              # jaws have finished before it lifts (depends on GRIP_SPEED)
+GRIP_OPEN_WAIT_S = 1.0         # ... and after releasing a cube at its target
 REACH_TOL_CM = 3.0             # has_reached_* tolerance, per axis
 
 # -- gripper WHILE the arm moves (what this test variant is about) --------------
-GRIP_REST_DEG = GRIP_CLOSED_DEG  # the "closed" gripper the arm looks around / rests with
-                                 # (lower, down to 0, for a tighter close)
 GRIP_OPEN_DELAY_S = 0.0          # seconds after a reach STARTS that the gripper begins to open
 GRIP_CLOSE_DELAY_S = 0.6         # seconds after the return to the look configuration STARTS
-                                 # that the gripper begins to close -- late enough to be clear
-                                 # of the cube it just dropped
+                                 # that the gripper begins to close to GRIP_LOOK_DEG -- late
+                                 # enough to be clear of the cube it just dropped
 GRIP_MOVING_REPEATS = 2          # how many times a gripper command fired during motion is
                                  # sent. armik writes it without waiting for a reply and keeps
                                  # config.MIN_COMMAND_GAP_S of quiet around it (a blocking send
@@ -520,16 +534,18 @@ def _fire_gripper(arm, deg):
     return bool(ok)
 
 
-def _grip(arm, deg, label):
+def _grip(arm, deg, label, wait_s=GRIP_SETTLE_S):
+    """Gripper command with the arm standing still, then wait_s before
+    anything else happens (never less than GRIP_MIN_GAP_S)."""
     _say(f"  gripper -> {deg:.0f} deg ({label})")
     if _TAPE is not None:
         _TAPE.append(("grip", float(deg)))
     elif not _fire_gripper(arm, deg):
         print(f"  send_gripper REFUSED -- {arm.last_error}")
         return False
-    if GRIP_SETTLE_S < GRIP_MIN_GAP_S:
-        _say(f"  (GRIP_SETTLE_S {GRIP_SETTLE_S}s < floor {GRIP_MIN_GAP_S}s -- using the floor)")
-    _pause(max(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S) - 0.06, 0.0))
+    if wait_s < GRIP_MIN_GAP_S:
+        _say(f"  (gripper wait {wait_s}s < floor {GRIP_MIN_GAP_S}s -- using the floor)")
+    _pause(max(max(wait_s, GRIP_MIN_GAP_S) - 0.06, 0.0))
     return True
 
 
@@ -852,10 +868,14 @@ def _phase_look_around(arm):
     return True
 
 
-def _return_looking_back(arm, target):
+def _return_looking_back(arm, target, end_wrist=None):
     """After a drop: J1..J3 travel back to LOOK_CONFIG_J123_DEG (J6 back to
     HOME's) while the head keeps looking at `target`, the place just left --
-    see _gaze.wrist_track_angles. Returns bool."""
+    see _gaze.wrist_track_angles.
+    end_wrist: optional [J4, J5, J6] to ARRIVE in (the nod pose, on the last
+    return). The head then looks at the target only until NOD_BLEND_START_FRAC
+    of the way back and cross-fades smoothly to end_wrist over the rest.
+    Returns bool."""
     q0 = np.asarray(arm.get_angles(), dtype=float)
     q_end = q0.copy()
     q_end[:3] = LOOK_CONFIG_J123_DEG
@@ -867,12 +887,18 @@ def _return_looking_back(arm, target):
     else:
         q_end[3:5] = HOME[3:5]
         rows = _line_to(q0, q_end, RETURN_WAYPOINTS)
+    blended = end_wrist is not None and NOD_BLEND_START_FRAC < 1.0
+    if blended:
+        frac = np.arange(1, len(rows) + 1) / len(rows)
+        w = _smootherstep((frac - NOD_BLEND_START_FRAC) / (1.0 - NOD_BLEND_START_FRAC))
+        rows[:, 3:6] += w[:, None] * (np.asarray(end_wrist, dtype=float)[None, :] - rows[:, 3:6])
     # close the gripper on the way, once clear of the cube just dropped
     if not _eased_joint_move(arm, rows, RETURN_SPEED_DPS, RETURN_EASE_IN, RETURN_EASE_OUT,
-                             "return", grip=(GRIP_REST_DEG, GRIP_CLOSE_DELAY_S, "close")):
+                             "return", grip=(GRIP_LOOK_DEG, GRIP_CLOSE_DELAY_S, "close")):
         return False
     _say("  returned to the look configuration"
-          + (", looking back at the target" if GAZE_ENABLED else ""))
+         + (", looking back at the target" if GAZE_ENABLED else "")
+         + (", then turning to the nod pose" if blended else ""))
     return True
 
 
@@ -1070,7 +1096,7 @@ def _choreography(arm, segments, paths, all_durs, d_max, cruise_dur_max, rng):
     whatever `arm` it is given. main() runs it once on a simulated arm with
     _TAPE recording (the rehearsal) and then plays the tape back on the real
     one. Returns False if anything was refused."""
-    if not _grip(arm, GRIP_REST_DEG, "closed for looking around"):
+    if not _grip(arm, GRIP_LOOK_DEG, "for looking around"):
         return False
 
     _say("\n=== phase 1: looking around ===")
@@ -1097,7 +1123,8 @@ def _choreography(arm, segments, paths, all_durs, d_max, cruise_dur_max, rng):
             if not run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max,
                              cruise_dur_max, grip=open_grip):
                 return False
-            if not _grip(arm, GRIP_CLOSED_DEG, "close on cube (new position)"):
+            if not _grip(arm, GRIP_CLOSED_DEG, "close on cube (new position)",
+                         wait_s=GRIP_CLOSE_WAIT_S):
                 return False
             continue
 
@@ -1106,14 +1133,19 @@ def _choreography(arm, segments, paths, all_durs, d_max, cruise_dur_max, rng):
 
         # grip IMMEDIATELY -- nothing (no position read, no extra round
         # trip) runs between the arm stopping and the gripper command.
-        if not _grip(arm, grip_deg, "close on cube" if kind == "reach" else "release cube"):
+        # ... then the arm WAITS for the jaws to finish before it moves off.
+        if not _grip(arm, grip_deg, "close on cube" if kind == "reach" else "release cube",
+                     wait_s=GRIP_CLOSE_WAIT_S if kind == "reach" else GRIP_OPEN_WAIT_S):
             return False
 
         # live check at playback: did the tip really get there?
         _TAPE.append(("check", "cube" if kind == "reach" else "target", tuple(seg["target"])))
 
-        # back to the look configuration, looking at the target just left
-        if kind == "carry" and not _return_looking_back(arm, seg["target"]):
+        # back to the look configuration, looking at the target just left; the
+        # LAST return also turns the head into the nod pose on the way
+        last = ci == len(segments) - 1
+        if kind == "carry" and not _return_looking_back(
+                arm, seg["target"], end_wrist=NOD_WRIST_J456_DEG if last else None):
             return False
 
     _say("\nall cubes placed.")

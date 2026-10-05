@@ -68,6 +68,7 @@ import time
 import numpy as np
 
 from armik import Arm, Plan, config, pose_coords
+from armik.arm import Execution
 from _gaze import (gaze_waypoints, gaze_then_level_waypoints, look_at_rpy, ease_to_rpy,
                    wrist_look_angles, wrist_track_angles)
 from armik.kinematics import check_joint_limits
@@ -489,13 +490,100 @@ def _fire_gripper(arm, deg):
 
 
 def _grip(arm, deg, label):
-    print(f"  gripper -> {deg:.0f} deg ({label})")
-    if not _fire_gripper(arm, deg):
+    _say(f"  gripper -> {deg:.0f} deg ({label})")
+    if _TAPE is not None:
+        _TAPE.append(("grip", float(deg)))
+    elif not _fire_gripper(arm, deg):
         print(f"  send_gripper REFUSED -- {arm.last_error}")
         return False
     if GRIP_SETTLE_S < GRIP_MIN_GAP_S:
-        print(f"  (GRIP_SETTLE_S {GRIP_SETTLE_S}s < floor {GRIP_MIN_GAP_S}s -- using the floor)")
-    time.sleep(max(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S) - 0.06, 0.0))
+        _say(f"  (GRIP_SETTLE_S {GRIP_SETTLE_S}s < floor {GRIP_MIN_GAP_S}s -- using the floor)")
+    _pause(max(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S) - 0.06, 0.0))
+    return True
+
+
+# ===========================================================================
+# THE TAPE -- rehearse the whole run first, then play it back
+# ===========================================================================
+# Working out a motion (the look searches, the IK for an arc) takes real time
+# on the Jetson, and doing it between actions left the arm standing still.
+# So the choreography runs TWICE:
+#   1. REHEARSAL on a second, simulated Arm(mock=True): nothing is streamed and
+#      nothing sleeps. Every action -- a finished Plan, a gripper command, a
+#      deliberate pause, a log line -- is appended to a list, the tape, and the
+#      simulated arm is put at the motion's end pose so the next step plans
+#      from the right place.
+#   2. PLAYBACK on the real arm: the tape is executed in order. No kinematics
+#      and no planning happen between motions, so the only gaps left are the
+#      deliberate pauses.
+# Every motion function reaches the arm only through _do_plan / _pause / _say /
+# _grip below, which record while _TAPE is a list and act when it is None.
+
+_TAPE = None
+
+
+def _say(text):
+    if _TAPE is not None:
+        _TAPE.append(("say", text))
+    else:
+        print(text)
+
+
+def _pause(seconds):
+    if _TAPE is not None:
+        _TAPE.append(("pause", float(seconds)))
+    else:
+        time.sleep(seconds)
+
+
+def _do_plan(arm, plan, grip=None):
+    """Execute a finished Plan -- or, in rehearsal, record it and move the
+    simulated arm to its end pose. grip: optional (deg, delay_s, label)
+    gripper command fired while it runs; plan=None means just that command.
+    Returns an Execution."""
+    if _TAPE is not None:
+        _TAPE.append(("plan", plan, grip, arm.jerk))
+        if plan is not None:
+            arm.conn.raw.set_angles_directly([float(v) for v in plan.q_waypoints[-1]])
+        return Execution(ok=True)
+    return _run_plan(arm, plan, grip)
+
+
+def _run_plan(arm, plan, grip):
+    if plan is None:
+        return Execution(ok=True)
+    return arm._execute(plan)
+
+
+def _play(arm, tape):
+    """Run a recorded tape on the real arm. Returns bool."""
+    for step in tape:
+        kind = step[0]
+        if kind == "say":
+            print(step[1])
+        elif kind == "pause":
+            time.sleep(step[1])
+        elif kind == "grip":
+            if not _fire_gripper(arm, step[1]):
+                print(f"  send_gripper REFUSED -- {arm.last_error}")
+                return False
+        elif kind == "plan":
+            _, plan, grip, jerk = step
+            arm.jerk = jerk
+            ex = _run_plan(arm, plan, grip)
+            arm.jerk = 0.0
+            arm.last_plan, arm.last_execution = plan, ex
+            if not ex.ok:
+                print(f"  execution ABORTED -- {ex.error}")
+                return False
+            if ex.late_deadlines:
+                print(f"  !! {ex.late_deadlines} late control-loop deadline(s) during this move")
+        elif kind == "check":
+            _, what, target = step
+            cur = current_pos(arm)
+            if not _within(cur, target, (REACH_TOL_CM,) * 3):
+                print(f"  !! tip at {tuple(round(v, 2) for v in cur)}, expected "
+                      f"{tuple(round(v, 1) for v in target)} +/- {REACH_TOL_CM} cm ({what})")
     return True
 
 
@@ -519,37 +607,49 @@ def _arc_orientations(arm, tail, durs, gaze_target):
 
 
 def _send_arc(arm, pts, durs, label, gaze_target=None):
-    """Blocking parabolic move. pts[0] is the implicit start (not sent).
+    """Parabolic move. pts[0] is the implicit start (not sent).
     gaze_target: if given (and GAZE_ENABLED), the gripper tip points at this
     3D point for the whole arc instead of holding PICK_ORIENTATION_DEG. A wide
     carry occasionally asks for a look-at pose this arm's elbow/wrist can't
-    reach (or can only reach too fast) -- if the gazed send_path is REFUSED,
-    this falls back to the fixed PICK_ORIENTATION_DEG for THIS arc only,
-    rather than aborting the run."""
+    reach (or can only reach too fast) -- if the gazed plan is REFUSED, this
+    falls back to the fixed PICK_ORIENTATION_DEG for THIS arc only, rather
+    than aborting the run.
+    Plans with arm.plan_path() and hands the Plan to _do_plan(), so the same
+    code serves the rehearsal (record) and a live move (execute)."""
     if len(pts) < 2:
-        print(f"  {label}: negligible, skipped")
+        _say(f"  {label}: negligible, skipped")
         return True
     tail = pts[1:]
     xs = [p[0] for p in tail]
     ys = [p[1] for p in tail]
     zs = [p[2] for p in tail]
 
-    rx, ry, rz = _arc_orientations(arm, tail, durs, gaze_target)
-    r = arm.send_path(x=xs, y=ys, z=zs, rx=rx, ry=ry, rz=rz, durations=list(durs))
-    if not r and GAZE_ENABLED and gaze_target is not None:
-        print(f"  {label}: gaze pose unreachable ({arm.last_error}) "
-              f"-- retrying this arc with fixed orientation")
-        rx, ry, rz = _arc_orientations(arm, tail, durs, None)
-        r = arm.send_path(x=xs, y=ys, z=zs, rx=rx, ry=ry, rz=rz, durations=list(durs))
-    if not r:
-        print(f"  {label}: send_path REFUSED -- {arm.last_error}")
+    def _plan(gaze):
+        rx, ry, rz = _arc_orientations(arm, tail, durs, gaze)
+        return arm.plan_path(x=xs, y=ys, z=zs, rx=rx, ry=ry, rz=rz, durations=list(durs))
+
+    arm.last_error = None
+    arm.last_execution = None
+    pl = _plan(gaze_target)
+    if not pl.ok and GAZE_ENABLED and gaze_target is not None:
+        _say(f"  {label}: gaze pose unreachable ({pl.error}) "
+             f"-- retrying this arc with fixed orientation")
+        pl = _plan(None)
+    arm.last_plan = pl
+    if not pl.ok:
+        arm.last_error = pl.error
+        _say(f"  {label}: plan REFUSED -- {pl.error}")
         return False
-    pl = arm.last_plan
-    print(f"  {label}: {pl.path_length_cm:.1f} cm, {pl.duration_s:.2f} s, "
-          f"peak {pl.peak_joint_dps:.0f} deg/s")
-    if arm.last_execution and arm.last_execution.late_deadlines:
-        print(f"  !! {arm.last_execution.late_deadlines} late control-loop "
-              f"deadline(s) during this arc")
+    ex = _do_plan(arm, pl)
+    arm.last_execution = ex
+    if not ex.ok:
+        arm.last_error = ex.error
+        _say(f"  {label}: execution ABORTED -- {ex.error}")
+        return False
+    _say(f"  {label}: {pl.path_length_cm:.1f} cm, {pl.duration_s:.2f} s, "
+         f"peak {pl.peak_joint_dps:.0f} deg/s")
+    if ex.late_deadlines:
+        _say(f"  !! {ex.late_deadlines} late control-loop deadline(s) during this arc")
     return True
 
 
@@ -588,7 +688,7 @@ def _eased_joint_move(arm, q_waypoints, speed_dps, ease_in, ease_out, label):
     for r in path[1:]:
         problems = check_joint_limits(r)
         if problems:
-            print(f"  {label} REFUSED -- violates joint limits: {'; '.join(problems)}")
+            _say(f"  {label} REFUSED -- violates joint limits: {'; '.join(problems)}")
             return False
 
     # eased progress s(t): celebration_durations gives the time of evenly spaced
@@ -614,12 +714,12 @@ def _eased_joint_move(arm, q_waypoints, speed_dps, ease_in, ease_out, label):
         t, rows = _sample(total_s)
 
     plan = Plan(ok=True, q_waypoints=rows, timestamps=t, duration_s=float(t[-1]))
-    ex = arm._execute(plan)
+    ex = _do_plan(arm, plan)
     if not ex.ok:
-        print(f"  {label} REFUSED -- {ex.error}")
+        _say(f"  {label} REFUSED -- {ex.error}")
         return False
     if ex.late_deadlines:
-        print(f"  !! {label}: {ex.late_deadlines} late control-loop deadline(s)")
+        _say(f"  !! {label}: {ex.late_deadlines} late control-loop deadline(s)")
     return True
 
 
@@ -654,8 +754,8 @@ def _swing_head(arm, target, label):
                              label):
         return False
     aim = f"aim error {err:.1f} deg" if err is not None else "no look (gripper down)"
-    print(f"  {label}: {tuple(round(float(v), 1) for v in target)}  ({aim})")
-    time.sleep(LOOK_PAUSE_S)
+    _say(f"  {label}: {tuple(round(float(v), 1) for v in target)}  ({aim})")
+    _pause(LOOK_PAUSE_S)
     return True
 
 
@@ -690,7 +790,7 @@ def _return_looking_back(arm, target):
     if not _eased_joint_move(arm, rows, RETURN_SPEED_DPS, RETURN_EASE_IN, RETURN_EASE_OUT,
                              "return"):
         return False
-    print("  returned to the look configuration"
+    _say("  returned to the look configuration"
           + (", looking back at the target" if GAZE_ENABLED else ""))
     return True
 
@@ -726,14 +826,14 @@ def _play_nod(arm):
     if not _eased_joint_move(arm, _line_to(arm.get_angles(), base, HEAD_SWING_WAYPOINTS),
                              HEAD_SWING_SPEED_DPS, HEAD_SWING_EASE_IN, HEAD_SWING_EASE_OUT,
                              "nod pose"):
-        print("  nod skipped -- could not reach the nod pose")
+        _say("  nod skipped -- could not reach the nod pose")
         return True
-    time.sleep(LOOK_PAUSE_S)
+    _pause(LOOK_PAUSE_S)
     if not NOD_ENABLED:
         return True
 
     keys = _nod_key_angles()
-    print(f"  nodding: J4 {' -> '.join(f'{k:.0f}' for k in keys)} deg")
+    _say(f"  nodding: J4 {' -> '.join(f'{k:.0f}' for k in keys)} deg")
     for a, b in zip(keys[:-1], keys[1:]):
         if abs(b - a) < 1e-6:
             continue
@@ -750,7 +850,7 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, cr
     n = len(pts)
     cut = max(2, int(round(NUDGE_AT_FRACTION * (n - 1))) + 1)
     gaze = seg["gaze"]                 # the original cube -- kept through approach + recoil
-    print(f"  NUDGE: approaching to {int(NUDGE_AT_FRACTION*100)}% ...")
+    _say(f"  NUDGE: approaching to {int(NUDGE_AT_FRACTION*100)}% ...")
     if not _send_arc(arm, pts[:cut], durs[:cut - 1], "  nudge approach", gaze_target=gaze):
         return False
 
@@ -762,7 +862,7 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, cr
         + np.array([0.0, 0.0, NUDGE_RECOIL_CM * 0.5])
     ))
 
-    print(f"  RECOIL -> {tuple(round(v, 1) for v in recoil)}")
+    _say(f"  RECOIL -> {tuple(round(v, 1) for v in recoil)}")
     rpts = get_path(here, recoil, NUDGE_RECOIL_ARC_HEIGHT_CM, rng,
                     n_waypoints=NUDGE_RECOIL_WAYPOINTS)
     rdurs = get_durations(here, recoil, NUDGE_RECOIL_ARC_HEIGHT_CM,
@@ -775,11 +875,11 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, cr
     if not ok:
         return False
 
-    print(f"  waiting {NUDGE_SETTLE_S:.1f}s for the cube to settle ...")
-    time.sleep(NUDGE_SETTLE_S)
+    _say(f"  waiting {NUDGE_SETTLE_S:.1f}s for the cube to settle ...")
+    _pause(NUDGE_SETTLE_S)
 
     new_cube = tuple(float(c + o) for c, o in zip(seg["target"], NUDGE_OFFSET_CM))
-    print(f"  cube moved -> re-approaching {tuple(round(v, 1) for v in new_cube)}")
+    _say(f"  cube moved -> re-approaching {tuple(round(v, 1) for v in new_cube)}")
     after = current_pos(arm)
     h2 = POST_NUDGE_ARC_HEIGHT_CM
     p2 = get_path(after, new_cube, h2, rng, n_waypoints=POST_NUDGE_WAYPOINTS)
@@ -880,6 +980,61 @@ def _build_segments(order, look_tip):
                      "target": CUBES_TARGET_POINTS[k], "k": int(k),
                      "gaze": CUBES_TARGET_POINTS[k]})
     return segs
+
+
+def _choreography(arm, segments, paths, all_durs, d_max, cruise_dur_max, rng):
+    """The whole run -- Phase 1, every cube cycle, Phase 3 -- written against
+    whatever `arm` it is given. main() runs it once on a simulated arm with
+    _TAPE recording (the rehearsal) and then plays the tape back on the real
+    one. Returns False if anything was refused."""
+    if not _grip(arm, GRIP_OPEN_DEG, "open before first pick"):
+        return False
+
+    _say("\n=== phase 1: looking around ===")
+    if not _phase_look_around(arm):
+        return False
+
+    for ci, seg in enumerate(segments):
+        kind = seg["kind"]
+
+        grip_deg = GRIP_CLOSED_DEG if kind == "reach" else GRIP_OPEN_DEG
+        label = "reach & grasp" if kind == "reach" else "carry & place"
+        _say(f"\n=== cycle {ci}/{N_CYCLES - 1}  {label}  "
+              f"cube #{seg['k'] + 1}  -> {tuple(round(v, 1) for v in seg['target'])} ===")
+
+        # a reach starts by looking at the cube from the look configuration;
+        # either way the arc starts from wherever the tip actually is
+        if kind == "reach" and not _swing_head(arm, seg["target"], "look at the cube"):
+            return False
+        pts, durs = _arc_from(current_pos(arm), seg["target"], d_max, cruise_dur_max, rng)
+
+        if kind == "reach" and NUDGE_ENABLED and seg["k"] == NUDGED_CUBE:
+            if not run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max,
+                             cruise_dur_max):
+                return False
+            if not _grip(arm, GRIP_CLOSED_DEG, "close on cube (new position)"):
+                return False
+            continue
+
+        if not _send_arc(arm, pts, durs, label, gaze_target=seg["gaze"]):
+            return False
+
+        # grip IMMEDIATELY -- nothing (no position read, no extra round
+        # trip) runs between the arm stopping and the gripper command.
+        if not _grip(arm, grip_deg, "close on cube" if kind == "reach" else "release cube"):
+            return False
+
+        # live check at playback: did the tip really get there?
+        _TAPE.append(("check", "cube" if kind == "reach" else "target", tuple(seg["target"])))
+
+        # back to the look configuration, looking at the target just left
+        if kind == "carry" and not _return_looking_back(arm, seg["target"]):
+            return False
+
+    _say("\nall cubes placed.")
+    _say("\n=== phase 3: success nod ===")
+    _play_nod(arm)
+    return True
 
 
 def main():
@@ -989,57 +1144,31 @@ def main():
             go_home(arm)
             return 1
 
-        if not _grip(arm, GRIP_OPEN_DEG, "open before first pick"):
+        # ---- rehearsal: compute EVERYTHING now, on a simulated arm ----------
+        global _TAPE
+        print("\nrehearsing the whole run on a simulated arm (nothing moves yet)...")
+        t_rehearse = time.perf_counter()
+        sim = Arm(mock=True)
+        sim.conn.raw.set_angles_directly([float(v) for v in HOME])
+        _TAPE = []
+        try:
+            ok = _choreography(sim, segments, paths, all_durs, d_max, cruise_dur_max, rng)
+        finally:
+            tape, _TAPE = _TAPE, None
+            sim.close()
+        if not ok:
+            for step in tape:                      # show how far the rehearsal got
+                if step[0] == "say":
+                    print(step[1])
+            print("\nrehearsal failed (see above) -- the arm has not moved beyond homing.")
             return 1
+        n_moves = sum(1 for step in tape if step[0] == "plan" and step[1] is not None)
+        print(f"precomputed {n_moves} motions in {time.perf_counter() - t_rehearse:.1f} s "
+              f"-- playing back")
 
-        print("\n=== phase 1: looking around ===")
-        if not _phase_look_around(arm):
+        # ---- playback: no computing between actions --------------------------
+        if not _play(arm, tape):
             print("\naborting run."); go_home(arm); return 1
-
-        for ci, seg in enumerate(segments):
-            kind = seg["kind"]
-
-            grip_deg = GRIP_CLOSED_DEG if kind == "reach" else GRIP_OPEN_DEG
-            label = "reach & grasp" if kind == "reach" else "carry & place"
-            print(f"\n=== cycle {ci}/{N_CYCLES - 1}  {label}  "
-                  f"cube #{seg['k'] + 1}  -> {tuple(round(v, 1) for v in seg['target'])} ===")
-
-            # a reach starts by looking at the cube from the look configuration;
-            # either way the arc starts from wherever the tip actually is
-            if kind == "reach" and not _swing_head(arm, seg["target"], "look at the cube"):
-                print("\naborting run."); go_home(arm); return 1
-            pts, durs = _arc_from(current_pos(arm), seg["target"], d_max, cruise_dur_max, rng)
-
-            if kind == "reach" and NUDGE_ENABLED and seg["k"] == NUDGED_CUBE:
-                if not run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max,
-                                 cruise_dur_max):
-                    print("\naborting run."); go_home(arm); return 1
-                if not _grip(arm, GRIP_CLOSED_DEG, "close on cube (new position)"):
-                    return 1
-                continue
-
-            if not _send_arc(arm, pts, durs, label, gaze_target=seg["gaze"]):
-                print("\naborting run."); go_home(arm); return 1
-
-            # grip IMMEDIATELY -- nothing (no position read, no extra round
-            # trip) runs between the arm stopping and the gripper command.
-            if not _grip(arm, grip_deg, "close on cube" if kind == "reach" else "release cube"):
-                return 1
-
-            cur = current_pos(arm)
-            reached = (has_reached_cube(cur, seg["target"]) if kind == "reach"
-                       else has_reached_target(cur, seg["target"]))
-            if not reached:
-                print(f"  !! tip at {tuple(round(v, 2) for v in cur)}, expected "
-                      f"{tuple(round(v, 1) for v in seg['target'])} +/- {REACH_TOL_CM} cm")
-
-            # back to the look configuration, looking at the target just left
-            if kind == "carry" and not _return_looking_back(arm, seg["target"]):
-                print("\naborting run."); go_home(arm); return 1
-
-        print("\nall cubes placed.")
-        print("\n=== phase 3: success nod ===")
-        _play_nod(arm)
         return 0
 
     except KeyboardInterrupt:

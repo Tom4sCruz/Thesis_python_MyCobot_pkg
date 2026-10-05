@@ -56,6 +56,29 @@ def forward_kinematics(q_deg: Sequence[float]) -> np.ndarray:
     return frame_chain(q_deg)[-1] @ tool_transform()
 
 
+def forward_kinematics_batch(q_batch) -> np.ndarray:
+    """forward_kinematics() for MANY joint configurations at once: q_batch is
+    (N, 6) degrees, the result (N, 4, 4). Same DH chain and tool transform,
+    done as array operations -- for searches that evaluate thousands of
+    candidate poses, where one Python call per pose is far too slow on the
+    Jetson."""
+    q = np.asarray(q_batch, dtype=float)
+    if q.ndim != 2 or q.shape[1] != config.DOF:
+        raise ValueError(f"expected (N, {config.DOF}) joint angles, got {q.shape}")
+    T = np.broadcast_to(np.eye(4), (len(q), 4, 4)).copy()
+    for i, (offset, d, a, alpha) in enumerate(config.DH_TABLE):
+        th = np.deg2rad(q[:, i] + offset)
+        ct, st = np.cos(th), np.sin(th)
+        ca, sa = np.cos(np.deg2rad(alpha)), np.sin(np.deg2rad(alpha))
+        A = np.zeros((len(q), 4, 4))
+        A[:, 0, 0], A[:, 0, 1], A[:, 0, 2], A[:, 0, 3] = ct, -st * ca, st * sa, a * ct
+        A[:, 1, 0], A[:, 1, 1], A[:, 1, 2], A[:, 1, 3] = st, ct * ca, -ct * sa, a * st
+        A[:, 2, 1], A[:, 2, 2], A[:, 2, 3] = sa, ca, d
+        A[:, 3, 3] = 1.0
+        T = T @ A
+    return T @ tool_transform()
+
+
 def geometric_jacobian(q_deg: Sequence[float]) -> np.ndarray:
     """
     Classic geometric Jacobian, (6, 6): linear velocity (mm/rad) stacked on
@@ -230,6 +253,18 @@ def check_joint_limits(q_deg) -> list[str]:
 # --------------------------------
 # Single-joint aux
 # --------------------------------
+
+def workspace_ok_batch(xyz_mm) -> np.ndarray:
+    """check_workspace_bounds() for many tip positions at once: xyz_mm is
+    (..., 3) mm, the result a bool array, True where the point is INSIDE the
+    safety envelope. Keep the rule identical to check_workspace_bounds below."""
+    p = np.asarray(xyz_mm, dtype=float)
+    z = p[..., 2]
+    reach_ok = np.linalg.norm(p, axis=-1) <= config.MAX_REACH_MM
+    column_ok = np.hypot(p[..., 0], p[..., 1]) > config.MIN_BASE_DIST_MM
+    return np.where(z >= config.BASE_Z_MM, reach_ok,
+                    np.where(z <= config.GROUND_Z_MM, True, column_ok))
+
 
 def check_workspace_bounds(xyz_mm) -> str | None:
     """

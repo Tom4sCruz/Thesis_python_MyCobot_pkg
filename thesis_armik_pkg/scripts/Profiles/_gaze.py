@@ -321,8 +321,9 @@ def wrist_look_angles(q_deg, target_xyz_cm, min_tip_z_cm):
     spins about the pointing axis itself and cannot change the aim.
 
     Plain search, no solver: a coarse 3 deg grid over (J4, J5), then a 0.5 deg
-    refinement around the best cell. A pose is admissible if it is inside the
-    soft joint limits, passes kinematics.check_workspace_bounds and keeps the
+    refinement around the best cell, each grid evaluated in one batched FK
+    call (kinematics.forward_kinematics_batch). A pose is admissible if it is
+    inside the soft joint limits, passes the workspace envelope and keeps the
     tip at or above min_tip_z_cm. A small travel penalty picks the nearer of
     two equally good aims."""
     q0 = np.asarray(q_deg, dtype=float)
@@ -331,26 +332,27 @@ def wrist_look_angles(q_deg, target_xyz_cm, min_tip_z_cm):
     lim = config.joint_limits_array()
     m = float(config.JOINT_LIMIT_MARGIN_DEG)
 
-    def _score(j4, j5):
-        q = q0.copy()
-        q[3], q[4] = j4, j5
-        T = kinematics.forward_kinematics(q)
-        tip = T[:3, 3]
-        if tip[2] < floor_mm or kinematics.check_workspace_bounds(tip) is not None:
-            return None
-        d = target_mm - tip
-        n = float(np.linalg.norm(d))
-        if n < 1e-6:
-            return None
-        err = math.degrees(math.acos(float(np.clip(np.dot(d / n, T[:3, 2]), -1.0, 1.0))))
-        return err + 0.02 * (abs(j4 - q0[3]) + abs(j5 - q0[4])), err, q
-
     def _search(j4s, j5s, best):
-        for j4 in j4s:
-            for j5 in j5s:
-                r = _score(float(j4), float(j5))
-                if r is not None and (best is None or r[0] < best[0]):
-                    best = r
+        """Best (cost, err, q) over the j4s x j5s grid, or `best` if nothing on
+        it beats it. The whole grid goes through ONE batched FK call; ties
+        keep the first candidate in j4-major order."""
+        g4, g5 = np.meshgrid(np.asarray(j4s, float), np.asarray(j5s, float), indexing="ij")
+        q = np.tile(q0, (g4.size, 1))
+        q[:, 3], q[:, 4] = g4.ravel(), g5.ravel()
+        T = kinematics.forward_kinematics_batch(q)
+        tip = T[:, :3, 3]
+        d = target_mm[None, :] - tip
+        n = np.linalg.norm(d, axis=1)
+        ok = (tip[:, 2] >= floor_mm) & kinematics.workspace_ok_batch(tip) & (n >= 1e-6)
+        if not ok.any():
+            return best
+        cosang = np.einsum("ij,ij->i", d, T[:, :3, 2]) / np.where(n > 0.0, n, 1.0)
+        err = np.degrees(np.arccos(np.clip(cosang, -1.0, 1.0)))
+        cost = err + 0.02 * (np.abs(q[:, 3] - q0[3]) + np.abs(q[:, 4] - q0[4]))
+        cost = np.where(ok, cost, np.inf)
+        i = int(np.argmin(cost))
+        if best is None or cost[i] < best[0]:
+            return float(cost[i]), float(err[i]), q[i].copy()
         return best
 
     lo4, hi4 = lim[3, 0] + m, lim[3, 1] - m
@@ -387,36 +389,27 @@ def wrist_track_angles(q_seq, target_xyz_cm, min_tip_z_cm, window_deg=6.0,
     lim = config.joint_limits_array()
     m = float(config.JOINT_LIMIT_MARGIN_DEG)
     offs = np.arange(-float(window_deg), float(window_deg) + 1e-9, 1.0)
+    d4, d5 = (g.ravel() for g in np.meshgrid(offs, offs, indexing="ij"))
+    move = np.abs(d4) + np.abs(d5)
 
     j4, j5 = float(rows[0, 3]), float(rows[0, 4])
     for i in range(1, len(rows)):
-        q = rows[i].copy()
-        best = None
-        for d4 in offs:
-            c4 = j4 + d4
-            if not (lim[3, 0] + m <= c4 <= lim[3, 1] - m):
-                continue
-            for d5 in offs:
-                c5 = j5 + d5
-                if not (lim[4, 0] + m <= c5 <= lim[4, 1] - m):
-                    continue
-                q[3], q[4] = c4, c5
-                T = kinematics.forward_kinematics(q)
-                tip = T[:3, 3]
-                if tip[2] < floor_mm or kinematics.check_workspace_bounds(tip) is not None:
-                    continue
-                d = target_mm - tip
-                n = float(np.linalg.norm(d))
-                move = abs(d4) + abs(d5)
-                if n < hold_mm:
-                    cost = move
-                else:
-                    cost = math.degrees(math.acos(
-                        float(np.clip(np.dot(d / n, T[:3, 2]), -1.0, 1.0)))) + 0.05 * move
-                if best is None or cost < best[0]:
-                    best = (cost, c4, c5)
-        if best is not None:
-            j4, j5 = best[1], best[2]
+        c4, c5 = j4 + d4, j5 + d5                       # the whole window, one FK call
+        q = np.tile(rows[i], (len(d4), 1))
+        q[:, 3], q[:, 4] = c4, c5
+        T = kinematics.forward_kinematics_batch(q)
+        tip = T[:, :3, 3]
+        ok = ((c4 >= lim[3, 0] + m) & (c4 <= lim[3, 1] - m)
+              & (c5 >= lim[4, 0] + m) & (c5 <= lim[4, 1] - m)
+              & (tip[:, 2] >= floor_mm) & kinematics.workspace_ok_batch(tip))
+        if ok.any():
+            d = target_mm[None, :] - tip
+            n = np.linalg.norm(d, axis=1)
+            cosang = np.einsum("ij,ij->i", d, T[:, :3, 2]) / np.where(n > 0.0, n, 1.0)
+            aim = np.degrees(np.arccos(np.clip(cosang, -1.0, 1.0))) + 0.05 * move
+            cost = np.where(ok, np.where(n < hold_mm, move, aim), np.inf)
+            k = int(np.argmin(cost))
+            j4, j5 = float(c4[k]), float(c5[k])
         rows[i, 3], rows[i, 4] = j4, j5
 
     # The search moves in whole degrees and releases the hold all at once, so

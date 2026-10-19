@@ -347,9 +347,9 @@ NOD_ENABLED = True
 NOD_WRIST_J456_DEG = [50.0, 0.0, 0.0]   # wrist pose the nod is centred on. With the default
                                         # configuration J4 = +90 points the gripper straight
                                         # ahead (+X)
-NOD_SPEED_DPS = 80.0          # AVERAGE J4 speed of each stroke, deg/s (peak is higher
+NOD_SPEED_DPS = 90.0          # AVERAGE J4 speed of each stroke, deg/s (peak is higher
                               # with strong ease)
-NOD_EASE_IN = 3.0             # [0,10] acceleration into each stroke -- see EASE_IN's doc above
+NOD_EASE_IN = 2.0             # [0,10] acceleration into each stroke -- see EASE_IN's doc above
 NOD_EASE_OUT = 1.0            # [0,10] deceleration out of each stroke -- see EASE_OUT's doc above
 NOD_START_DIRECTION = 1      # +1 = the first nod goes UP, -1 = it goes DOWN
 NOD_UP_COUNT = 4              # number of up nods

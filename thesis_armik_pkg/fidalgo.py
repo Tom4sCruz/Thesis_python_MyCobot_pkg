@@ -36,7 +36,11 @@ import time
 from datetime import datetime
 
 MAX_AMP = 25.0
-FALLBACK_LIMITS = (-130.0, 130.0)
+# myCobot 280 joint ranges (deg), used whenever the robot does not report a usable
+# limit -- many firmwares answer get_joint_min/max_angle with pymycobot's error
+# value -1, which would otherwise read as the "limit" (-1, -1)
+FALLBACK_LIMITS = [(-168.0, 168.0), (-135.0, 135.0), (-150.0, 150.0),
+                   (-145.0, 145.0), (-165.0, 165.0), (-175.0, 175.0)]
 LIMIT_MARGIN = 3.0
 
 
@@ -206,10 +210,29 @@ def read_angles(robot, tries=10):
     sys.exit("Could not read joint angles from the robot. Check the port, baud rate, power and firmware.")
 
 
+def sanitize_limits(raw):
+    """Keep a joint's (lo, hi) only if it is plausible: lo < 0 < hi and wide
+    enough for the largest test motion. Anything else -- e.g. (-1, -1), what
+    pymycobot returns when the firmware does not answer -- becomes None, so the
+    myCobot 280 default in FALLBACK_LIMITS is used for that joint."""
+    out = []
+    for j, lim in enumerate(raw):
+        ok = (lim is not None and len(lim) == 2
+              and all(isinstance(v, (int, float)) for v in lim)
+              and lim[0] < 0.0 < lim[1]
+              and lim[1] - lim[0] >= 2 * (MAX_AMP + LIMIT_MARGIN))
+        if lim is not None and not ok:
+            lo, hi = FALLBACK_LIMITS[j]
+            print("J%d: robot returned limits %s, ignoring -> using the myCobot 280 default (%.0f..%.0f)"
+                  % (j + 1, tuple(lim), lo, hi))
+        out.append(tuple(lim) if ok else None)
+    return out
+
+
 def clamp_to_limits(angles, limits):
     out = []
     for i, a in enumerate(angles):
-        lo, hi = limits[i] if limits[i] else FALLBACK_LIMITS
+        lo, hi = limits[i] if limits[i] else FALLBACK_LIMITS[i]
         out.append(max(lo + LIMIT_MARGIN, min(hi - LIMIT_MARGIN, a)))
     return out
 
@@ -490,7 +513,7 @@ def main():
     out_dir = os.path.join(args.out, stamp)
     os.makedirs(out_dir, exist_ok=True)
 
-    limits = robot.joint_limits()
+    limits = sanitize_limits(robot.joint_limits())
     home = read_angles(robot)
     info = {"timestamp": stamp, "dry_run": args.dry_run, "robot": robot.info(), "home_angles_deg": home,
             "joint_limits": limits, "joint_limits_source": "robot" if all(limits) else "partly missing, fallback used",
@@ -500,7 +523,7 @@ def main():
 
     safe_joints = []
     for j in joints:
-        lo, hi = limits[j] if limits[j] else FALLBACK_LIMITS
+        lo, hi = limits[j] if limits[j] else FALLBACK_LIMITS[j]
         if home[j] - amp - LIMIT_MARGIN >= lo and home[j] + amp + LIMIT_MARGIN <= hi:
             safe_joints.append(j)
         else:

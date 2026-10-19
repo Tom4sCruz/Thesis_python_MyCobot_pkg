@@ -1,0 +1,13 @@
+{
+  "note": "Starting points only. Check them against summary.json before using them in the simulator.",
+  "speed_setting_to_deg_per_s_mean": null,
+  "speed_setting_to_deg_per_s_peak": null,
+  "joint_limits_deg": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ]
+}

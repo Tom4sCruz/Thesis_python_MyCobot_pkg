@@ -1,0 +1,78 @@
+$ sudo python3 scripts/diag_port.py 
+serial port diagnostic -- /dev/ttyTHS1 @ 1000000  (2026-10-19 16:14:42)
+
+========================================================================
+[1] WHO HAS /dev/ttyTHS1 OPEN
+========================================================================
+  PID 10189  user er  started 2026-10-19 15:31:57  (systemd unit: shared-growth-workstation.service)
+      cmd:    /home/er/shared-growth/.venv/bin/python scripts/robot_interaction_workstation.py --host 127.0.0.1 --port 8766 --backend hardware --physical-preflight-pass --...
+      parent: PID 1  /sbin/init 2
+  $ fuser -v /dev/ttyTHS1
+    10189                     USER        PID ACCESS COMMAND
+    /dev/ttyTHS1:        er        F.... python
+  $ lsof /dev/ttyTHS1
+    COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+    python  10189   er    4u   CHR  238,1      0t0 2360 /dev/ttyTHS1
+    lsof: WARNING: can't stat() fuse.gvfsd-fuse file system /run/user/1001/gvfs
+          Output information may be incomplete.
+    lsof: WARNING: can't stat() fuse file system /run/user/1001/doc
+          Output information may be incomplete.
+--> FAIL: 1 other process(es) have /dev/ttyTHS1 open -- see above
+
+========================================================================
+[2] WHAT STARTS AT BOOT
+========================================================================
+  running services that look related:
+    serial-getty@ttyGS0.service
+    serial-getty@ttyS0.service
+    ssh.service
+  nvgetty.service                  enabled=enabled    active=inactive
+  serial-getty@ttyTHS1.service     enabled=disabled   active=inactive
+  ModemManager.service             enabled=enabled    active=active
+  recently changed unit files (last 14 days):
+    2026-10-06 14:01  /etc/systemd/system/shared-growth-workstation.service
+  @reboot / cron entries:
+    (none)
+  desktop autostart / rc.local / shell rc lines that start python or touch serial:
+    /home/er/.bashrc:61: if [ "$MYCOBOT_ROS_1_INIT" == "1" ]; then
+    /home/er/.bashrc:65: if [ "$MYCOBOT_ROS_2_INIT" == "1" ]; then
+    /home/er/.bashrc:70: PS1="(ros$ROS_VERSION $ROS_DISTRO py$ROS_PYTHON_VERSION)$PS1"
+--> WARN: things that start at boot and could open the port -- see above
+
+========================================================================
+[3] KERNEL CONSOLE ON THE PORT
+========================================================================
+  /proc/cmdline: tegraid=21.1.2.0.0 ddr_die=4096M@2048M section=512M memtype=0 vpr_resize usb_port_owner_info=0 lane_owner_info=0 emc_max_dvfs=0 touch_id=0@63 video=tegrafb no_console_suspend=1 console=ttyS0,115200n8 debug_uartport=lsport,4 earlyprintk=uart8250-32bit,0x70006000 maxcpus=4 usbcore.old_scheme_first=1 lp0_vec=0x1000@0xff780000 core_edp_mv=1075 core_edp_ma=4000 gpt tegra_fbmem=0x800000@0x92cb4000 is_hdmi_initialised=1  earlycon=uart8250,mmio32,0x70006000  root=/dev/mmcblk1p1 rw rootwait rootfstype=ext4 console=ttyS0,115200n8 console=tty0 fbcon=map:0 net.ifnames=0 sdhci_tegra.en_boot_part_access=1 quiet root=/dev/mmcblk1p1 rw rootwait rootfstype=ext4 console=ttyS0,115200n8 console=tty0 fbcon=map:0 net.ifnames=0 sdhci_tegra.en_boot_part_access=1
+--> PASS: no kernel console on ttyTHS1
+
+========================================================================
+[4] PASSIVE LISTEN
+========================================================================
+--> WARN: skipped -- the port is already held by another process (see [1])
+
+========================================================================
+[5] EXCLUSIVE OPEN
+========================================================================
+--> PASS: exclusive lock taken and released -- (only proves no OTHER locking user; non-locking ones show up in [1])
+
+========================================================================
+[7] ENVIRONMENT
+========================================================================
+  pymycobot NOT installed
+  user er, groups: adm, tty, uucp, dialout, cdrom, sudo, audio, dip, video, plugdev, i2c, lpadmin, gdm, lightdm, nopasswdlogin, docker, gpio, weston-launch, sambashare, jtop
+  /dev/ttyTHS1: crwxrwxrwx owner root group tty
+--> PASS: port exists
+
+========================================================================
+SUMMARY
+========================================================================
+  FAIL  1 other process(es) have /dev/ttyTHS1 open
+  WARN  things that start at boot and could open the port
+  PASS  no kernel console on ttyTHS1
+  WARN  skipped -- the port is already held by another process (see [1])
+  PASS  exclusive lock taken and released
+  PASS  port exists
+
+VERDICT: /dev/ttyTHS1 is held by PID 10189 (/home/er/shared-growth/.venv/bin/python scripts/robot_interaction_workstation.py --host 127.0.0.1 --port 8766 --backend hardware --physical-preflight-pass --...) -> stop it: sudo systemctl stop shared-growth-workstation.service   (and `sudo systemctl disable shared-growth-workstation.service` to stop it starting at boot)
+It is a shared robot -- check with whoever set that up before disabling it.
+

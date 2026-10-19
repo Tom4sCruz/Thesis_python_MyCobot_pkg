@@ -1526,7 +1526,7 @@ def main():
         global _TAPE
         print("\nrehearsing the whole run on a simulated arm (nothing moves yet)...")
         t_rehearse = time.perf_counter()
-        sim = Arm(mock=True)
+        sim = Arm(mock=True, quiet_mock=True)          # the rehearsal arm -- no MOCK warning
         sim.conn.raw.set_angles_directly([float(v) for v in HOME])
         _TAPE = []
         try:

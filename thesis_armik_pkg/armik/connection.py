@@ -22,14 +22,22 @@ Everything that touches the serial port goes through here, for three reasons:
    (config.MIN_COMMAND_GAP_S) so the next command -- from any thread -- never
    lands while the firmware is still busy with it. See the notes in config.py.
 
+5. A SECOND process on the same serial port eats the firmware's replies and
+   interleaves its own traffic with the setpoint stream -- reads fail ("could
+   not read joint angles"), streamed moves stutter. So before opening a real
+   port, ArmConnection checks that no other process has it open and refuses,
+   naming that process (see _port_users; scripts/diag_port.py digs deeper).
+
 Anything this module does not wrap is still reachable through `.raw`, which is
 the live pymycobot object, under the same lock.
 """
 
 from __future__ import annotations
 
+import glob
 import inspect
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -44,6 +52,40 @@ log = logging.getLogger(__name__)
 
 class ArmError(RuntimeError):
     pass
+
+
+def _port_users(port: str) -> list[tuple[int, str]]:
+    """(pid, command line) of every OTHER process with `port` open, found by
+    scanning /proc/<pid>/fd. Processes we may not inspect (other users', unless
+    root) are skipped, so an empty list is "none visible", not a guarantee.
+    Linux only; anywhere else it returns []."""
+    try:
+        target = os.path.realpath(port)
+    except OSError:
+        return []
+    me, found = os.getpid(), []
+    for d in glob.glob("/proc/[0-9]*"):
+        pid = int(os.path.basename(d))
+        if pid == me:
+            continue
+        try:
+            fds = os.listdir(f"{d}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.path.realpath(os.readlink(f"{d}/fd/{fd}")) != target:
+                    continue
+            except OSError:
+                continue
+            try:
+                with open(f"{d}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+            except OSError:
+                cmd = "?"
+            found.append((pid, cmd or "?"))
+            break
+    return found
 
 
 @dataclass
@@ -76,7 +118,11 @@ class ArmConnection:
         port: str = config.DEFAULT_PORT,
         baudrate: int = config.DEFAULT_BAUDRATE,
         mock: bool = False,
+        quiet_mock: bool = False,
     ):
+        """quiet_mock: with mock=True, log the mock notice at INFO instead of
+        WARNING -- for an internal simulated arm (a profile's rehearsal) that
+        runs alongside a real one, where the warning would be misleading."""
         self._lock = threading.RLock()
         self.mock = mock
         self._single_joint = 0
@@ -84,7 +130,10 @@ class ArmConnection:
         if mock:
             from .mock import MockMyCobot
             self._mc = MockMyCobot()
-            log.warning("ArmConnection is in MOCK mode -- no hardware will move.")
+            if quiet_mock:
+                log.info("simulated arm (rehearsal) -- no hardware involved.")
+            else:
+                log.warning("ArmConnection is in MOCK mode -- no hardware will move.")
         else:
             try:
                 from pymycobot import MyCobot280
@@ -96,6 +145,13 @@ class ArmConnection:
                         "pymycobot is not installed. `pip install pymycobot`, or "
                         "construct ArmConnection(mock=True) to work offline."
                     ) from exc
+            others = _port_users(port)
+            if others:
+                who = "; ".join(f"PID {pid}: {cmd[:120]}" for pid, cmd in others)
+                raise ArmError(
+                    f"{port} is already open by another process ({who}). It would eat the "
+                    f"arm's replies and break up the setpoint stream -- stop it first "
+                    f"(`sudo python3 scripts/diag_port.py` shows how it was started).")
             self._mc = MyCobot280(port, baudrate)
             time.sleep(0.1)
 

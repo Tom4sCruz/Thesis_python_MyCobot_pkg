@@ -121,8 +121,9 @@ class Arm:
         mock: bool = False,
         control_rate_hz: float | None = None,
         connection: ArmConnection | None = None,
+        quiet_mock: bool = False,
     ):
-        self.conn = connection or ArmConnection(port, baudrate, mock=mock)
+        self.conn = connection or ArmConnection(port, baudrate, mock=mock, quiet_mock=quiet_mock)
         self.control_rate_hz = float(control_rate_hz or config.CONTROL_RATE_HZ)
         self.last_plan: Plan | None = None
         self.last_execution: Execution | None = None

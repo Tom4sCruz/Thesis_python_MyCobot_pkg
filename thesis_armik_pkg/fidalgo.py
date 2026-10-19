@@ -303,7 +303,11 @@ def analyze_step(ts, ys, y0, target):
     final = statistics.median(tail)
     delta = final - y0
     commanded = target - y0
-    if abs(delta) < 0.3 * abs(commanded):
+    if abs(commanded) < 0.5:
+        # already at the target (e.g. the "down" step after an "up" step that did not move)
+        return {"ok": False, "reason": "nothing_to_move", "commanded_deg": round(commanded, 2),
+                "moved_deg": round(delta, 2)}
+    if abs(delta) < max(0.3 * abs(commanded), 0.2):   # never lets delta be ~0 below
         return {"ok": False, "reason": "little_or_no_motion", "moved_deg": round(delta, 2)}
     settled = (max(tail) - min(tail)) < 1.0 and abs(final - target) < 2.0
     t05, t10, t90 = (crossing(ts, ys, y0, delta, f) for f in (0.05, 0.10, 0.90))

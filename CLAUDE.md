@@ -72,6 +72,7 @@ Current family, by choreography:
 - `HighH-LowR.py` — randomized parabolic arcs, jittered apex/position, random pick order, scripted "recoil" nudge.
 - `HighH-LowR_v2.py` — same arcs, J6 hard-frozen at HOME for the whole run.
 - `HighH-HighR.py` — deterministic clone of `HighH-LowR.py`: fixed apex (`APEX_Z_CM`), constant tip speed, no randomness — same every run.
+- `LowH-LowR_v2.py` — "animal" profile built on `HighH-LowR.py`: gripper shut the whole run, used as a beak to push each cube in a straight line to its target, with random pull-back "adjustments" mid-push (`ADJUST_*`); ends looking straight ahead (no nod).
 
 Shared dials worth knowing: `NUDGE_CYCLE` (which "reach" cycle triggers a scripted interruption; `-1` disables) appears in every profile script; `STUTTER_TYPE` lives centrally in `armik/config.py` rather than per-script.
 

@@ -24,8 +24,10 @@ TEST of HighH-LowR.py with the GRIPPER MOVING WHILE THE ARM MOVES:
     (NUDGE_LOOK_SPEED_DPS);
   * on the nudge the gripper shuts to GRIP_LOOK_DEG during the recoil and
     reopens as the arm reaches for the moved cube;
-  * Phase 1 looks at the cubes' average, the targets' average, then straight
-    at the first cube.
+  * Phase 1 looks at the cubes (straight at the first one) and then reaches
+    for it right away.
+  * after the nudge recoil the head glances, confused, between the moved
+    cube and a point CONFUSED_OFFSET_CM beside it (CONFUSED_* constants).
 arm.move_joints() / arm.send_path() only return once the motion is over (they
 stream setpoints in a loop), so a gripper call written after them runs too
 late. Here the gripper command is sent from a short background thread while
@@ -41,13 +43,12 @@ gripper can turn to look at cubes and target positions. A look is a wrist-only
 head turn (J4/J5, see _gaze.wrist_look_angles); the tip swings a little.
 
 PHASE 1 -- look around
-    From HOME the arm goes to the configuration and looks at the cubes (their
-    average position), then at the target positions (their average); the
-    next look is straight at the first cube (Phase 2, step 1).
+    From HOME the arm goes to the configuration and looks at the cubes
+    (straight at the first one to grab), then reaches for it straight away.
 
 PHASE 2 -- one cycle per cube
     1. at the configuration, the head swings to look at the cube it is about
-       to grab;
+       to grab (skipped for the first cube -- Phase 1 already looked);
     2. it reaches the cube and carries it to its target in parabolic arcs,
        gazing at where it is going and turning the gripper straight down just
        before it arrives (GAZE_EASE_IN_S / GAZE_EASE_OUT_S, as in
@@ -55,8 +56,9 @@ PHASE 2 -- one cycle per cube
     3. it returns to the configuration while LOOKING BACK at the target
        position it just left -- then step 1 again for the next cube.
     One cube is NUDGED mid-run (scripted, no sensors): as the arm nears it the
-    arm RECOILS, waits for the cube to "settle", then grabs it at its new
-    position.
+    arm RECOILS, glances back and forth between the moved cube and a point
+    beside it (confused), waits for the cube to "settle", then grabs it at
+    its new position.
 
 PHASE 3 -- success nod
     After the last cube's return, the head turns straight ahead
@@ -188,7 +190,7 @@ RETURN_SPEED_DPS = 40.0          # average speed of the return (largest joint tr
 RETURN_EASE_IN = 2.0             # [0,10]
 RETURN_EASE_OUT = 4.0            # [0,10]
 RETURN_WAYPOINTS = 30            # samples along the return
-NEXT_LOOK_START_FRAC = 0.9       # fraction of a return's PATH after which the head stops
+NEXT_LOOK_START_FRAC = 0.8       # fraction of a return's PATH after which the head stops
                                  # looking back at the target and turns to the NEXT CUBE. The
                                  # turn runs on its own clock (HEAD_SWING_SPEED_DPS / ease): it
                                  # may finish before the arm reaches the configuration or carry
@@ -226,7 +228,7 @@ ARC_TIME_EQUALIZATION = 0.5   # 0..1: blends each reach/carry arc's own duration
                               # never pushed faster than the already-smooth cruise speed.
 EASE_IN = 4.0                    # [0,10] start-of-move acceleration shape. 0 = abrupt,
 EASE_OUT = 5.0                   # [0,10] end-of-move deceleration shape.  10 = long, gentle S
-PATH_WAYPOINTS = 60              # samples per arc
+PATH_WAYPOINTS = 80              # samples per arc
 MIN_SEGMENT_S = 0.02
 
 # -- per-move variation ("never the same twice") -----------------------------
@@ -236,7 +238,10 @@ BOW_JITTER_CM = 0.0             # +/- sideways bow, perpendicular to the chord
 EASE_JITTER = 0.0              # +/- on EASE_IN / EASE_OUT per move
 
 # -- order ------------------------------------------------------------------------
-SHUFFLE_ORDER = False #True             # grab cubes in a random order (init<->target pairing kept)
+SHUFFLE = True #False
+SHUFFLE_ORDER = [2,0,1]             # grab cubes in a random order (init<->target pairing kept)
+SHUFFLE_TARGET = True #False
+SHUFFLE_TARGET_ORDER = [1,2,0]      # i-th cube placed goes to CUBES_TARGET_POINTS[this[i]]
 
 # -- scripted nudge / flinch ------------------------------------------------------
 NUDGE_ENABLED = True             # True enables the scripted nudge (fires on NUDGED_CUBE's
@@ -246,7 +251,8 @@ NUDGED_CUBE = 1                  # 0, 1, or 2 -- which CUBES_INITIAL_POINTS cube
                                  # yellow RViz preview cube
 NUDGE_OFFSET_CM = (4.0, 0.0, 0.0)   # where the nudged cube ends up (relative to its point)
 NUDGE_AT_FRACTION = 0.8         # fraction of the reach arc completed before the recoil
-NUDGE_RECOIL_CM = 4.0           # how far the arm hops back
+NUDGE_RECOIL_CM = 6.0           # how far the arm hops back (along its approach direction)
+NUDGE_RECOIL_LIFT_CM = 2.0      # ... and how far it rises while doing so
 NUDGE_RECOIL_ARC_HEIGHT_CM = 0.0   # recoil path's apex above its own chord -- small, so
                                  # it reads as a fast near-straight hop, not a lofted arc
 NUDGE_RECOIL_EASE_IN = 0.0     # [0,10] recoil-specific ease-in (see EASE_IN doc) -- low, so
@@ -258,33 +264,58 @@ NUDGE_RECOIL_WAYPOINTS = 20     # fewer than PATH_WAYPOINTS -- get_durations flo
                               # cruise speed, so the recoil's short hop needs far fewer
                               # segments than a full reach/carry arc to actually reach
                               # NUDGE_RECOIL_SPEED_CM_S instead of being floored near it
-NUDGE_RECOIL_SPEED_CM_S = 25.0  # the recoil is fast
+NUDGE_RECOIL_SPEED_CM_S = 30.0  # the recoil is fast
 POST_NUDGE_ARC_HEIGHT_CM = 2.0   # re-approach-to-the-moved-cube arc's apex above its own
                                 # chord -- bypasses _arc_height()'s shared-parabola floor
                                 # (MIN_ARC_HEIGHT_CM) so this short hop stays a gentle curve
                                 # toward the cube instead of a full lift-and-descend peak
-POST_NUDGE_SPEED_CM_S = 12.0    # re-approach cruise speed -- its own dial, independent of
+POST_NUDGE_SPEED_CM_S = 9.0    # re-approach cruise speed -- its own dial, independent of
                                 # CRUISE_SPEED_CM_S / ARC_TIME_EQUALIZATION (which every
                                 # normal arc uses), so it can be tuned without also
                                 # speeding up the rest of the run
-POST_NUDGE_WAYPOINTS = 10       # fewer than PATH_WAYPOINTS -- same reasoning as
+POST_NUDGE_WAYPOINTS = 20       # fewer than PATH_WAYPOINTS -- same reasoning as
                                 # NUDGE_RECOIL_WAYPOINTS: get_durations floors a move's total
                                 # time at (n_waypoints-1)*MIN_SEGMENT_S regardless of cruise
                                 # speed, so this short re-approach needs far fewer segments
                                 # than a full reach/carry arc to actually reach
                                 # POST_NUDGE_SPEED_CM_S instead of being floored well below it
+POST_NUDGE_OPEN_START_FRAC = 0.5  # fraction of the re-approach PATH to the moved cube after
+                                  # which the gripper starts to open (distrust: it stays as it
+                                  # is until then); 0 = open right away, 1 = only once there
+POST_NUDGE_OPEN_SPEED = 1      # gripper speed (0..100, as GRIP_SPEED) for that opening only
 NUDGE_RECOIL_JERK = 0.0        # brief arm.jerk on the recoil for a startled look (0 = clean)
 NUDGE_LOOK_SPEED_DPS = 80.0    # the head starts turning to the cube's NEW position the moment
                                # the recoil starts; this is how fast it turns (largest wrist
                                # travel / time, eased by HEAD_SWING_EASE_IN / OUT). The turn
                                # runs alongside the recoil on its own clock: it may finish
                                # before the hop back does, or just after it
-NUDGE_SETTLE_S = 1.5           # pause after the recoil, "waiting for the cube to stop"
+NUDGE_SETTLE_S = 1.5           # pause after the confused glances, "waiting for the cube to stop"
+
+# -- confused glances after the recoil ---------------------------------------------
+# Once the recoil is over (the head already looking at the moved cube), the head
+# glances back and forth between the moved cube and a point CONFUSED_OFFSET_CM
+# beside it -- wrist only (J4/J5), the arm stays where the recoil left it.
+CONFUSED_ENABLED = True
+CONFUSED_OFFSET_CM = (10.0, 0.0, 0.0)   # the "other" point, relative to the moved cube
+CONFUSED_GLANCE_COUNT = 4      # head swings in the main sequence; each cube -> other or
+                               # other -> cube swing counts as one (4: other, cube, other, cube)
+CONFUSED_START_DELAY_S = 0.5   # pause after the recoil ends, before the first glance
+CONFUSED_REPEAT_ENABLED = True # after a pause, one more glance: other, then back to the cube
+CONFUSED_REPEAT_DELAY_S = 0.5  # the pause before that last glance
+CONFUSED_SPEED_DPS = 70.0      # average speed of a glance (largest wrist travel / time)
+CONFUSED_EASE_IN = 2.0         # [0,10] acceleration into each glance -- see EASE_IN's doc
+CONFUSED_EASE_OUT = 2.0        # [0,10] deceleration out of each glance
+CONFUSED_WAYPOINTS = 20        # samples per glance
+CONFUSED_HOLD_S = 0.2         # beat held at the end of each glance
 
 # where the nudged cube visually ends up -- always fed to RvizBridge as the yellow
 # preview cube, independent of whether nudging is enabled this run
 NUDGE_CUBE_PREVIEW_CM = tuple(
     float(c + o) for c, o in zip(CUBES_INITIAL_POINTS[NUDGED_CUBE], NUDGE_OFFSET_CM)
+)
+# the "other" point the confused glances go to -- drawn in RViz as a small red sphere
+CONFUSED_LOOK_POINT_CM = tuple(
+    float(c + o) for c, o in zip(NUDGE_CUBE_PREVIEW_CM, CONFUSED_OFFSET_CM)
 )
 
 # -- success animation: a head NOD (Phase 3) ---------------------------------
@@ -294,9 +325,9 @@ NOD_ENABLED = True
 NOD_WRIST_J456_DEG = [50.0, 0.0, 0.0]   # wrist pose the nod is centred on. With the default
                                         # configuration J4 = +90 points the gripper straight
                                         # ahead (+X)
-NOD_SPEED_DPS = 80.0          # AVERAGE J4 speed of each stroke, deg/s (peak is higher
+NOD_SPEED_DPS = 90.0          # AVERAGE J4 speed of each stroke, deg/s (peak is higher
                               # with strong ease)
-NOD_EASE_IN = 3.0             # [0,10] acceleration into each stroke -- see EASE_IN's doc above
+NOD_EASE_IN = 2.0             # [0,10] acceleration into each stroke -- see EASE_IN's doc above
 NOD_EASE_OUT = 1.0            # [0,10] deceleration out of each stroke -- see EASE_OUT's doc above
 NOD_START_DIRECTION = 1      # +1 = the first nod goes UP, -1 = it goes DOWN
 NOD_UP_COUNT = 4              # number of up nods
@@ -593,9 +624,10 @@ class _GripTimer(threading.Thread):
     setpoints. finish() -- called when the stream is over -- sends at once if
     the delay has not elapsed yet, so the command is never lost."""
 
-    def __init__(self, arm, deg, delay_s, label):
+    def __init__(self, arm, deg, delay_s, label, speed=None):
         super().__init__(daemon=True)
         self.arm, self.deg, self.delay_s, self.label = arm, float(deg), float(delay_s), label
+        self.speed = GRIP_SPEED if speed is None else speed
         self._now = threading.Event()
 
     def run(self):
@@ -604,7 +636,7 @@ class _GripTimer(threading.Thread):
         for i in range(max(int(GRIP_MOVING_REPEATS), 1)):
             if i:
                 time.sleep(GRIP_MOVING_REPEAT_GAP_S)
-            self.arm.send_gripper(self.deg, speed=GRIP_SPEED)
+            self.arm.send_gripper(self.deg, speed=self.speed)
 
     def finish(self):
         self._now.set()
@@ -746,17 +778,29 @@ def _plan_arc(arm, pts, durs, label, gaze_target=None):
     return pl
 
 
-def _send_arc(arm, pts, durs, label, gaze_target=None, grip=None):
+def _send_arc(arm, pts, durs, label, gaze_target=None, grip=None, grip_at_frac=None):
     """Parabolic move: _plan_arc(), then hand the Plan to _do_plan(), so the
     same code serves the rehearsal (record) and a live move (execute).
-    grip: optional (deg, delay_s, label) gripper command fired while the arc
-    runs. Returns bool."""
+    grip: optional (deg, delay_s, label[, speed]) gripper command fired while
+    the arc runs. grip_at_frac: if given, the command fires once that fraction
+    of the arc's PATH is covered instead of after delay_s (the waypoints are
+    evenly spaced along the path, so it is read off `durs`, scaled to the
+    planned duration). Returns bool."""
     if len(pts) < 2:
         _say(f"  {label}: negligible, skipped")
         return True
     pl = _plan_arc(arm, pts, durs, label, gaze_target)
     if pl is None:
         return False
+    if grip is not None and grip_at_frac is not None:
+        cum = np.concatenate([[0.0], np.cumsum(np.asarray(durs, dtype=float))])
+        frac = float(np.clip(grip_at_frac, 0.0, 1.0))
+        t_share = float(np.interp(frac * (len(cum) - 1), np.arange(len(cum)), cum)) / max(cum[-1], 1e-9)
+        t_open = t_share * float(pl.duration_s)
+        grip = (grip[0], t_open) + tuple(grip[2:])
+        _say(f"  {label}: gripper -> {grip[0]:.0f} deg at {frac * 100:.0f}% of the way "
+             f"(t = {t_open:.2f} of {pl.duration_s:.2f} s"
+             + (f", speed {grip[3]}" if len(grip) > 3 else "") + ")")
     ex = _do_plan(arm, pl, grip)
     arm.last_execution = ex
     if not ex.ok:
@@ -895,11 +939,12 @@ def _swing_head(arm, target, label):
     return True
 
 
-def _phase_look_around(arm):
+def _phase_look_around(arm, first_cube):
     """Phase 1: FIRST get to the look configuration (J1..J3 only, the wrist
-    stays gripper-down), and only then look at the cubes (their average
-    position) and the target positions (their average). The look that follows
-    is the first cycle's own, straight at the first cube."""
+    stays gripper-down), and only then look at the cubes -- straight at
+    `first_cube`, the one about to be grabbed. The first reach follows right
+    away from that look. (Aiming at the cubes' average instead leaves the tip
+    where the first reach arc is not solvable.)"""
     q_now = np.asarray(arm.get_angles(), dtype=float)
     q_cfg = q_now.copy()
     q_cfg[:3] = LOOK_CONFIG_J123_DEG
@@ -909,13 +954,7 @@ def _phase_look_around(arm):
     _say("  at the look configuration")
     _pause(LOOK_PAUSE_S)
 
-    cubes = tuple(float(v) for v in np.mean(np.asarray(CUBES_INITIAL_POINTS, float), axis=0))
-    targets = tuple(float(v) for v in np.mean(np.asarray(CUBES_TARGET_POINTS, float), axis=0))
-    for target, label in ((cubes, "look at the cubes"),
-                          (targets, "look at the targets")):
-        if not _swing_head(arm, target, label):
-            return False
-    return True
+    return _swing_head(arm, first_cube, "look at the cubes (first cube)")
 
 
 def _return_looking_back(arm, target, next_wrist=None, start_frac=1.0, next_name="next pose"):
@@ -1036,6 +1075,47 @@ def _play_nod(arm):
     return True
 
 
+def _confused_glances(arm, cube):
+    """After the recoil: the head (J4/J5 only, the arm holds still) glances
+    between `cube` and a point CONFUSED_OFFSET_CM beside it --
+    a CONFUSED_START_DELAY_S beat, CONFUSED_GLANCE_COUNT swings starting
+    toward the other point, then
+    (CONFUSED_REPEAT_ENABLED) a CONFUSED_REPEAT_DELAY_S pause and one more
+    other -> cube glance. A pose the head cannot aim from here skips the
+    glances (with a message) rather than failing the run. Returns bool."""
+    if not (GAZE_ENABLED and CONFUSED_ENABLED):
+        return True
+    other = tuple(float(c + o) for c, o in zip(cube, CONFUSED_OFFSET_CM))
+    q_here = arm.get_angles()
+    q_cube, _e1 = wrist_look_angles(q_here, cube, LOOK_MIN_TIP_Z_CM)
+    q_other, _e2 = wrist_look_angles(q_here, other, LOOK_MIN_TIP_Z_CM)
+    if q_cube is None or q_other is None:
+        _say(f"  confused glances skipped -- no head pose looks at "
+             f"{'the cube' if q_cube is None else tuple(round(v, 1) for v in other)} from here")
+        return True
+
+    n = max(int(CONFUSED_GLANCE_COUNT), 0)
+    seq = [q_other if i % 2 == 0 else q_cube for i in range(n)]
+    if CONFUSED_REPEAT_ENABLED:
+        seq += [None, q_other, q_cube]                  # None = the pause
+    _say(f"  confused: glancing between the cube and {tuple(round(v, 1) for v in other)} "
+         f"({n} glances" + (", then one more after a pause" if CONFUSED_REPEAT_ENABLED else "")
+         + f"; aim error {_e1:.1f} / {_e2:.1f} deg, J4/J5 swing "
+         f"{abs(q_other[3] - q_cube[3]):.0f} / {abs(q_other[4] - q_cube[4]):.0f} deg)")
+    _pause(CONFUSED_START_DELAY_S)
+    for q_goal in seq:
+        if q_goal is None:
+            _pause(CONFUSED_REPEAT_DELAY_S)
+            continue
+        q_now = arm.get_angles()
+        if not _eased_joint_move(arm, _line_to(q_now, q_goal, CONFUSED_WAYPOINTS),
+                                 CONFUSED_SPEED_DPS, CONFUSED_EASE_IN, CONFUSED_EASE_OUT,
+                                 "  confused glance"):
+            return False
+        _pause(CONFUSED_HOLD_S)
+    return True
+
+
 def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, cruise_dur_max,
               grip=None):
     """Scripted flinch: approach part-way, recoil, wait, re-approach the moved cube."""
@@ -1052,7 +1132,7 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, cr
     dirn = travel / (np.linalg.norm(travel) + 1e-9)
     recoil = tuple(float(v) for v in (
         np.asarray(here, float) - dirn * NUDGE_RECOIL_CM
-        + np.array([0.0, 0.0, NUDGE_RECOIL_CM * 0.5])
+        + np.array([0.0, 0.0, NUDGE_RECOIL_LIFT_CM])
     ))
 
     _say(f"  RECOIL -> {tuple(round(v, 1) for v in recoil)}")
@@ -1109,6 +1189,9 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, cr
     else:
         _say(f"  recoil {rec_t[-1]:.2f} s (no look)")
 
+    if not _confused_glances(arm, new_cube):
+        return False
+
     _say(f"  waiting {NUDGE_SETTLE_S:.1f}s for the cube to settle ...")
     _pause(NUDGE_SETTLE_S)
 
@@ -1118,9 +1201,11 @@ def run_nudge(arm, seg, pts, durs, rng, ci, segments, paths, all_durs, d_max, cr
     p2 = get_path(after, new_cube, h2, rng, n_waypoints=POST_NUDGE_WAYPOINTS)
     d2 = get_durations(after, new_cube, h2, EASE_IN, EASE_OUT,
                        cruise=POST_NUDGE_SPEED_CM_S, n_waypoints=POST_NUDGE_WAYPOINTS)
-    # ... and reopens as it reaches for the moved cube
+    # ... and only reopens once POST_NUDGE_OPEN_START_FRAC of the way there --
+    # it does not quite trust the moved cube
     if not _send_arc(arm, p2, d2, "  nudge re-approach", gaze_target=new_cube,
-                     grip=(GRIP_OPEN_DEG, GRIP_OPEN_DELAY_S, "open")):
+                     grip=(GRIP_OPEN_DEG, 0.0, "open", POST_NUDGE_OPEN_SPEED),
+                     grip_at_frac=POST_NUDGE_OPEN_START_FRAC):
         return False
 
     # the following carry cycle must start from where the cube actually is now
@@ -1179,9 +1264,7 @@ def preflight(arm, segments, paths):
 
     # every look must be possible from LOOK_CONFIG_J123_DEG with the wrist alone
     if GAZE_ENABLED:
-        looks = [("cubes avg", tuple(np.mean(np.asarray(CUBES_INITIAL_POINTS, float), axis=0))),
-                 ("targets avg", tuple(np.mean(np.asarray(CUBES_TARGET_POINTS, float), axis=0)))]
-        looks += [(f"init{i+1}", s) for i, s in enumerate(CUBES_INITIAL_POINTS)]
+        looks = [(f"init{i+1}", s) for i, s in enumerate(CUBES_INITIAL_POINTS)]
         looks += [(f"tgt{i+1}", t) for i, t in enumerate(CUBES_TARGET_POINTS)]
         q_cfg = list(LOOK_CONFIG_J123_DEG) + list(HOME[3:])
         bad_looks = 0
@@ -1203,17 +1286,19 @@ def preflight(arm, segments, paths):
 # MAIN
 # ===========================================================================
 
-def _build_segments(order, look_tip):
-    """Reach / carry pairs. Every reach starts from the look configuration
-    (nominally look_tip -- the real start depends on where the head points)."""
+def _build_segments(order, target_order, look_tip):
+    """Reach / carry pairs: the i-th cube picked, CUBES_INITIAL_POINTS[order[i]],
+    goes to CUBES_TARGET_POINTS[target_order[i]]. Every reach starts from the
+    look configuration (nominally look_tip -- the real start depends on where
+    the head points)."""
     segs = []
-    for k in order:
+    for k, t in zip(order, target_order):
         segs.append({"kind": "reach", "origin": look_tip,
                      "target": CUBES_INITIAL_POINTS[k], "k": int(k),
                      "gaze": CUBES_INITIAL_POINTS[k]})
         segs.append({"kind": "carry", "origin": CUBES_INITIAL_POINTS[k],
-                     "target": CUBES_TARGET_POINTS[k], "k": int(k),
-                     "gaze": CUBES_TARGET_POINTS[k]})
+                     "target": CUBES_TARGET_POINTS[t], "k": int(k),
+                     "gaze": CUBES_TARGET_POINTS[t]})
     return segs
 
 
@@ -1226,7 +1311,7 @@ def _choreography(arm, segments, paths, all_durs, d_max, cruise_dur_max, rng):
         return False
 
     _say("\n=== phase 1: looking around ===")
-    if not _phase_look_around(arm):
+    if not _phase_look_around(arm, segments[0]["target"]):
         return False
 
     for ci, seg in enumerate(segments):
@@ -1237,9 +1322,10 @@ def _choreography(arm, segments, paths, all_durs, d_max, cruise_dur_max, rng):
         _say(f"\n=== cycle {ci}/{N_CYCLES - 1}  {label}  "
               f"cube #{seg['k'] + 1}  -> {tuple(round(v, 1) for v in seg['target'])} ===")
 
-        # a reach starts by looking at the cube from the look configuration;
-        # either way the arc starts from wherever the tip actually is
-        if kind == "reach" and not _swing_head(arm, seg["target"], "look at the cube"):
+        # a reach starts by looking at the cube from the look configuration --
+        # except the very first, which leaves straight from Phase 1's look at
+        # the cubes; either way the arc starts from wherever the tip actually is
+        if kind == "reach" and ci > 0 and not _swing_head(arm, seg["target"], "look at the cube"):
             return False
         pts, durs = _arc_from(current_pos(arm), seg["target"], d_max, cruise_dur_max, rng)
         # the gripper opens WHILE the arm travels to the cube
@@ -1312,7 +1398,12 @@ def main():
 
     rng = np.random.default_rng(RANDOM_SEED)
     n = len(CUBES_INITIAL_POINTS)
-    order = list(rng.permutation(n)) if SHUFFLE_ORDER else list(range(n))
+    order = list(range(n)) if not SHUFFLE else SHUFFLE_ORDER
+    target_order = list(range(n)) if not SHUFFLE_TARGET else SHUFFLE_TARGET_ORDER
+    for name, lst in (("SHUFFLE_ORDER", order), ("SHUFFLE_TARGET_ORDER", target_order)):
+        if sorted(int(v) for v in lst) != list(range(n)):
+            print(f"{name} must list every index 0..{n - 1} exactly once, got {list(lst)}.")
+            return 1
 
     p_home = pose_coords(HOME)                       # mm/deg (Z_RELATIVE_TO_JOINT1 assumed False)
     home_tip = (p_home[0] / 10.0, p_home[1] / 10.0, p_home[2] / 10.0)
@@ -1321,6 +1412,7 @@ def main():
     _AZ_REF = (home_tip[0], home_tip[1])
 
     print(f"pick order (cube indices): {[int(k) for k in order]}")
+    print(f"target order (target indices, in placement order): {[int(t) for t in target_order]}")
     print(f"orientation lock: {ORIENT_LOCK}")
     if NUDGE_ENABLED:
         print(f"NUDGE enabled: cube #{NUDGED_CUBE + 1} "
@@ -1329,7 +1421,7 @@ def main():
 
     p_look = pose_coords(list(LOOK_CONFIG_J123_DEG) + list(HOME[3:]))
     look_tip = (p_look[0] / 10.0, p_look[1] / 10.0, p_look[2] / 10.0)
-    segments = _build_segments(order, look_tip)
+    segments = _build_segments(order, target_order, look_tip)
 
     # the widest move sets the shared parabola; every shorter arc lifts less
     d_max = max((_chord_len(s["origin"], s["target"]) for s in segments), default=1.0) or 1.0
@@ -1367,6 +1459,8 @@ def main():
         try:
             bridge = RvizBridge(arm.get_angles, path_xyz_cm=flat_path,
                                 cube_points=cube_pts, nudge_cube_point=NUDGE_CUBE_PREVIEW_CM,
+                                look_point=(CONFUSED_LOOK_POINT_CM
+                                            if NUDGE_ENABLED and CONFUSED_ENABLED else None),
                                 tip_source=arm.get_coords,
                                 gripper_source=arm.get_gripper_value)
             bridge.start()

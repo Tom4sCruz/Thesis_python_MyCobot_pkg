@@ -6,40 +6,48 @@ MOVEMENT PROFILE: Low-human / High-robot  (v2 -- reliable grab)
 Same idea as LowH-HighR.py -- move cubes from one side of the frame to the
 other like a classic industrial robot -- but with a grab that actually works:
 
-  * the HORIZONTAL transit between cubes turns only J1 (the base), with J6
-    counter-rotated by the same amount so the GRIPPER ALWAYS FACES THE SAME
-    ABSOLUTE DIRECTION -- J2..J5 never move during the transit;
-  * the VERTICAL grab / place is a COORDINATED multi-joint move that keeps the
-    end-effector pointing straight down the whole way, so the gripper descends
-    onto the cube instead of swiping sideways into it;
-  * per cube, both the reach and the carry run the SAME three steps:
-        coordinated lift to CARRY_HEIGHT_CM  ->  J1+J6 swing to the next
-        azimuth  ->  coordinated descent onto the cube / drop point.
-    Lifting first means a swing never drags the gripper along the table
+  * EVERY move is a straight line, end-effector held straight down with a
+    fixed world heading (PICK_ORIENTATION_DEG): per cube, both the reach and
+    the carry run the SAME three steps:
+        VERTICAL lift to CARRY_HEIGHT_CM  ->  HORIZONTAL straight line to
+        directly above the cube / drop point  ->  VERTICAL descent onto it.
+    The transit ends exactly above the target, so the gripper descends
+    perpendicular to the table onto the cube instead of swiping into it, and
+    lifting first means a transit never drags the gripper along the table
     after a release.
   * cubes grabbed in a fixed order (PICK_ORDER, left -> right), same trajectory
     every run, nothing randomised;
-  * one cube is NUDGED mid-run (scripted): the lift + horizontal swing happen
+  * one cube is NUDGED mid-run (scripted): the lift + horizontal transit happen
     as normal, then the arm STOPS mid-descent onto it (NUDGE_AT_FRACTION of
     the way down), holds for NUDGE_WAIT_S as if watching the cube move, then
     moves on to the NEXT cube instead -- the nudged cube's reach and carry
     are both skipped; it is left behind ("defective"). Fully scripted; the
     arm has no sensors.
-  * deliberate jerk is a STUTTER, as in LowH-HighR.py: every lift / swing /
-    descent (and each homing joint) stops and continues at random points --
+  * deliberate jerk is a STUTTER, as in LowH-HighR.py: every lift / transit /
+    descent / homing move stops and continues at random points --
     nothing else is perturbed. See the jerk constants; JERK = 0 turns it off.
-  * the END-of-run homing is ONE coordinated multi-joint move (like
-    HighH-LowR.py's), stuttering the same way; the start-of-run / abort homing
-    stays one joint at a time.
+  * the END-of-run homing is straight lines too: vertical lift ->
+    horizontal line to above HOME -> vertical to HOME's height -> a short
+    joint move onto HOME's exact angles, stuttering the same way, with a
+    PHASE_DELAY_S hold between the legs; the start-of-run / abort homing is
+    one coordinated joint move.
+  * the arm holds PHASE_DELAY_S at every hand-over between a vertical and a
+    horizontal leg: after each lift (before the traverse) and above every
+    cube / drop point (before the descent).
 
     python3 scripts/Profiles/LowH-HighR_v2.py --mock --yes      # no hardware
     python3 scripts/Profiles/LowH-HighR_v2.py --port /dev/ttyTHS1
 
-The J1+J6 swing uses arm.move_joints (streamed, so the two co-rotate and the
-heading stays fixed throughout). Each coordinated lift/descent temporarily drops
-to normal (blended, multi-joint) mode via arm.set_single_joint(0). The
-disabled-by-default nudge / trigger-box paths keep the original staccato
-behaviour.
+Every move is PRE-COMPUTED, as in HighH-LowR.py: the whole run is first
+rehearsed on a simulated arm, recording each finished plan (straight lines,
+IK-solved and speed-capped), gripper command and pause on a "tape"; the tape
+is then played back on the real arm with no planning between moves, so the
+only gaps left are the deliberate ones. Each straight lift / transit / descent
+is IK-solved finely and streamed one setpoint per control tick (arm._execute)
+at a CONSTANT tip
+speed (DESCENT_ / TRAVERSE_SPEED_CM_S), ramping in / out per MOVE_EASE_IN /
+MOVE_EASE_OUT (NUDGE_EASE_OUT for the nudge's interrupted descent); the
+start-of-run and abort homing stay live (one coordinated joint move).
 
 Everything you tune is a CONSTANT below. The cube coordinates and
 PICK_ORIENTATION_DEG are PLACEHOLDERS -- measure them on your arm first.
@@ -54,12 +62,13 @@ _sys.path.insert(
 )
 
 import argparse
-import threading
+import math
 import time
 
 import numpy as np
 
-from armik import Arm, ArmError, config, pose_coords
+from armik import Arm, Plan, config, ik, pose_coords
+from armik.kinematics import check_joint_limits, check_workspace_bounds
 
 # ===========================================================================
 # CONSTANTS
@@ -91,35 +100,47 @@ CUBES_TARGET_POINTS = [           # the drop row; cube picked k-th goes to slot 
 # gripper-straight-down, read arm.get_coords()[3:] (current TOOL frame).
 PICK_ORIENTATION_DEG = (180.0, 0.0, -45.0)
 
-APPROACH_HEIGHT_CM = 10.0          # hover height above a cube (preflight checks only)
-
-# -- robotic motion --------------------------------------------------------------
-JOINT_SPEED_DPS = 60.0           # fast, CONSTANT deg/s for the J1 swing + homing
-                                # (clamped per joint to config.MAX_JOINT_SPEED_DPS)
-SEG_PLAN_S = 4.0              # planning-only per-waypoint duration for send_path (nudge path)
-DELAY_BETWEEN_JOINTS_S = 0.0  # -> config.SINGLE_JOINT_DELAY            (armik default 0.15)
-DELAY_BETWEEN_POINTS_S = 0.00  # -> config.SINGLE_JOINT_DELAY_BETWEEN_POINTS (default 2.0!)
-HOME_MOVE_S = 2.5             # minimum duration of the final coordinated homing
+# -- homing ------------------------------------------------------------------------
+HOME_MOVE_S = 2.5             # minimum duration of a joint-space homing (start / abort, or the
+                              # final one if a straight leg is refused)
 HOME_RETURN_DPS = 35.0        # deg/s -- a long return gets proportionally MORE time
+HOME_SETTLE_MOVE_S = 0.4      # minimum duration of the last joint move onto HOME's exact
+                              # angles, after the straight-line homing legs
 
 # -- v2 coordinated grab/place -------------------------------------------------
-CARRY_HEIGHT_CM = 8.0         # height the end-effector is lifted/held at during the J1 transit --
-                              # was 12.0; matching HighH-LowR.py's wider cube row (now spanning
-                              # y=+-23, not +-19) made the widest swing (straight-line Cartesian,
-                              # full pose constrained) go unreachable partway through at 12.0 --
-                              # confirmed 10.0+ fails, 8.0 is comfortably reachable end to end
+CARRY_HEIGHT_CM = 8.0         # height the end-effector is lifted to / traverses at -- 10.0+ is
+                              # unreachable above the y=+-23 cubes; even 8.0 has the arm nearly
+                              # stretched there (see MAX_MOVE_JOINT_DPS)
 DESCENT_SPEED_CM_S = 8.0      # cm/s for the coordinated lift and grab/place descent
+TRAVERSE_SPEED_CM_S = 15.0    # cm/s for the straight carry-height transit between zones
+PHASE_DELAY_S = 0.0           # hold at every hand-over between a vertical and a horizontal leg:
+                              # lift -> traverse and traverse -> descent on every cube (incl. the
+                              # nudge), and between the legs of the final homing (lift / traverse
+                              # / up to HOME); 0 = no pause
+MOVE_EASE_IN = 1.0            # [0,10] acceleration at the start of EVERY straight lift / traverse /
+MOVE_EASE_OUT = 1.0           # descent / homing leg. 0 = no ramp at all (full speed at once /
+                              # dead stop), 10 = long gentle S. In between the tip cruises at a
+                              # CONSTANT speed -- DESCENT_ / TRAVERSE_SPEED_CM_S are that speed
+MOVE_MAX_ACCEL_CM_S2 = 60.0   # how hard the tip may speed up / slow down around a joint-limited
+                              # stretch (see MAX_MOVE_JOINT_DPS) -- it eases into the slow part
+                              # instead of braking at once
+MOVE_IK_STEP_CM = 0.1         # IK is solved this finely along every straight move -- near the
+                              # edge of reach (e.g. above the y=23 cube at CARRY_HEIGHT_CM) the
+                              # solver only converges in small steps; the setpoints themselves
+                              # are one per control tick, independent of this
+MAX_MOVE_JOINT_DPS = 160.0    # no straight lift / traverse / descent may need a joint faster than
+                              # this (the real J1..J3 servo limit, see config.py). Where a move
+                              # would, the tip slows down LOCALLY -- only over that stretch of
+                              # the line (near the edge of reach, e.g. above the y=+-23 cubes,
+                              # J3 needs up to ~45 deg per cm); everywhere else it cruises
 
 # -- jerk constants -------------------------------------------------------------
 # STOP-and-go only (config.STUTTER_TYPE = 0): JERK just ARMS it, its size does
 # nothing. Tune with the two counts below + config.JERK_SUBSTEP_DWELL_S (length
 # of each stop). JERK = 0 -> clean motion.
 JERK = 5.0
-TWITCH_FREQ = 0.0
-TWITCH_INTENSITY = 5.0
 
-config.JERK_SINGLE_JOINT_SUBSTEPS = 4   # stops per joint in the joint-by-joint homing (as LowH-HighR.py)
-config.JERK_STREAM_STOPS = 4            # stops per coordinated lift / swing / descent / final homing
+config.JERK_STREAM_STOPS = 4            # stops per lift / transit / descent / homing move
 
 # grab order -- deterministic. Arrange CUBES_INITIAL_POINTS left->right, or set
 # explicit indices here.
@@ -135,6 +156,9 @@ NUDGE_OFFSET_CM = (2.0, 0.0, 0.0)   # where the nudged cube ends up (narrative/
 NUDGE_AT_FRACTION = 0.65          # fraction of the vertical descent onto the cube
                                  # completed before the arm stops (0..1) -- mirrors
                                  # HighH-LowR.py's NUDGE_AT_FRACTION
+NUDGE_EASE_OUT = 0.0             # [0,10] ease-out of the partial descent onto the nudged cube
+                                 # (the lift / traverse before it use MOVE_EASE_*) -- 0 = it
+                                 # stops dead at NUDGE_AT_FRACTION, as if startled
 NUDGE_WAIT_S = 2.5               # how long the arm holds there before giving up on
                                  # this cube and moving on to the next one
 
@@ -153,31 +177,47 @@ GRIP_SETTLE_S = 0.35          # quiet time after a gripper command: it must LAND
 GRIP_MIN_GAP_S = 1.0         # hard floor -- pymycobot drops a gripper command with no quiet gap
 REACH_TOL_CM = 3.0            # has_reached_* tolerance, per axis
 
-# -- gripper trigger boxes (optional, experimental in single-joint mode) --------
-# [[(cx,cy,cz), (l,w,h), cycle_n], ...] -- on cycle cycle_n the gripper fires the
-# moment the tip enters this box (that cycle runs on a background thread, polled
-# live). Empty -> gripper fires at the cycle end. Single-joint timing is
-# unpredictable so the fire point is position-based, not time-based.
-TRIGGER_BOXES = []
-
 
 # ===========================================================================
 # GEOMETRY HELPERS
 # ===========================================================================
 
-def _approach(p):
-    return (p[0], p[1], p[2] + APPROACH_HEIGHT_CM)
+def _smootherstep(p):
+    """Min-jerk progress 0..1 -- the same profile Arm.move_joints uses."""
+    p = np.clip(p, 0.0, 1.0)
+    return 10 * p ** 3 - 15 * p ** 4 + 6 * p ** 5
 
 
-def get_path(origin_point, target_point):
-    """Straight waypoints for one move: traverse over the target, then descend
-    onto it. `origin_point` is unused. Kept for the nudge path + the RViz marker."""
-    return [tuple(map(float, _approach(target_point))), tuple(map(float, target_point))]
+def _ease_speed(ease_in, ease_out):
+    """The [0,10] ease dials (same as HighH-LowR.py's get_durations) as the
+    tip's NORMALISED speed (1 = cruise) against the fraction of the PATH
+    covered. Flat (= cruise) in the middle; a dial of exactly 0 means NO ramp
+    on that side -- full speed from the first tick / right up to the last one,
+    i.e. a dead stop."""
+    a = float(np.clip(ease_in, 0.0, 10.0)) / 10.0
+    b = float(np.clip(ease_out, 0.0, 10.0)) / 10.0
+    r_in = 0.0 if ease_in <= 0.0 else 0.05 + 0.45 * a
+    r_out = 0.0 if ease_out <= 0.0 else 0.05 + 0.45 * b
+    if r_in + r_out > 1.0:
+        k = 1.0 / (r_in + r_out)
+        r_in *= k
+        r_out *= k
 
+    tau = np.linspace(0.0, 1.0, 2001)
+    v = np.ones_like(tau)
+    if r_in > 0.0:
+        m_in = tau < r_in
+        p = tau[m_in] / r_in
+        v[m_in] = (1.0 - a) * p + a * _smootherstep(p)
+    if r_out > 0.0:
+        m_out = tau > 1.0 - r_out
+        q = (1.0 - tau[m_out]) / r_out
+        v[m_out] = (1.0 - b) * q + b * _smootherstep(q)
+    v = np.maximum(v, 1e-6)
 
-def get_durations(pts):
-    """Planning-only per-waypoint durations."""
-    return [SEG_PLAN_S] * len(pts)
+    s = np.concatenate([[0.0], np.cumsum(0.5 * (v[1:] + v[:-1]) * np.diff(tau))])
+    s_norm = s / s[-1]
+    return lambda f: np.interp(np.clip(f, 0.0, 1.0), s_norm, v)
 
 
 # ===========================================================================
@@ -193,25 +233,82 @@ def _within(xyz, centre, half_extents):
     return bool(np.all(d <= np.asarray(half_extents, float)))
 
 
-def is_in_trigger_box(end_effector_coords, cycle_n):
-    for entry in TRIGGER_BOXES:
-        centre, dims, cyc = entry
-        if cyc == cycle_n and _within(end_effector_coords, centre,
-                                      np.asarray(dims, float) / 2.0):
-            return True
-    return False
+# ===========================================================================
+# THE TAPE -- rehearse the whole run first, then play it back
+# ===========================================================================
+# As in HighH-LowR.py: planning a move (IK along every straight line) takes real
+# time on the Jetson, and doing it between moves left the arm standing still.
+# So the choreography runs TWICE:
+#   1. REHEARSAL on a second, simulated Arm(mock=True): nothing is streamed and
+#      nothing sleeps. Every action -- a finished Plan, a gripper command, a
+#      deliberate pause, a log line -- is appended to a list, the tape, and the
+#      simulated arm is put at the motion's end pose so the next step plans
+#      from the right place.
+#   2. PLAYBACK on the real arm: the tape is executed in order. No kinematics
+#      and no planning happen between motions, so the only gaps left are the
+#      deliberate ones (gripper waits, the nudge wait, the stutter-stops).
+# Every motion function reaches the arm only through _do_plan / _pause / _say /
+# _grip below, which record while _TAPE is a list and act when it is None.
+
+_TAPE = None
 
 
-def _has_trigger(cycle_n):
-    return any(cyc == cycle_n for _, _, cyc in TRIGGER_BOXES)
+def _say(text):
+    if _TAPE is not None:
+        _TAPE.append(("say", text))
+    else:
+        print(text)
 
 
-def has_reached_cube(end_effector_coords, cube_xyz):
-    return _within(end_effector_coords, cube_xyz, (REACH_TOL_CM,) * 3)
+def _pause(seconds):
+    if _TAPE is not None:
+        _TAPE.append(("pause", float(seconds)))
+    else:
+        time.sleep(seconds)
 
 
-def has_reached_target(end_effector_coords, target_xyz):
-    return _within(end_effector_coords, target_xyz, (REACH_TOL_CM,) * 3)
+def _do_plan(arm, plan):
+    """Execute a finished Plan -- or, in rehearsal, record it and move the
+    simulated arm to its end pose. Returns bool."""
+    if _TAPE is not None:
+        _TAPE.append(("plan", plan, arm.jerk))
+        arm.conn.raw.set_angles_directly([float(v) for v in plan.q_waypoints[-1]])
+        return True
+    ex = arm._execute(plan)
+    if not ex.ok:
+        print(f"  execution ABORTED -- {ex.error}")
+    return bool(ex.ok)
+
+
+def _play(arm, tape):
+    """Run a recorded tape on the real arm. Returns bool."""
+    for step in tape:
+        kind = step[0]
+        if kind == "say":
+            print(step[1])
+        elif kind == "pause":
+            time.sleep(step[1])
+        elif kind == "grip":
+            if not _fire_gripper(arm, step[1]):
+                print(f"  send_gripper REFUSED -- {arm.last_error}")
+                return False
+        elif kind == "plan":
+            _, plan, jerk = step
+            arm.jerk = jerk
+            ex = arm._execute(plan)
+            arm.last_plan, arm.last_execution = plan, ex
+            if not ex.ok:
+                print(f"  execution ABORTED -- {ex.error}")
+                return False
+            if ex.late_deadlines:
+                print(f"  !! {ex.late_deadlines} late control-loop deadline(s) during this move")
+        elif kind == "check":
+            _, what, target = step
+            cur = current_pos(arm)
+            if not _within(cur, target, (REACH_TOL_CM,) * 3):
+                print(f"  !! tip at {tuple(round(v, 2) for v in cur)}, expected "
+                      f"{tuple(round(v, 1) for v in target)} +/- {REACH_TOL_CM} cm ({what})")
+    return True
 
 
 # ===========================================================================
@@ -219,104 +316,188 @@ def has_reached_target(end_effector_coords, target_xyz):
 # ===========================================================================
 
 def go_home(arm):
-    """Robotic homing -- drive J1..J6 to their HOME values ONE AT A TIME."""
-    for j in range(1, config.DOF + 1):
-        tgt = float(HOME[j - 1])
-        cur = float(arm.get_angles()[j - 1])
-        if abs(tgt - cur) <= config.SINGLE_JOINT_TOL_DEG:
-            continue
-        try:
-            arm._drive_joint(j, tgt, JOINT_SPEED_DPS, "home")
-        except ArmError as exc:
-            print(f"  homing: J{j} would not move -- {exc}")
-            return
-        time.sleep(config.SINGLE_JOINT_DELAY)
-
-
-def go_home_coordinated(arm):
-    """End-of-run homing -- ONE coordinated multi-joint move (mirrors
-    HighH-LowR.py's go_home), duration scaled to the joint distance. Streamed,
-    so it stutters like the cube moves when jerk is armed
-    (config.JERK_STREAM_STOPS). Falls back to the joint-by-joint go_home() if
-    move_joints refuses."""
-    try:
-        dq = max(abs(a - b) for a, b in zip(arm.get_angles(), HOME))
-    except Exception:
-        dq = 0.0
+    """Homing -- ONE coordinated joint move to HOME, the duration scaled to the
+    joint distance (HOME_MOVE_S minimum, HOME_RETURN_DPS) so a long return is
+    not rushed; streamed, so it stutters like everything else. LIVE ONLY (the
+    start-of-run and the abort homing -- the end-of-run one is on the tape).
+    Returns bool."""
+    dq = max(abs(a - b) for a, b in zip(arm.get_angles(), HOME))
     dur = max(HOME_MOVE_S, dq / HOME_RETURN_DPS)
     if dur > HOME_MOVE_S + 0.05:
         print(f"  homing over {dur:.1f}s (joint travel {dq:.0f} deg)")
     if not arm.move_joints(HOME, duration=dur):
-        print(f"  homing REFUSED -- {arm.last_error}; homing one joint at a time")
-        go_home(arm)
-
-
-def _coord_move(arm, x, y, z, label, speed=None):
-    """One COORDINATED (multi-joint, blended) Cartesian move, end-effector held
-    at PICK_ORIENTATION_DEG. Temporarily leaves single-joint mode so the move
-    goes through armik's streamed executor. Treats 'already at' as success."""
-    rx, ry, rz = PICK_ORIENTATION_DEG
-    arm.set_single_joint(0)
-    try:
-        ok = arm.send_coords(x=float(x), y=float(y), z=float(z),
-                             rx=rx, ry=ry, rz=rz,
-                             speed=speed or DESCENT_SPEED_CM_S)
-    finally:
-        arm.set_single_joint(1)
-    if not ok:
-        if "already at" in (arm.last_error or "").lower():
-            return True
-        print(f"  {label}: send_coords REFUSED -- {arm.last_error}")
+        print(f"  homing REFUSED -- {arm.last_error}")
         return False
-    pl = arm.last_plan
-    if pl is not None:
-        print(f"  {label}: {pl.path_length_cm:.1f} cm, {pl.duration_s:.2f} s")
     return True
 
 
-def _swing(arm, target_xyz, label):
-    """Aim the arm at target_xyz's azimuth by rotating J1 and J6 only -- J1 to
-    the IK azimuth, J6 to the IK wrist angle that holds the gripper's world
-    heading (PICK_ORIENTATION_DEG is world-fixed, so the IK J6 counter-rotates
-    with J1). J2..J5 stay put; the coordinated descent fixes them. move_joints
-    runs the streamed executor, so J1 and J6 turn together and the heading stays
-    fixed throughout, not just at the ends."""
-    rx, ry, rz = PICK_ORIENTATION_DEG
-    tx, ty = float(target_xyz[0]), float(target_xyz[1])
-    pl = arm.plan_coords(x=tx, y=ty, z=CARRY_HEIGHT_CM, rx=rx, ry=ry, rz=rz,
-                         speed=config.DEFAULT_SPEED_CM_S)
-    if not pl.ok:
-        if "already at" in (pl.error or "").lower():
-            return True
-        print(f"  {label}: J1 plan REFUSED -- {pl.error}")
+def _home_tip():
+    """HOME's tip position (x, y, z) in cm -- gripper straight down there, the
+    same orientation as PICK_ORIENTATION_DEG."""
+    p = pose_coords(HOME)                        # mm/deg (Z_RELATIVE_TO_JOINT1 assumed False)
+    return (p[0] / 10.0, p[1] / 10.0, p[2] / 10.0)
+
+
+def _joint_move(arm, q_target, duration, label):
+    """Straight joint-space move over `duration` s, min-jerk -- built exactly
+    like Arm.move_joints, but handed to _do_plan so it can go on the tape."""
+    q0 = np.asarray(arm.get_angles(), dtype=float)
+    qT = np.asarray(q_target, dtype=float)
+    problems = check_joint_limits(qT)
+    if problems:
+        _say(f"  {label} REFUSED -- target violates joint limits: {'; '.join(problems)}")
         return False
-    q_cur = [float(v) for v in arm.get_angles()]
-    q_ik = [float(v) for v in pl.segment_q[-1]]
-    dj1 = q_ik[0] - q_cur[0]
-    dj6 = q_ik[5] - q_cur[5]
-    tol = config.SINGLE_JOINT_TOL_DEG
-    if abs(dj1) <= tol and abs(dj6) <= tol:
+    n = max(2, int(round(duration * config.CONTROL_RATE_HZ)) + 1)
+    s = _smootherstep(np.linspace(0.0, 1.0, n))
+    wps = q0[None, :] + (qT - q0)[None, :] * s[:, None]
+    return _do_plan(arm, Plan(ok=True, q_waypoints=wps, duration_s=float(duration)))
+
+
+def go_home_coordinated(arm):
+    """End-of-run homing in straight lines, like the cube moves: vertical lift
+    to CARRY_HEIGHT_CM -> horizontal line to above HOME's tip -> vertical move
+    to HOME's tip height -> a short joint move that lands exactly on HOME's
+    angles. Streamed, so it stutters like the cube moves when jerk is armed
+    (config.JERK_STREAM_STOPS). If any straight leg is refused it falls back to
+    one coordinated joint move. Returns bool."""
+    hx, hy, hz = _home_tip()
+    here = current_pos(arm)
+    straight = (_coord_move(arm, here[0], here[1], CARRY_HEIGHT_CM, "home: lift")
+                and _phase_pause()
+                and _traverse(arm, (hx, hy, hz), "home: traverse")
+                and _phase_pause()
+                and _coord_move(arm, hx, hy, hz, "home: to HOME height"))
+    if not straight:
+        _say("  straight-line homing refused -- finishing with one joint move")
+    dq = max(abs(a - b) for a, b in zip(arm.get_angles(), HOME))
+    if straight and dq <= config.SINGLE_JOINT_TOL_DEG:
         return True
-    q_target = list(q_cur)
-    q_target[0] = q_ik[0]
-    q_target[5] = q_ik[5]
-    dur = max(abs(dj1), abs(dj6)) / JOINT_SPEED_DPS
-    print(f"  {label}: J1 {q_cur[0]:.1f}->{q_ik[0]:.1f}, J6 {q_cur[5]:.1f}->{q_ik[5]:.1f} deg")
-    if not arm.move_joints(q_target, duration=max(dur, 0.1)):
-        print(f"  {label}: move_joints REFUSED -- {arm.last_error}")
+    # after the straight legs only an IK residual (~1 deg) is left: settle it
+    # quickly instead of over the full HOME_MOVE_S
+    dur = max(HOME_SETTLE_MOVE_S if straight else HOME_MOVE_S, dq / HOME_RETURN_DPS)
+    if dur > HOME_MOVE_S + 0.05:
+        _say(f"  homing over {dur:.1f}s (joint travel {dq:.0f} deg)")
+    return _joint_move(arm, HOME, dur, "homing")
+
+
+def _solve_line(q0, start, goal):
+    """Joint angles along the straight line start -> goal (cm), gripper at
+    PICK_ORIENTATION_DEG, IK-solved every MOVE_IK_STEP_CM and seeded from the
+    previous solution (one IK branch throughout). Returns (fractions, q_rows)
+    -- q_rows[0] is q0 -- or (None, reason)."""
+    L = float(np.linalg.norm(goal - start))
+    m = max(2, int(math.ceil(L / MOVE_IK_STEP_CM)) + 1)
+    fr = np.linspace(0.0, 1.0, m)
+    mask = np.ones(6, dtype=bool)
+    rows, seed = [np.asarray(q0, dtype=float)], np.asarray(q0, dtype=float)
+    for f in fr[1:]:
+        p = start + f * (goal - start)
+        why = check_workspace_bounds(p * 10.0)
+        if why:
+            return None, f"outside the workspace at {f * 100:.0f}% of the line ({why})"
+        desired = np.array([p[0] * 10.0, p[1] * 10.0, p[2] * 10.0, *PICK_ORIENTATION_DEG])
+        q = ik.try_solve(desired, mask, seed)
+        if q is None:
+            return None, f"unreachable along the straight line at {f * 100:.0f}%"
+        problems = check_joint_limits(q)
+        if problems:
+            return None, f"joint limits at {f * 100:.0f}% of the line: {'; '.join(problems)}"
+        rows.append(np.asarray(q, dtype=float))
+        seed = rows[-1]
+    return fr, np.vstack(rows)
+
+
+def _coord_move(arm, x, y, z, label, speed=None, ease_out=None):
+    """One COORDINATED (multi-joint) straight Cartesian move from the tip's
+    current position to (x, y, z), end-effector held at PICK_ORIENTATION_DEG,
+    handed to _do_plan (recorded in the rehearsal, streamed at playback).
+
+    The tip CRUISES at `speed` cm/s along the line, ramping in / out per
+    MOVE_EASE_IN / MOVE_EASE_OUT (ease_out overrides the latter for this move
+    -- the nudge's partial descent). The line is IK-solved finely
+    (_solve_line), then sampled ONE SETPOINT PER CONTROL TICK along the eased
+    progress. Wherever that would need a joint faster than MAX_MOVE_JOINT_DPS
+    (near the workspace edge a cm of tip travel costs many degrees) the tip
+    slows down over THAT stretch only, easing in and out of it at up to
+    MOVE_MAX_ACCEL_CM_S2 -- same straight path, cruise everywhere else."""
+    e_out = MOVE_EASE_OUT if ease_out is None else ease_out
+    start = np.asarray(current_pos(arm), dtype=float)
+    goal = np.array([float(x), float(y), float(z)])
+    L = float(np.linalg.norm(goal - start))
+    if L < 0.05:
+        return True
+    fr, rows = _solve_line(arm.get_angles(), start, goal)
+    if fr is None:
+        _say(f"  {label}: plan REFUSED -- {rows}")
         return False
+
+    cruise = float(speed or DESCENT_SPEED_CM_S)
+    # requested speed along the path: constant cruise with the ease ramps ...
+    v_req = cruise * _ease_speed(MOVE_EASE_IN, e_out)(fr)
+    # ... capped, point by point, at what keeps every joint under the limit
+    ds = np.diff(fr) * L
+    dq_ds = np.max(np.abs(np.diff(rows, axis=0)), axis=1) / np.maximum(ds, 1e-9)   # deg/cm
+    lim_seg = 0.97 * MAX_MOVE_JOINT_DPS / np.maximum(dq_ds, 1e-9)
+    v_lim = np.minimum(np.concatenate([lim_seg[:1], lim_seg]), np.concatenate([lim_seg, lim_seg[-1:]]))
+    for k in range(1, len(v_lim)):                     # ease into / out of a slow stretch
+        v_lim[k] = min(v_lim[k], math.sqrt(v_lim[k - 1] ** 2 + 2 * MOVE_MAX_ACCEL_CM_S2 * ds[k - 1]))
+    for k in range(len(v_lim) - 2, -1, -1):
+        v_lim[k] = min(v_lim[k], math.sqrt(v_lim[k + 1] ** 2 + 2 * MOVE_MAX_ACCEL_CM_S2 * ds[k]))
+    v = np.maximum(np.minimum(v_req, v_lim), 1e-3)
+    limited = v_lim < v_req - 1e-6
+
+    t_at = np.concatenate([[0.0], np.cumsum(2.0 * ds / (v[1:] + v[:-1]))])   # time at each IK row
+    T = float(t_at[-1])
+    for _ in range(4):              # rounding at the ticks -- stretch slightly if still over
+        n = max(1, int(math.ceil(T * config.CONTROL_RATE_HZ)))
+        t = np.linspace(0.0, T, n + 1)
+        u = np.interp(t * (t_at[-1] / T), t_at, fr)
+        q = np.column_stack([np.interp(u, fr, rows[:, j]) for j in range(rows.shape[1])])
+        q[0], q[-1] = rows[0], rows[-1]
+        peak = float(np.max(np.abs(np.diff(q, axis=0)) / np.diff(t)[:, None]))
+        if peak <= MAX_MOVE_JOINT_DPS + 1e-6:
+            break
+        T *= peak / (0.99 * MAX_MOVE_JOINT_DPS)
+    pl = Plan(ok=True, q_waypoints=q, timestamps=t, duration_s=float(T),
+              path_length_cm=L, peak_joint_dps=peak)
+    if not _do_plan(arm, pl):
+        return False
+    slow = (f", slowed near the arm's reach limit over {limited.mean() * 100:.0f}% of the path "
+            f"(min {v[limited].min():.1f} cm/s)" if limited.any() else "")
+    _say(f"  {label}: {L:.1f} cm, {T:.2f} s, cruise {cruise:.1f} cm/s{slow}, "
+         f"peak {peak:.0f} deg/s")
     return True
 
 
-def _lift_swing_descend(arm, target_xyz, label):
-    """v2 reach / carry: coordinated lift to CARRY_HEIGHT_CM -> J1 swing (with
-    J6 compensation) to target_xyz's azimuth -> coordinated descent onto
-    target_xyz, end-effector held straight down throughout."""
+def _phase_pause():
+    """The PHASE_DELAY_S hold between two legs (recorded on the tape).
+    Returns True so it can sit in an `and` chain of moves."""
+    if PHASE_DELAY_S > 0.0:
+        _pause(PHASE_DELAY_S)
+    return True
+
+
+def _traverse(arm, target_xyz, label):
+    """Carry-height transit: ONE straight Cartesian line at CARRY_HEIGHT_CM from
+    where the tip is to DIRECTLY ABOVE target_xyz, end-effector held at
+    PICK_ORIENTATION_DEG (world-fixed, so the gripper heading never changes).
+    Ending exactly above the target is what makes the following descent
+    vertical."""
+    return _coord_move(arm, target_xyz[0], target_xyz[1], CARRY_HEIGHT_CM, label,
+                       speed=TRAVERSE_SPEED_CM_S)
+
+
+def _lift_traverse_descend(arm, target_xyz, label):
+    """v2 reach / carry, all straight lines: vertical lift to CARRY_HEIGHT_CM ->
+    horizontal line to above target_xyz -> vertical descent onto it,
+    end-effector held straight down throughout."""
     here = current_pos(arm)
     if not _coord_move(arm, here[0], here[1], CARRY_HEIGHT_CM, f"{label}: lift"):
         return False
-    if not _swing(arm, target_xyz, f"{label}: swing"):
+    _phase_pause()                          # hold at the top before the traverse
+    if not _traverse(arm, target_xyz, f"{label}: traverse"):
         return False
+    _phase_pause()                          # hold above it before descending
     return _coord_move(arm, target_xyz[0], target_xyz[1], target_xyz[2],
                        f"{label}: descend")
 
@@ -331,89 +512,42 @@ def _fire_gripper(arm, deg):
 
 
 def _grip(arm, deg, label):
-    print(f"  gripper -> {deg:.0f} deg ({label})")
-    if not _fire_gripper(arm, deg):
+    """Gripper command with the arm standing still, then the settle wait
+    (never less than GRIP_MIN_GAP_S). Recorded in the rehearsal."""
+    _say(f"  gripper -> {deg:.0f} deg ({label})")
+    if _TAPE is not None:
+        _TAPE.append(("grip", float(deg)))
+    elif not _fire_gripper(arm, deg):
         print(f"  send_gripper REFUSED -- {arm.last_error}")
         return False
     if GRIP_SETTLE_S < GRIP_MIN_GAP_S:
-        print(f"  (GRIP_SETTLE_S {GRIP_SETTLE_S}s < floor {GRIP_MIN_GAP_S}s -- using the floor)")
-    time.sleep(max(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S) - 0.06, 0.0))
+        _say(f"  (GRIP_SETTLE_S {GRIP_SETTLE_S}s < floor {GRIP_MIN_GAP_S}s -- using the floor)")
+    _pause(max(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S) - 0.06, 0.0))
     return True
 
 
-def _staccato_kw(arm, pts):
-    """send_path kwargs for a joint-by-joint move through `pts`, with a live
-    lift waypoint prepended. Used only by the trigger path in v2."""
-    sent = [_approach(current_pos(arm))] + [tuple(map(float, p)) for p in pts]
-    rx, ry, rz = PICK_ORIENTATION_DEG
-    return sent, dict(
-        x=[p[0] for p in sent], y=[p[1] for p in sent], z=[p[2] for p in sent],
-        rx=rx, ry=ry, rz=rz, speed=JOINT_SPEED_DPS, durations=[SEG_PLAN_S] * len(sent),
-    )
-
-
-class _PathThread(threading.Thread):
-    def __init__(self, arm, kw):
-        super().__init__(daemon=True)
-        self.arm, self.kw = arm, kw
-        self.result, self.exc = None, None
-
-    def run(self):
-        try:
-            self.result = self.arm.send_path(**self.kw)
-        except BaseException as exc:                       # noqa: BLE001
-            self.exc, self.result = exc, 0
-
-
-def _send_staccato_with_trigger(arm, pts, cycle_n, grip_deg, label):
-    """Run the move on a background thread; fire the gripper the first time the
-    tip is inside an active trigger box for this cycle (position-polled).
-    Still uses armik's J1..J6 order."""
-    _sent, kw = _staccato_kw(arm, pts)
-    th = _PathThread(arm, kw)
-    th.start()
-    fired = False
-    while th.is_alive():
-        if not fired and th.exc is None:
-            try:
-                if is_in_trigger_box(current_pos(arm), cycle_n):
-                    print(f"  {label}: trigger box entered -> gripper {grip_deg:.0f}")
-                    _fire_gripper(arm, grip_deg)
-                    fired = True
-            except Exception:
-                pass
-        time.sleep(0.05)
-    th.join()
-    if th.exc is not None:
-        raise th.exc
-    if not th.result:
-        print(f"  {label}: send_path (threaded) REFUSED -- {arm.last_error}")
-        return False
-    if not fired:
-        print(f"  {label}: box not entered -- firing gripper {grip_deg:.0f} now")
-        _fire_gripper(arm, grip_deg)
-    time.sleep(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S))
-    return True
-
-
-def _lift_swing_descend_nudge(arm, target_xyz, label):
-    """Scripted nudge: lift + swing as normal, then stop the coordinated
+def _lift_traverse_descend_nudge(arm, target_xyz, label):
+    """Scripted nudge: lift + traverse as normal, then stop the vertical
     descent at NUDGE_AT_FRACTION of the way down, wait NUDGE_WAIT_S (the
     cube supposedly moves during this pause), then leave it -- the
     gripper never closes and this cube's carry is skipped."""
     here = current_pos(arm)
     if not _coord_move(arm, here[0], here[1], CARRY_HEIGHT_CM, f"{label}: lift"):
         return False
-    if not _swing(arm, target_xyz, f"{label}: swing"):
+    _phase_pause()                          # hold at the top before the traverse
+    if not _traverse(arm, target_xyz, f"{label}: traverse"):
         return False
+    _phase_pause()                          # hold above it before descending
     start = current_pos(arm)
-    mid = tuple(s + NUDGE_AT_FRACTION * (t - s) for s, t in zip(start, target_xyz))
-    print(f"  {label}: NUDGE -- stopping the descent {int(NUDGE_AT_FRACTION * 100)}% "
-          f"of the way down (z {start[2]:.1f} -> {mid[2]:.1f} of {target_xyz[2]:.1f} cm)")
-    if not _coord_move(arm, mid[0], mid[1], mid[2], f"{label}: descend (partial)"):
+    mid = (float(target_xyz[0]), float(target_xyz[1]),     # straight down: x, y already there
+           start[2] + NUDGE_AT_FRACTION * (float(target_xyz[2]) - start[2]))
+    _say(f"  {label}: NUDGE -- stopping the descent {int(NUDGE_AT_FRACTION * 100)}% "
+         f"of the way down (z {start[2]:.1f} -> {mid[2]:.1f} of {target_xyz[2]:.1f} cm)")
+    if not _coord_move(arm, mid[0], mid[1], mid[2], f"{label}: descend (partial)",
+                       ease_out=NUDGE_EASE_OUT):
         return False
-    print(f"  cube moved -- waiting {NUDGE_WAIT_S:.1f}s, then leaving it behind")
-    time.sleep(NUDGE_WAIT_S)
+    _say(f"  cube moved -- waiting {NUDGE_WAIT_S:.1f}s, then leaving it behind")
+    _pause(NUDGE_WAIT_S)
     return True
 
 
@@ -426,8 +560,8 @@ def preflight(arm, segments):
     print("\n--- preflight: planning every cube point (no motion) ---")
     checks = []
     for i, (s, t) in enumerate(zip(CUBES_INITIAL_POINTS, CUBES_TARGET_POINTS)):
-        checks += [(f"init{i+1}", s), (f"init{i+1}^", _approach(s)),
-                   (f"tgt{i+1}", t), (f"tgt{i+1}^", _approach(t))]
+        checks += [(f"init{i+1}", s), (f"init{i+1}^", (s[0], s[1], CARRY_HEIGHT_CM)),
+                   (f"tgt{i+1}", t), (f"tgt{i+1}^", (t[0], t[1], CARRY_HEIGHT_CM))]
     bad = 0
     for name, (x, y, z) in checks:
         pl = arm.plan_coords(x=x, y=y, z=z, rx=rx, ry=ry, rz=rz,
@@ -461,6 +595,50 @@ def _build_segments(order, home_tip):
     return segs
 
 
+def _choreography(arm, segments):
+    """The whole run -- every cube cycle (incl. the nudge) and the final
+    straight-line homing -- written against whatever `arm` it is given. main()
+    runs it once on a simulated arm with _TAPE recording (the rehearsal) and
+    then plays the tape back on the real one. Returns False if anything was
+    refused."""
+    if not _grip(arm, GRIP_OPEN_DEG, "open before first pick"):
+        return False
+
+    skip_k = None
+    for ci, seg in enumerate(segments):
+        kind = seg["kind"]
+
+        if skip_k is not None and seg["k"] == skip_k:
+            _say(f"\n=== cycle {ci}/{len(segments) - 1}  {kind}  cube #{seg['k'] + 1}  "
+                 f"-- SKIPPED (left behind after nudge) ===")
+            if kind == "carry":
+                skip_k = None
+            continue
+
+        grip_deg = GRIP_CLOSED_DEG if kind == "reach" else GRIP_OPEN_DEG
+        label = "reach & grasp" if kind == "reach" else "carry & place"
+        _say(f"\n=== cycle {ci}/{len(segments) - 1}  {label}  cube #{seg['k'] + 1}  "
+             f"-> {tuple(round(v, 1) for v in seg['target'])} ===")
+
+        if kind == "reach" and ci == NUDGE_CYCLE:
+            if not _lift_traverse_descend_nudge(arm, seg["target"], label):
+                return False
+            skip_k = seg["k"]
+            continue
+
+        if not _lift_traverse_descend(arm, seg["target"], label):
+            return False
+        if not _grip(arm, grip_deg, "close on cube" if kind == "reach" else "release cube"):
+            return False
+        # live check at playback: did the tip really get there?
+        if _TAPE is not None:
+            _TAPE.append(("check", "cube" if kind == "reach" else "target",
+                          tuple(seg["target"])))
+
+    _say("\ndone. homing...")
+    return go_home_coordinated(arm)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", default=config.DEFAULT_PORT)
@@ -488,12 +666,8 @@ def main():
         if input("Type 'go' to continue: ").strip().lower() != "go":
             return 1
 
-    config.SINGLE_JOINT_DELAY = DELAY_BETWEEN_JOINTS_S
-    config.SINGLE_JOINT_DELAY_BETWEEN_POINTS = DELAY_BETWEEN_POINTS_S
-
     order = list(PICK_ORDER)
-    p_home = pose_coords(HOME)                       # mm/deg (Z_RELATIVE_TO_JOINT1 assumed False)
-    home_tip = (p_home[0] / 10.0, p_home[1] / 10.0, p_home[2] / 10.0)
+    home_tip = _home_tip()
 
     print(f"pick order (cube indices): {order}")
     segments = _build_segments(order, home_tip)
@@ -503,24 +677,22 @@ def main():
               f"-- the descent onto it stops at {int(NUDGE_AT_FRACTION * 100)}%, waits "
               f"{NUDGE_WAIT_S:.1f}s, then moves on to the next cube; this one is left behind")
 
-    paths = [get_path(s["origin"], s["target"]) for s in segments]
-
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
     # Jerky motion: v2's cube moves are coordinated / streamed, so with
-    # config.JERK_STREAM_STOPS set (see the jerk constants) each lift / swing /
+    # config.JERK_STREAM_STOPS set (see the jerk constants) each lift / transit /
     # descent STOPS and continues at random points -- no tremor; homing stutters
-    # the same way (per joint, or across the final coordinated move). Seed via
-    # arm.jerk_seed or config.JERK_SEED.
+    # the same way (per joint, or across the final coordinated move). The stops
+    # are drawn at PLAYBACK (inside arm._execute), so they differ every run.
+    # Seed via arm.jerk_seed or config.JERK_SEED.
     arm.jerk = JERK
-    arm.random_twitch = TWITCH_FREQ
-    arm.twitch_intensity = TWITCH_INTENSITY
 
     bridge = None
     if args.rviz:
         from _rviz_bridge import RvizBridge
         # polyline the EE actually traces: from HOME, then per segment
         # lift straight up to CARRY_HEIGHT_CM -> traverse at that height ->
-        # descend onto the target (mirrors _lift_swing_descend)
+        # descend onto the target (mirrors _lift_traverse_descend), then the
+        # straight-line homing (mirrors go_home_coordinated)
         flat_path = [tuple(map(float, home_tip))]
         for s in segments:
             ox, oy, _oz = s["origin"]
@@ -528,6 +700,10 @@ def main():
             flat_path += [(float(ox), float(oy), float(CARRY_HEIGHT_CM)),
                           (float(tx), float(ty), float(CARRY_HEIGHT_CM)),
                           (float(tx), float(ty), float(tz))]
+        lx, ly, _lz = flat_path[-1]
+        flat_path += [(lx, ly, float(CARRY_HEIGHT_CM)),
+                      (float(home_tip[0]), float(home_tip[1]), float(CARRY_HEIGHT_CM)),
+                      tuple(map(float, home_tip))]
         cube_pts = [tuple(map(float, c)) for c in CUBES_INITIAL_POINTS]
         try:
             bridge = RvizBridge(arm.get_angles, path_xyz_cm=flat_path,
@@ -546,9 +722,10 @@ def main():
             arm.conn.power_on()
             time.sleep(1.5)
 
-        arm.set_single_joint(1)
-        print("homing (one joint at a time)...")
-        go_home(arm)
+        print("homing...")
+        if not go_home(arm):
+            print("\nhoming failed -- fix the arm's position (see error above), then try again.")
+            return 1
         time.sleep(SETTLE_S)
         print(f"start pose (tip, cm/deg): {[round(v, 2) for v in arm.get_coords()]}")
 
@@ -558,54 +735,32 @@ def main():
             go_home(arm)
             return 1
 
-        if not _grip(arm, GRIP_OPEN_DEG, "open before first pick"):
+        # ---- rehearsal: compute EVERYTHING now, on a simulated arm ----------
+        global _TAPE
+        print("\nrehearsing the whole run on a simulated arm (nothing moves yet)...")
+        t_rehearse = time.perf_counter()
+        sim = Arm(mock=True)
+        sim.conn.raw.set_angles_directly([float(v) for v in HOME])
+        sim.jerk = JERK
+        _TAPE = []
+        try:
+            ok = _choreography(sim, segments)
+        finally:
+            tape, _TAPE = _TAPE, None
+            sim.close()
+        if not ok:
+            for step in tape:                      # show how far the rehearsal got
+                if step[0] == "say":
+                    print(step[1])
+            print("\nrehearsal failed (see above) -- the arm has not moved beyond homing.")
             return 1
+        n_moves = sum(1 for step in tape if step[0] == "plan")
+        print(f"precomputed {n_moves} motions in {time.perf_counter() - t_rehearse:.1f} s "
+              f"-- playing back")
 
-        skip_k = None
-        for ci, seg in enumerate(segments):
-            kind = seg["kind"]
-
-            if skip_k is not None and seg["k"] == skip_k:
-                print(f"\n=== cycle {ci}/{len(segments) - 1}  {kind}  cube #{seg['k'] + 1}  "
-                      f"-- SKIPPED (left behind after nudge) ===")
-                if kind == "carry":
-                    skip_k = None
-                continue
-
-            grip_deg = GRIP_CLOSED_DEG if kind == "reach" else GRIP_OPEN_DEG
-            label = "reach & grasp" if kind == "reach" else "carry & place"
-            print(f"\n=== cycle {ci}/{len(segments) - 1}  {label}  cube #{seg['k'] + 1}  "
-                  f"-> {tuple(round(v, 1) for v in seg['target'])} ===")
-
-            if kind == "reach" and ci == NUDGE_CYCLE:
-                if not _lift_swing_descend_nudge(arm, seg["target"], label):
-                    print("\naborting run."); go_home(arm); return 1
-                skip_k = seg["k"]
-                continue
-
-            pts = paths[ci]
-            if _has_trigger(ci):
-                if not _send_staccato_with_trigger(arm, pts, ci, grip_deg, label):
-                    print("\naborting run."); go_home(arm); return 1
-                continue
-
-            if not _lift_swing_descend(arm, seg["target"], label):
-                print("\naborting run."); go_home(arm); return 1
-
-            cur = current_pos(arm)
-            reached = (has_reached_cube(cur, seg["target"]) if kind == "reach"
-                       else has_reached_target(cur, seg["target"]))
-            if reached:
-                if not _grip(arm, grip_deg,
-                             "close on cube" if kind == "reach" else "release cube"):
-                    return 1
-            else:
-                print(f"  !! tip at {tuple(round(v, 2) for v in cur)}, expected "
-                      f"{tuple(round(v, 1) for v in seg['target'])} +/- {REACH_TOL_CM} cm "
-                      f"-- gripper NOT fired")
-
-        print("\ndone. homing...")
-        go_home_coordinated(arm)
+        # ---- playback: no computing between actions --------------------------
+        if not _play(arm, tape):
+            print("\naborting run."); go_home(arm); return 1
         return 0
 
     except KeyboardInterrupt:
@@ -615,10 +770,6 @@ def main():
     finally:
         if bridge is not None:
             bridge.stop()
-        try:
-            arm.set_single_joint(0)
-        except Exception:
-            pass
         arm.close()
 
 

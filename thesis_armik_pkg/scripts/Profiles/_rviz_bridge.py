@@ -115,6 +115,8 @@ PATH_COLOR_RGBA = (0.00, 0.90, 1.00, 0.55)   # cyan, semi-transparent
 CUBE_COLOR_RGBA = (0.10, 0.75, 0.20, 0.35)   # green, semi-transparent
 NUDGE_CUBE_COLOR_RGBA = (1.00, 0.90, 0.00, 0.55)   # yellow, semi-transparent
 TIP_COLOR_RGBA = (0.10, 1.00, 0.20, 0.90)    # green, near-solid
+LOOK_POINT_COLOR_RGBA = (1.00, 0.10, 0.10, 0.35)   # red, as transparent as the cubes
+LOOK_POINT_RADIUS_CM = 1.0                   # the look-point sphere's radius
 
 
 def _cm_xyz_to_frame(x_cm, y_cm, z_cm):
@@ -147,6 +149,9 @@ class RvizBridge:
     nudge_cube_point: optional (x, y, z) tuple in CM -- where a scripted nudge
                     leaves its cube; drawn as a single yellow cube, separate
                     from the green `cube_points`, whenever given.
+    look_point    : optional (x, y, z) tuple in CM -- a point the arm looks at
+                    (HighH-LowR's confused glances); drawn as a small red
+                    sphere of LOOK_POINT_RADIUS_CM, whenever given.
     tip_source    : optional zero-arg callable -> ``arm.get_coords()`` (cm); when
                     given, a live green sphere is drawn at the tool tip.
     gripper_source: optional zero-arg callable -> gripper value 0..100 (pass
@@ -158,7 +163,7 @@ class RvizBridge:
     """
 
     def __init__(self, joint_source, path_xyz_cm=None, cube_points=None,
-                 nudge_cube_point=None,
+                 nudge_cube_point=None, look_point=None,
                  tip_source=None, gripper_source=None, sequential_joints=False,
                  node_name="thesis_mock_rviz_bridge",
                  joint_rate_hz=30.0, marker_period_s=2.0):
@@ -169,6 +174,7 @@ class RvizBridge:
         self._path_xyz_cm = [tuple(p) for p in path_xyz_cm] if path_xyz_cm else []
         self._cube_points = [tuple(p) for p in cube_points] if cube_points else []
         self._nudge_cube_point = tuple(map(float, nudge_cube_point)) if nudge_cube_point else None
+        self._look_point = tuple(map(float, look_point)) if look_point else None
         self._node_name = node_name
         self._joint_period = 1.0 / float(joint_rate_hz)
         self._marker_period = float(marker_period_s)
@@ -182,6 +188,7 @@ class RvizBridge:
         self._line_marker = None
         self._cube_marker = None
         self._nudge_cube_marker = None
+        self._look_point_marker = None
         self._owns_rclpy = False
         self._started = False
         self._stopped = False
@@ -230,6 +237,7 @@ class RvizBridge:
         self._line_marker = self._build_line_marker()
         self._cube_marker = self._build_cube_marker()
         self._nudge_cube_marker = self._build_nudge_cube_marker()
+        self._look_point_marker = self._build_look_point_marker()
 
         # One publish while this is still the only thread -> no cross-thread
         # races on the publishers; the spin thread takes over from here.
@@ -377,6 +385,9 @@ class RvizBridge:
             if self._nudge_cube_marker is not None:
                 self._nudge_cube_marker.header.stamp = now
                 self._marker_pub.publish(self._nudge_cube_marker)
+            if self._look_point_marker is not None:
+                self._look_point_marker.header.stamp = now
+                self._marker_pub.publish(self._look_point_marker)
             if self._tip_source is not None:
                 tip = self._tip_marker(now)
                 if tip is not None:
@@ -436,6 +447,23 @@ class RvizBridge:
         m.scale.x = m.scale.y = m.scale.z = 0.035
         m.color = _rgba(NUDGE_CUBE_COLOR_RGBA)
         x, y, z = _cm_xyz_to_frame(*self._nudge_cube_point)
+        m.pose.position.x, m.pose.position.y, m.pose.position.z = x, y, z
+        m.pose.orientation.w = 1.0
+        m.lifetime = _DurationMsg(sec=0, nanosec=0)
+        return m
+
+    def _build_look_point_marker(self):
+        if self._look_point is None:
+            return None
+        m = _Marker()
+        m.header.frame_id = MARKER_FRAME
+        m.ns = "thesis_look_point"
+        m.id = 4
+        m.type = _Marker.SPHERE
+        m.action = _Marker.ADD
+        m.scale.x = m.scale.y = m.scale.z = 2.0 * LOOK_POINT_RADIUS_CM / 100.0   # diameter, m
+        m.color = _rgba(LOOK_POINT_COLOR_RGBA)
+        x, y, z = _cm_xyz_to_frame(*self._look_point)
         m.pose.position.x, m.pose.position.y, m.pose.position.z = x, y, z
         m.pose.orientation.w = 1.0
         m.lifetime = _DurationMsg(sec=0, nanosec=0)

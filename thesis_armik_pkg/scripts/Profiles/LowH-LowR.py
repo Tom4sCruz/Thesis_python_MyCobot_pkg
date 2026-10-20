@@ -75,10 +75,14 @@ not something simulated in code. Both split points are clamped to the
 arc's own actual duration by construction, so a large offset just lands at
 the very start/end rather than reaching more than one cycle ahead.
 
-This never runs two things at once (no background thread) -- each call is
-a normal, fully-blocking send_path()/send_gripper(), one after another,
-exactly like the existing HighH-LowR_delay-points.py prototype this is
-adapted from.
+This never runs two things at once (no background thread) -- each motion
+and gripper command is fully blocking, one after another, exactly like the
+existing HighH-LowR_delay-points.py prototype this is adapted from.
+
+Every move is PRE-COMPUTED, as in HighH-LowR.py: the whole run is first
+rehearsed on a simulated arm (every arc IK-planned, recorded to a "tape"),
+then the tape is played back on the real arm with no planning between
+actions -- the only gaps left are the deliberate gripper/lead-out pauses.
 
 Everything you tune is a CONSTANT below. The cube coordinates,
 PICK_ORIENTATION_DEG, and TARGET_POSITIONS are PLACEHOLDERS -- measure/
@@ -105,6 +109,7 @@ import time
 import numpy as np
 
 from armik import Arm, config, pose_coords
+from armik.arm import Execution
 
 # ===========================================================================
 # CONSTANTS
@@ -764,35 +769,123 @@ def _fire_gripper(arm, deg):
 
 
 def _grip(arm, deg, label):
-    print(f"  gripper -> {deg:.0f} deg ({label})")
-    if not _fire_gripper(arm, deg):
+    _say(f"  gripper -> {deg:.0f} deg ({label})")
+    if _TAPE is not None:
+        _TAPE.append(("grip", float(deg)))
+    elif not _fire_gripper(arm, deg):
         print(f"  send_gripper REFUSED -- {arm.last_error}")
         return False
     if GRIP_SETTLE_S < GRIP_MIN_GAP_S:
-        print(f"  (GRIP_SETTLE_S {GRIP_SETTLE_S}s < floor {GRIP_MIN_GAP_S}s -- using the floor)")
-    time.sleep(max(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S) - 0.06, 0.0))
+        _say(f"  (GRIP_SETTLE_S {GRIP_SETTLE_S}s < floor {GRIP_MIN_GAP_S}s -- using the floor)")
+    _pause(max(max(GRIP_SETTLE_S, GRIP_MIN_GAP_S) - 0.06, 0.0))
+    return True
+
+
+# ===========================================================================
+# THE TAPE -- rehearse the whole run first, then play it back
+# ===========================================================================
+# Working out a motion (the IK for an arc) takes real time on the Jetson, and
+# doing it between actions -- after every gripper command and arc split --
+# left the arm standing still. So the choreography runs TWICE:
+#   1. REHEARSAL on a second, simulated Arm(mock=True): nothing is streamed and
+#      nothing sleeps. Every action -- a finished Plan, a gripper command, a
+#      deliberate pause, a log line -- is appended to a list, the tape, and the
+#      simulated arm is put at the motion's end pose so the next step plans
+#      from the right place.
+#   2. PLAYBACK on the real arm: the tape is executed in order. No kinematics
+#      and no planning happen between motions, so the only gaps left are the
+#      deliberate pauses.
+# Every motion function reaches the arm only through _do_plan / _pause / _say /
+# _grip, which record while _TAPE is a list and act when it is None.
+
+_TAPE = None
+
+
+def _say(text):
+    if _TAPE is not None:
+        _TAPE.append(("say", text))
+    else:
+        print(text)
+
+
+def _pause(seconds):
+    if _TAPE is not None:
+        _TAPE.append(("pause", float(seconds)))
+    else:
+        time.sleep(seconds)
+
+
+def _do_plan(arm, plan):
+    """Execute a finished Plan -- or, in rehearsal, record it and move the
+    simulated arm to its end pose. Returns an Execution."""
+    if _TAPE is not None:
+        _TAPE.append(("plan", plan))
+        arm.conn.raw.set_angles_directly([float(v) for v in plan.q_waypoints[-1]])
+        return Execution(ok=True)
+    return arm._execute(plan)
+
+
+def _check(arm, what, target):
+    """Log (don't abort) if the tip is not within REACH_TOL_CM of target --
+    deferred to playback while rehearsing, since only the real arm can drift."""
+    if _TAPE is not None:
+        _TAPE.append(("check", what, tuple(target)))
+        return
+    cur = current_pos(arm)
+    if not _within(cur, target, (REACH_TOL_CM,) * 3):
+        print(f"  !! tip at {tuple(round(v, 2) for v in cur)}, expected "
+              f"{tuple(round(v, 1) for v in target)} +/- {REACH_TOL_CM} cm ({what})")
+
+
+def _play(arm, tape):
+    """Run a recorded tape on the real arm. Returns bool."""
+    for step in tape:
+        kind = step[0]
+        if kind == "say":
+            print(step[1])
+        elif kind == "pause":
+            time.sleep(step[1])
+        elif kind == "grip":
+            if not _fire_gripper(arm, step[1]):
+                print(f"  send_gripper REFUSED -- {arm.last_error}")
+                return False
+        elif kind == "plan":
+            plan = step[1]
+            ex = arm._execute(plan)
+            arm.last_plan, arm.last_execution = plan, ex
+            if not ex.ok:
+                print(f"  execution ABORTED -- {ex.error}")
+                return False
+            if ex.late_deadlines:
+                print(f"  !! {ex.late_deadlines} late control-loop deadline(s) during this move")
+        elif kind == "check":
+            _check(arm, step[1], step[2])
     return True
 
 
 def _send_arc(arm, pts, durs, label):
-    """Blocking parabolic move. pts[0] is the implicit start (not sent)."""
+    """Parabolic move: plan it, then hand the Plan to _do_plan(), so the same
+    code serves the rehearsal (record) and a live move (execute).
+    pts[0] is the implicit start (not sent). Returns bool."""
     rx, ry = PICK_ORIENTATION_DEG[:2]
     if len(pts) < 2:
-        print(f"  {label}: negligible, skipped")
+        _say(f"  {label}: negligible, skipped")
         return True
-    r = arm.send_path(
+    pl = arm.plan_path(
         x=[p[0] for p in pts[1:]], y=[p[1] for p in pts[1:]], z=[p[2] for p in pts[1:]],
         rx=rx, ry=ry, rz=_yaw(pts[1:]), durations=list(durs),
     )
-    if not r:
-        print(f"  {label}: send_path REFUSED -- {arm.last_error}")
+    if not pl.ok:
+        _say(f"  {label}: plan REFUSED -- {pl.error}")
         return False
-    pl = arm.last_plan
-    print(f"  {label}: {pl.path_length_cm:.1f} cm, {pl.duration_s:.2f} s, "
-          f"peak {pl.peak_joint_dps:.0f} deg/s")
-    if arm.last_execution and arm.last_execution.late_deadlines:
-        print(f"  !! {arm.last_execution.late_deadlines} late control-loop "
-              f"deadline(s) during this arc")
+    ex = _do_plan(arm, pl)
+    if not ex.ok:
+        _say(f"  {label}: execution ABORTED -- {ex.error}")
+        return False
+    _say(f"  {label}: {pl.path_length_cm:.1f} cm, {pl.duration_s:.2f} s, "
+         f"peak {pl.peak_joint_dps:.0f} deg/s")
+    if ex.late_deadlines:
+        _say(f"  !! {ex.late_deadlines} late control-loop deadline(s) during this arc")
     return True
 
 
@@ -848,6 +941,113 @@ def preflight(arm, segments, paths, all_durs):
 # ===========================================================================
 # MAIN
 # ===========================================================================
+
+def _choreography(arm, segments, paths, all_durs, styles, rng):
+    """The whole run, cycle by cycle. Runs once on a simulated arm with
+    _TAPE recording (the rehearsal), and the tape is then played back on the
+    real arm -- see THE TAPE above. Returns bool."""
+    if not _grip(arm, GRIP_OPEN_DEG, "open before first pick"):
+        return False
+
+    pending = None   # (grip_deg, action_label, offset_s) deferred from the previous cycle
+
+    for ci, seg in enumerate(segments):
+        kind = seg["kind"]
+        pts, durs = paths[ci], all_durs[ci]
+
+        if kind == "leadout":
+            _say(f"\n=== lead-out arc -> HOME ===  [{styles[ci]}]")
+            _pause(LEADOUT_PAUSE_S)
+            if pending is not None:
+                p_deg, p_label, p_off = pending
+                split = _head_split_index(durs, p_off)
+                if split > 0:
+                    if not _send_arc(arm, pts[:split + 1], durs[:split], "lead-out (deferred head)"):
+                        return False
+                    pts, durs = pts[split:], durs[split:]
+                if not _grip(arm, p_deg, f"{p_label} (fired late)"):
+                    return False
+                pending = None
+            _send_arc(arm, pts, durs, "lead-out")
+            break
+
+        grip_deg = GRIP_CLOSED_DEG if kind == "reach" else GRIP_OPEN_DEG
+        action = "close on cube" if kind == "reach" else "release cube"
+        label = "reach & grasp" if kind == "reach" else "carry & place"
+        _say(f"\n=== cycle {ci}/{N_CYCLES - 1}  {label}  "
+             f"cube #{seg['k'] + 1}  -> {tuple(round(v, 1) for v in seg['target'])}  "
+             f"[{styles[ci]}] ===")
+
+        # fire anything deferred from the PREVIOUS cycle, near the start of this arc
+        if pending is not None:
+            p_deg, p_label, p_off = pending
+            split = _head_split_index(durs, p_off)
+            if split > 0:
+                if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (deferred head)"):
+                    return False
+                pts, durs = pts[split:], durs[split:]
+            if not _grip(arm, p_deg, f"{p_label} (fired late)"):
+                return False
+            pending = None
+
+        # this cycle's own gripper action -- DELAYED_OPEN_CYCLE forces a
+        # deterministic, tunable-fraction defer instead of the usual random offset
+        if ci == DELAYED_OPEN_CYCLE and kind == "carry":
+            if not _send_arc(arm, pts, durs, label):
+                return False
+            next_durs = all_durs[ci + 1] if ci + 1 < len(all_durs) else []
+            forced_offset = DELAYED_OPEN_FRACTION * sum(next_durs)
+            pending = (grip_deg, action, forced_offset)
+            _say(f"  gripper action DELIBERATELY delayed to "
+                 f"{DELAYED_OPEN_FRACTION * 100:.0f}% into the next leg")
+        elif ci == EARLY_DROP_CYCLE and kind == "carry":
+            # deterministic early release, partway through THIS carry's own arc
+            lead_s = (1.0 - EARLY_DROP_FRACTION) * sum(durs)
+            split = _tail_split_index(durs, lead_s)
+            if split > 0:
+                if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (approach)"):
+                    return False
+                pts, durs = pts[split:], durs[split:]
+            if not _grip(arm, grip_deg, f"{action} (dropped at {EARLY_DROP_FRACTION * 100:.0f}%)"):
+                return False
+            if not _send_arc(arm, pts, durs, f"{label} (final)"):
+                return False
+            _say(f"  gripper action DELIBERATELY dropped "
+                 f"{EARLY_DROP_FRACTION * 100:.0f}% into this leg")
+        elif ci in NORMAL_GRIP_CYCLES:
+            # deterministic, reliable close / release right at arrival (no early/late chaos)
+            split = _tail_split_index(durs, 0.0)
+            if split > 0:
+                if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (approach)"):
+                    return False
+                pts, durs = pts[split:], durs[split:]
+            if not _grip(arm, grip_deg, f"{action} (normal grip)"):
+                return False
+            if not _send_arc(arm, pts, durs, f"{label} (final)"):
+                return False
+        else:
+            # timed with a fresh random offset
+            offset = float(rng.uniform(-GRIP_CHAOS_SPREAD_S, GRIP_CHAOS_SPREAD_S))
+            if offset <= 0.0:
+                split = _tail_split_index(durs, -offset)
+                if split > 0:
+                    if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (approach)"):
+                        return False
+                    pts, durs = pts[split:], durs[split:]
+                if not _grip(arm, grip_deg, f"{action} (offset {offset:+.2f}s)"):
+                    return False
+                if not _send_arc(arm, pts, durs, f"{label} (final)"):
+                    return False
+            else:
+                if not _send_arc(arm, pts, durs, label):
+                    return False
+                pending = (grip_deg, action, offset)
+                _say(f"  gripper action deferred ~{offset:.2f}s into the next leg")
+
+        _check(arm, "cube" if kind == "reach" else "target", seg["target"])
+
+    return True
+
 
 def _build_segments(order, home_tip):
     segs = []
@@ -973,110 +1173,31 @@ def main():
             go_home(arm)
             return 1
 
-        if not _grip(arm, GRIP_OPEN_DEG, "open before first pick"):
+        # ---- rehearsal: compute EVERYTHING now, on a simulated arm ----------
+        global _TAPE
+        print("\nrehearsing the whole run on a simulated arm (nothing moves yet)...")
+        t_rehearse = time.perf_counter()
+        sim = Arm(mock=True, quiet_mock=True)          # the rehearsal arm -- no MOCK warning
+        sim.conn.raw.set_angles_directly([float(v) for v in HOME])
+        _TAPE = []
+        try:
+            ok = _choreography(sim, segments, paths, all_durs, styles, rng)
+        finally:
+            tape, _TAPE = _TAPE, None
+            sim.close()
+        if not ok:
+            for step in tape:                      # show how far the rehearsal got
+                if step[0] == "say":
+                    print(step[1])
+            print("\nrehearsal failed (see above) -- the arm has not moved beyond homing.")
             return 1
+        n_moves = sum(1 for step in tape if step[0] == "plan")
+        print(f"precomputed {n_moves} motions in {time.perf_counter() - t_rehearse:.1f} s "
+              f"-- playing back")
 
-        pending = None   # (grip_deg, action_label, offset_s) deferred from the previous cycle
-
-        for ci, seg in enumerate(segments):
-            kind = seg["kind"]
-            pts, durs = paths[ci], all_durs[ci]
-
-            if kind == "leadout":
-                print(f"\n=== lead-out arc -> HOME ===  [{styles[ci]}]")
-                time.sleep(LEADOUT_PAUSE_S)
-                if pending is not None:
-                    p_deg, p_label, p_off = pending
-                    split = _head_split_index(durs, p_off)
-                    if split > 0:
-                        if not _send_arc(arm, pts[:split + 1], durs[:split], "lead-out (deferred head)"):
-                            print("\naborting run."); go_home(arm); return 1
-                        pts, durs = pts[split:], durs[split:]
-                    if not _grip(arm, p_deg, f"{p_label} (fired late)"):
-                        return 1
-                    pending = None
-                _send_arc(arm, pts, durs, "lead-out")
-                break
-
-            grip_deg = GRIP_CLOSED_DEG if kind == "reach" else GRIP_OPEN_DEG
-            action = "close on cube" if kind == "reach" else "release cube"
-            label = "reach & grasp" if kind == "reach" else "carry & place"
-            print(f"\n=== cycle {ci}/{N_CYCLES - 1}  {label}  "
-                  f"cube #{seg['k'] + 1}  -> {tuple(round(v, 1) for v in seg['target'])}  "
-                  f"[{styles[ci]}] ===")
-
-            # fire anything deferred from the PREVIOUS cycle, near the start of this arc
-            if pending is not None:
-                p_deg, p_label, p_off = pending
-                split = _head_split_index(durs, p_off)
-                if split > 0:
-                    if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (deferred head)"):
-                        print("\naborting run."); go_home(arm); return 1
-                    pts, durs = pts[split:], durs[split:]
-                if not _grip(arm, p_deg, f"{p_label} (fired late)"):
-                    return 1
-                pending = None
-
-            # this cycle's own gripper action -- DELAYED_OPEN_CYCLE forces a
-            # deterministic, tunable-fraction defer instead of the usual random offset
-            if ci == DELAYED_OPEN_CYCLE and kind == "carry":
-                if not _send_arc(arm, pts, durs, label):
-                    print("\naborting run."); go_home(arm); return 1
-                next_durs = all_durs[ci + 1] if ci + 1 < len(all_durs) else []
-                forced_offset = DELAYED_OPEN_FRACTION * sum(next_durs)
-                pending = (grip_deg, action, forced_offset)
-                print(f"  gripper action DELIBERATELY delayed to "
-                      f"{DELAYED_OPEN_FRACTION * 100:.0f}% into the next leg")
-            elif ci == EARLY_DROP_CYCLE and kind == "carry":
-                # deterministic early release, partway through THIS carry's own arc
-                lead_s = (1.0 - EARLY_DROP_FRACTION) * sum(durs)
-                split = _tail_split_index(durs, lead_s)
-                if split > 0:
-                    if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (approach)"):
-                        print("\naborting run."); go_home(arm); return 1
-                    pts, durs = pts[split:], durs[split:]
-                if not _grip(arm, grip_deg, f"{action} (dropped at {EARLY_DROP_FRACTION * 100:.0f}%)"):
-                    return 1
-                if not _send_arc(arm, pts, durs, f"{label} (final)"):
-                    print("\naborting run."); go_home(arm); return 1
-                print(f"  gripper action DELIBERATELY dropped "
-                      f"{EARLY_DROP_FRACTION * 100:.0f}% into this leg")
-            elif ci in NORMAL_GRIP_CYCLES:
-                # deterministic, reliable close / release right at arrival (no early/late chaos)
-                split = _tail_split_index(durs, 0.0)
-                if split > 0:
-                    if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (approach)"):
-                        print("\naborting run."); go_home(arm); return 1
-                    pts, durs = pts[split:], durs[split:]
-                if not _grip(arm, grip_deg, f"{action} (normal grip)"):
-                    return 1
-                if not _send_arc(arm, pts, durs, f"{label} (final)"):
-                    print("\naborting run."); go_home(arm); return 1
-            else:
-                # timed with a fresh random offset
-                offset = float(rng.uniform(-GRIP_CHAOS_SPREAD_S, GRIP_CHAOS_SPREAD_S))
-                if offset <= 0.0:
-                    split = _tail_split_index(durs, -offset)
-                    if split > 0:
-                        if not _send_arc(arm, pts[:split + 1], durs[:split], f"{label} (approach)"):
-                            print("\naborting run."); go_home(arm); return 1
-                        pts, durs = pts[split:], durs[split:]
-                    if not _grip(arm, grip_deg, f"{action} (offset {offset:+.2f}s)"):
-                        return 1
-                    if not _send_arc(arm, pts, durs, f"{label} (final)"):
-                        print("\naborting run."); go_home(arm); return 1
-                else:
-                    if not _send_arc(arm, pts, durs, label):
-                        print("\naborting run."); go_home(arm); return 1
-                    pending = (grip_deg, action, offset)
-                    print(f"  gripper action deferred ~{offset:.2f}s into the next leg")
-
-            cur = current_pos(arm)
-            reached = (has_reached_cube(cur, seg["target"]) if kind == "reach"
-                       else has_reached_target(cur, seg["target"]))
-            if not reached:
-                print(f"  !! tip at {tuple(round(v, 2) for v in cur)}, expected "
-                      f"{tuple(round(v, 1) for v in seg['target'])} +/- {REACH_TOL_CM} cm")
+        # ---- playback: no computing between actions --------------------------
+        if not _play(arm, tape):
+            print("\naborting run."); go_home(arm); return 1
 
         print("\nall cubes placed. homing...")
         if not go_home(arm):

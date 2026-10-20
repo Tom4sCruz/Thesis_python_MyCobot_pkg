@@ -235,7 +235,7 @@ MIN_ARC_HEIGHT_CM = 9.0          # floor, so short moves still clear the table /
                                  # the gazed pose enough clearance to stay reachable throughout,
                                  # confirmed the same way (plan_coords/ik.solve at every waypoint of
                                  # that arc, plus a full clean run)
-CRUISE_SPEED_CM_S = 16.5          # peak tip speed of EVERY reach/carry arc (the ease dials stretch the
+CRUISE_SPEED_CM_S = 12.5          # peak tip speed of EVERY reach/carry arc (the ease dials stretch the
                                  # move time). 30 used to be capped by the old fixed waypoint count;
                                  # really reached, it drives the joints to ~400 deg/s and breaks the
                                  # nudge approach. 12 keeps every joint under ~100 deg/s

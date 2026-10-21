@@ -234,6 +234,22 @@ def gaze_waypoints(points_xyz, target_xyz, start_rpy, durations, ease_in_s):
     return rx_list, ry_list, rz_list
 
 
+def _level_out_weights(durs, ease_out_s):
+    """Per-waypoint blend weight toward the level pose: exp(-remaining/ease_out_s),
+    i.e. 0 early in the arc and exactly 1 on the LAST waypoint. durs[i] is the
+    time spent reaching waypoint i."""
+    n = len(durs)
+    remaining_s = [0.0] * n
+    running = 0.0
+    for i in range(n - 1, -1, -1):
+        remaining_s[i] = running
+        running += durs[i]
+    tau_out = max(float(ease_out_s), 0.0)
+    if tau_out <= 1e-9:
+        return [1.0 if r <= 1e-9 else 0.0 for r in remaining_s]
+    return [math.exp(-r / tau_out) for r in remaining_s]
+
+
 def gaze_then_level_waypoints(points_xyz, target_xyz, level_rpy_sequence,
                                start_rpy, durations, ease_in_s, ease_out_s):
     """Like gaze_waypoints, but blends back to level_rpy_sequence (the fixed
@@ -247,22 +263,13 @@ def gaze_then_level_waypoints(points_xyz, target_xyz, level_rpy_sequence,
     durs = [float(durations[i]) if i < len(durations)
             else (float(durations[-1]) if len(durations) else 0.0)
             for i in range(n)]
-    remaining_s = [0.0] * n
-    running = 0.0
-    for i in range(n - 1, -1, -1):
-        remaining_s[i] = running
-        running += durs[i]
-    tau_out = max(float(ease_out_s), 0.0)
+    betas = _level_out_weights(durs, ease_out_s)
 
     rx_list, ry_list, rz_list = [], [], []
     for i, p in enumerate(points_xyz):
         R_gaze = easer.step_matrix(p, target_xyz, durs[i])
         R_level = kinematics.rpy_to_matrix(*level_rpy_sequence[i])
-        if tau_out <= 1e-9:
-            beta = 1.0 if remaining_s[i] <= 1e-9 else 0.0
-        else:
-            beta = math.exp(-remaining_s[i] / tau_out)
-        R = _slerp_matrix(R_gaze, R_level, beta)
+        R = _slerp_matrix(R_gaze, R_level, betas[i])
         rx, ry, rz = kinematics.matrix_to_rpy(R)
         rx_list.append(float(rx))
         ry_list.append(float(ry))
@@ -270,7 +277,7 @@ def gaze_then_level_waypoints(points_xyz, target_xyz, level_rpy_sequence,
     return rx_list, ry_list, rz_list
 
 
-def ease_to_rpy(target_rpy_sequence, start_rpy, durations, ease_in_s):
+def ease_to_rpy(target_rpy_sequence, start_rpy, durations, ease_in_s, ease_out_s=None):
     """Like gaze_waypoints, but the per-waypoint target orientation is already
     known (e.g. the fixed PICK_ORIENTATION_DEG / ORIENT_LOCK schedule) rather
     than computed live from a look-at point.
@@ -284,21 +291,32 @@ def ease_to_rpy(target_rpy_sequence, start_rpy, durations, ease_in_s):
     always eases there smoothly instead. A no-op (returns target_rpy_sequence
     verbatim) when start_rpy already matches it, e.g. GAZE_ENABLED=False for
     the whole run -- every arc has always held the same fixed pose then, so
-    there is nothing to ease from."""
+    there is nothing to ease from.
+
+    The exponential ease alone never ARRIVES: on an arc shorter than a few
+    ease_in_s it ends well short of the target pose. ease_out_s (None = off)
+    additionally blends onto target_rpy_sequence over the arc's final
+    ease_out_s seconds, exactly like gaze_then_level_waypoints, so the LAST
+    waypoint lands on target_rpy_sequence[-1]."""
     tau = max(float(ease_in_s), 0.0)
     R = kinematics.rpy_to_matrix(*start_rpy)
-    rx_list, ry_list, rz_list = [], [], []
+    dts = []
     last_dt = 0.0
+    for i in range(len(target_rpy_sequence)):
+        last_dt = float(durations[i]) if i < len(durations) else last_dt
+        dts.append(last_dt)
+    betas = _level_out_weights(dts, ease_out_s) if ease_out_s is not None else None
+    rx_list, ry_list, rz_list = [], [], []
     for i, target_rpy in enumerate(target_rpy_sequence):
-        dt = float(durations[i]) if i < len(durations) else last_dt
-        last_dt = dt
+        dt = dts[i]
         R_goal = kinematics.rpy_to_matrix(*target_rpy)
         if tau <= 1e-9:
             R = R_goal
         else:
             alpha = 1.0 - math.exp(-max(dt, 0.0) / tau)
             R = _slerp_matrix(R, R_goal, alpha)
-        rx, ry, rz = kinematics.matrix_to_rpy(R)
+        rx, ry, rz = kinematics.matrix_to_rpy(
+            R if betas is None else _slerp_matrix(R, R_goal, betas[i]))
         rx_list.append(float(rx))
         ry_list.append(float(ry))
         rz_list.append(float(rz))

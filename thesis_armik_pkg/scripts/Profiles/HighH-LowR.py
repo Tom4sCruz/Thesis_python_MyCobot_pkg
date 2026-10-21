@@ -230,6 +230,17 @@ MIN_ARC_HEIGHT_CM = 9.0          # floor, so short moves still clear the table /
                                  # the gazed pose enough clearance to stay reachable throughout,
                                  # confirmed the same way (plan_coords/ik.solve at every waypoint of
                                  # that arc, plus a full clean run)
+MIN_PATH_RADIUS_CM = 14.0        # keep-out radius around the base, horizontal (xy). An arc
+                                 # whose straight top-down chord passes closer than this gets
+                                 # the SMALLEST outward sideways bow that keeps it out (never
+                                 # more than its own end points allow -- an arc starting inside,
+                                 # e.g. from the look configuration, only has to move outward
+                                 # steadily). Close to the base, and low, the elbow (J3) is
+                                 # folded to its limit: the carry from (14,10) to (8,-22) cut
+                                 # 11.9 cm from the base at ~1.5 cm height, which no gripper
+                                 # orientation reaches -- both END points were fine. 14.0 bows
+                                 # this run's arcs by 0.6-2.3 cm and leaves that carry ~5 deg
+                                 # of J3 headroom; 0 disables.
 CRUISE_SPEED_CM_S = 22.0          # peak tip speed; the ease dials stretch the move time
 ARC_TIME_EQUALIZATION = 0.5   # 0..1: blends each reach/carry arc's own duration at
                               # CRUISE_SPEED_CM_S (0 = today, duration grows with arc
@@ -450,11 +461,45 @@ def _arc_height(d, d_max):
     return float(np.clip(c, MIN_ARC_HEIGHT_CM, MAX_HEIGHT_TRAJECTORY))
 
 
+def _keepout_bow(o_xy, chord, perp, bow, u):
+    """Extra bow (cm, along `perp`) on top of `bow` that keeps the arc's xy
+    path at least MIN_PATH_RADIUS_CM from the base -- capped, per point, at the
+    straight ramp between its two end points' own radii, so an end point
+    already inside the radius never makes the rest impossible. The smallest
+    sufficient value, found by bisection; 0.0 if the path is already clear."""
+    if MIN_PATH_RADIUS_CM <= 0.0:
+        return 0.0
+    base_xy = o_xy[None, :] + chord[None, :] * u[:, None]
+    shape = 4.0 * u * (1.0 - u)
+    r_o = float(np.linalg.norm(o_xy))
+    r_t = float(np.linalg.norm(o_xy + chord))
+    need = np.minimum(MIN_PATH_RADIUS_CM, (1.0 - u) * r_o + u * r_t) - 1e-6
+    mid = o_xy + 0.5 * chord
+    out = 1.0 if float(perp @ mid) >= 0.0 else -1.0     # +perp or -perp points away from the base
+
+    def clear(extra):
+        xy = base_xy + perp[None, :] * ((bow + out * extra) * shape)[:, None]
+        return bool(np.all(np.linalg.norm(xy, axis=1) >= need))
+
+    if clear(0.0):
+        return 0.0
+    lo, hi = 0.0, 50.0
+    if not clear(hi):
+        return out * hi
+    for _ in range(40):
+        m = 0.5 * (lo + hi)
+        lo, hi = (lo, m) if clear(m) else (m, hi)
+    return out * hi
+
+
 def _parabola_points(origin, target, arc_height, rng, n_waypoints=None):
     """(list of `n_waypoints` (x,y,z), arc_length) along the arc from `origin`
     to `target`: the straight xy chord + a symmetric vertical parabolic lift of
     apex `arc_height` above the chord (== a*x^2 + c with x = (u-0.5)*chord).
     With `rng` the apex height and a sideways bow are jittered by VARIATION.
+    Independently of `rng`, an arc that would pass closer to the base than
+    MIN_PATH_RADIUS_CM is bowed outward (_keepout_bow) -- deterministic, so
+    get_durations() sees the same path.
     `n_waypoints` defaults to PATH_WAYPOINTS -- pass fewer for a short, fast
     move (e.g. the recoil) where PATH_WAYPOINTS segments would floor its total
     duration at (PATH_WAYPOINTS-1)*MIN_SEGMENT_S regardless of cruise speed."""
@@ -477,9 +522,11 @@ def _parabola_points(origin, target, arc_height, rng, n_waypoints=None):
     # sideways bow, perpendicular to the chord in the horizontal plane
     chord = t[:2] - o[:2]
     n = float(np.linalg.norm(chord))
-    if n > 1e-6 and bow != 0.0:
+    if n > 1e-6:
         perp = np.array([-chord[1], chord[0]]) / n
-        xy = xy + perp[None, :] * (bow * 4.0 * (u * (1.0 - u)))[:, None]
+        bow += _keepout_bow(o[:2], chord, perp, bow, u)
+        if bow != 0.0:
+            xy = xy + perp[None, :] * (bow * 4.0 * (u * (1.0 - u)))[:, None]
 
     # straight chord in z + symmetric parabolic lift (0 at both ends, peak h at u=0.5)
     z = z0 + (z1 - z0) * u + 4.0 * h * u * (1.0 - u)
@@ -608,11 +655,13 @@ def _grip(arm, deg, label, wait_s=GRIP_SETTLE_S):
     return True
 
 
-def _arc_orientations(arm, tail, durs, gaze_target):
+def _arc_orientations(arm, tail, durs, gaze_target, land=False):
     """(rx, ry, rz) for the waypoints `tail` of an arc starting at the arm's
     current orientation: gazing at gaze_target and leveling out before arrival
     (if GAZE_ENABLED and a target is given), else easing to the fixed
-    PICK_ORIENTATION_DEG / ORIENT_LOCK pose."""
+    PICK_ORIENTATION_DEG / ORIENT_LOCK pose. land=True makes that ease ARRIVE
+    on the fixed pose by the last waypoint (blending over GAZE_EASE_OUT_S);
+    without it a short arc ends still part-way between the start pose and it."""
     rx0, ry0 = PICK_ORIENTATION_DEG[:2]
     rz_raw = _yaw(tail)
     rz_seq = rz_raw if isinstance(rz_raw, list) else [rz_raw] * len(tail)
@@ -624,7 +673,8 @@ def _arc_orientations(arm, tail, durs, gaze_target):
     # eases FROM the arm's actual current orientation (which, after a gazed
     # arc, can be far from PICK_ORIENTATION_DEG) -- a no-op when it's already
     # there, e.g. the whole run has GAZE_ENABLED=False.
-    return ease_to_rpy(fixed, start_rpy, durs, GAZE_EASE_IN_S)
+    return ease_to_rpy(fixed, start_rpy, durs, GAZE_EASE_IN_S,
+                       ease_out_s=GAZE_EASE_OUT_S if land else None)
 
 
 class _GripTimer(threading.Thread):
@@ -770,8 +820,8 @@ def _plan_arc(arm, pts, durs, label, gaze_target=None):
     ys = [p[1] for p in tail]
     zs = [p[2] for p in tail]
 
-    def _plan(gaze):
-        rx, ry, rz = _arc_orientations(arm, tail, durs, gaze)
+    def _plan(gaze, land=False):
+        rx, ry, rz = _arc_orientations(arm, tail, durs, gaze, land=land)
         return arm.plan_path(x=xs, y=ys, z=zs, rx=rx, ry=ry, rz=rz, durations=list(durs))
 
     arm.last_error = None
@@ -780,7 +830,10 @@ def _plan_arc(arm, pts, durs, label, gaze_target=None):
     if not pl.ok and GAZE_ENABLED and gaze_target is not None:
         _say(f"  {label}: gaze pose unreachable ({pl.error}) "
              f"-- retrying this arc with fixed orientation")
-        pl = _plan(None)
+        # land=True: the retry must really END straight down -- easing alone
+        # (GAZE_EASE_IN_S ~ 4 s) stays tilted on a ~2.5 s arc, MORE tilted than
+        # the gaze it replaces, and would grab the cube tilted
+        pl = _plan(None, land=True)
     arm.last_plan = pl
     if not pl.ok:
         arm.last_error = pl.error

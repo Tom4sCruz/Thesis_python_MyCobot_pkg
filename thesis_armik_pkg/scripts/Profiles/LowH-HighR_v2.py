@@ -51,6 +51,16 @@ start-of-run and abort homing stay live (one coordinated joint move).
 
 Everything you tune is a CONSTANT below. The cube coordinates and
 PICK_ORIENTATION_DEG are PLACEHOLDERS -- measure them on your arm first.
+
+COMPILED RUN
+------------
+The rehearsed run is saved to compiled/LowH-HighR_v2.json and reused on the next
+launch until this script, armik/ or a _*.py helper changes (see
+_compiled.py). --recompile forces a fresh rehearsal; --compile-only builds
+it and exits without connecting to an arm (compile on the laptop, commit,
+and the Jetson only plays it back):
+
+    python3 scripts/Profiles/LowH-HighR_v2.py --compile-only
 """
 
 from __future__ import annotations
@@ -69,6 +79,7 @@ import numpy as np
 
 from armik import Arm, Plan, config, ik, pose_coords
 from armik.kinematics import check_joint_limits, check_workspace_bounds
+import _compiled
 
 # ===========================================================================
 # CONSTANTS
@@ -90,11 +101,14 @@ CUBES_INITIAL_POINTS = [          # a row on the pick side, LISTED LEFT -> RIGHT
     (14.0, 15.5, Z_CUBE_COORD),
     (14.0, 23.0, Z_CUBE_COORD),
 ]
-CUBES_TARGET_POINTS = [           # the drop row; cube picked k-th goes to slot k
-    (14.0, -10.0, Z_CUBE_COORD),
-    (14.0, -15.5, Z_CUBE_COORD),
-    (14.0, -23.0, Z_CUBE_COORD),
+
+CUBES_TARGET_POINTS = [           # clean, evenly-spaced drop row, uniform z -- no overshoot
+    (12.0, -23.0, Z_CUBE_COORD),
+    (17.0, -16.5, Z_CUBE_COORD),
+    (14.0, -8.0, Z_CUBE_COORD),
 ]
+
+CUBES_TARGET_POINTS = CUBES_TARGET_POINTS[::-1]
 
 # Gripper orientation (rx, ry, rz DEG) held for EVERY move. CALIBRATION: jog to
 # gripper-straight-down, read arm.get_coords()[3:] (current TOOL frame).
@@ -648,6 +662,11 @@ def main():
                     help="mock only: stream the simulated pose + precomputed path to RViz2 "
                          "(needs rclpy; run inside the Study-docker container)")
     ap.add_argument("--yes", action="store_true", help="skip the safety prompt")
+    ap.add_argument("--recompile", action="store_true",
+                    help="ignore the compiled run in compiled/ and rehearse it again")
+    ap.add_argument("--compile-only", action="store_true",
+                    help="rehearse (or check) the compiled run, save it, and exit -- "
+                         "no arm is connected")
     args = ap.parse_args()
 
     if args.rviz and not args.mock:
@@ -661,7 +680,7 @@ def main():
         print(f"NUDGE_CYCLE must be an EVEN (reach) cycle, got {NUDGE_CYCLE}.")
         return 1
 
-    if not args.mock and not args.yes:
+    if not args.mock and not args.yes and not args.compile_only:
         print("This will move the robot arm and actuate the gripper. Clear the workspace.")
         if input("Type 'go' to continue: ").strip().lower() != "go":
             return 1
@@ -676,6 +695,39 @@ def main():
         print(f"NUDGE on cycle {NUDGE_CYCLE}: cube #{nk + 1} at {CUBES_INITIAL_POINTS[nk]} "
               f"-- the descent onto it stops at {int(NUDGE_AT_FRACTION * 100)}%, waits "
               f"{NUDGE_WAIT_S:.1f}s, then moves on to the next cube; this one is left behind")
+
+    # ---- the tape: load the compiled run, or rehearse it now on a simulated arm ----
+    # (see _compiled.py -- reused until any source it depends on changes)
+    tape = None if args.recompile else _compiled.load(__file__, "fixed")
+    if tape is not None:
+        n_moves = sum(1 for step in tape if step[0] == "plan")
+        print(f"loaded the compiled run ({n_moves} motions) -- skipping the rehearsal")
+    else:
+        global _TAPE
+        print("\nrehearsing the whole run on a simulated arm (nothing moves yet)...")
+        t_rehearse = time.perf_counter()
+        sim = Arm(mock=True, quiet_mock=True)          # the rehearsal arm -- no MOCK warning
+        sim.conn.raw.set_angles_directly([float(v) for v in HOME])
+        sim.jerk = JERK
+        _TAPE = []
+        try:
+            ok = _choreography(sim, segments)
+        finally:
+            tape, _TAPE = _TAPE, None
+            sim.close()
+        if not ok:
+            for step in tape:                      # show how far the rehearsal got
+                if step[0] == "say":
+                    print(step[1])
+            print("\nrehearsal failed (see above) -- nothing moved.")
+            return 1
+        n_moves = sum(1 for step in tape if step[0] == "plan")
+        print(f"precomputed {n_moves} motions in {time.perf_counter() - t_rehearse:.1f} s")
+        saved = _compiled.save(__file__, "fixed", tape)
+        if saved:
+            print(f"compiled -> {_os.path.relpath(saved)}")
+    if args.compile_only:
+        return 0
 
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
     # Jerky motion: v2's cube moves are coordinated / streamed, so with
@@ -734,29 +786,6 @@ def main():
                   "Nothing moved.")
             go_home(arm)
             return 1
-
-        # ---- rehearsal: compute EVERYTHING now, on a simulated arm ----------
-        global _TAPE
-        print("\nrehearsing the whole run on a simulated arm (nothing moves yet)...")
-        t_rehearse = time.perf_counter()
-        sim = Arm(mock=True, quiet_mock=True)          # the rehearsal arm -- no MOCK warning
-        sim.conn.raw.set_angles_directly([float(v) for v in HOME])
-        sim.jerk = JERK
-        _TAPE = []
-        try:
-            ok = _choreography(sim, segments)
-        finally:
-            tape, _TAPE = _TAPE, None
-            sim.close()
-        if not ok:
-            for step in tape:                      # show how far the rehearsal got
-                if step[0] == "say":
-                    print(step[1])
-            print("\nrehearsal failed (see above) -- the arm has not moved beyond homing.")
-            return 1
-        n_moves = sum(1 for step in tape if step[0] == "plan")
-        print(f"precomputed {n_moves} motions in {time.perf_counter() - t_rehearse:.1f} s "
-              f"-- playing back")
 
         # ---- playback: no computing between actions --------------------------
         if not _play(arm, tape):

@@ -92,6 +92,16 @@ straight-down orientation can force a joint past its real hardware limit
 on a short, close-to-base move -- confirmed the hard way fixing
 HighH-LowR.py earlier; verify reachability before trusting new
 TARGET_POSITIONS on real hardware.
+
+COMPILED RUN
+------------
+The rehearsed run is saved to compiled/LowH-LowR.json and reused on the next
+launch until this script, armik/ or a _*.py helper changes (see
+_compiled.py). --recompile forces a fresh rehearsal; --compile-only builds
+it and exits without connecting to an arm (compile on the laptop, commit,
+and the Jetson only plays it back):
+
+    python3 scripts/Profiles/LowH-LowR.py --compile-only
 """
 
 from __future__ import annotations
@@ -110,6 +120,7 @@ import numpy as np
 
 from armik import Arm, config, pose_coords
 from armik.arm import Execution
+import _compiled
 
 # ===========================================================================
 # CONSTANTS
@@ -1071,6 +1082,11 @@ def main():
                     help="mock only: stream the simulated pose + precomputed path to RViz2 "
                          "(needs rclpy; run inside the Study-docker container)")
     ap.add_argument("--yes", action="store_true", help="skip the safety prompt")
+    ap.add_argument("--recompile", action="store_true",
+                    help="ignore the compiled run in compiled/ and rehearse it again")
+    ap.add_argument("--compile-only", action="store_true",
+                    help="rehearse (or check) the compiled run, save it, and exit -- "
+                         "no arm is connected")
     args = ap.parse_args()
 
     if args.rviz and not args.mock:
@@ -1093,7 +1109,7 @@ def main():
         print(f"EARLY_DROP_CYCLE must be an ODD (carry) cycle, got {EARLY_DROP_CYCLE}.")
         return 1
 
-    if not args.mock and not args.yes:
+    if not args.mock and not args.yes and not args.compile_only:
         print("This will move the robot arm and actuate the gripper. Clear the workspace.")
         if input("Type 'go' to continue: ").strip().lower() != "go":
             return 1
@@ -1114,12 +1130,82 @@ def main():
 
     segments = _build_segments(order, home_tip)
 
+    # ---- the run: load the compiled one, or rehearse it now on a simulated arm ----
+    # (see _compiled.py -- reused until any source it depends on changes)
+    compiled = None if args.recompile else _compiled.load(__file__, RANDOM_SEED)
+    if compiled is not None:
+        paths, all_durs, styles, tape = (compiled[k] for k in ("paths", "all_durs", "styles", "tape"))
+        n_moves = sum(1 for step in tape if step[0] == "plan")
+        print(f"loaded the compiled run ({n_moves} motions) -- skipping the rehearsal")
+    else:
+        global _TAPE
+        print("\nrehearsing the whole run on a simulated arm (nothing moves yet)...")
+        t_rehearse = time.perf_counter()
+        sim = Arm(mock=True, quiet_mock=True)          # the rehearsal arm -- no MOCK warning
+        sim.conn.raw.set_angles_directly([float(v) for v in HOME])
+        try:
+            # ---- every arc + its durations (style/ease/speed all fresh per move) ----
+            # _draw_valid_move() validates each candidate arc against arm.plan_path()
+            # (reachability + MAX_JOINT_SPEED_DPS) before committing to it -- see the
+            # note above EASE_MIN/EASE_MAX. Purely planning; no motion happens here.
+            # plan_path() plans from the arm's CURRENT pose, so the number of re-rolls
+            # (and with it every later draw from the shared rng) depends on where the
+            # arm is -- done on the simulated arm at exactly HOME (where the real arm
+            # is after homing), so RANDOM_SEED really reproduces the run.
+            paths, all_durs, styles = [], [], []
+            for ci, seg in enumerate(segments):
+                if ci == DIAGONAL_ARC_CYCLE and seg["kind"] == "reach":
+                    pts, durs, desc = _draw_valid_diagonal(sim, seg["origin"], seg["target"], rng)
+                elif ci == ROLLERCOASTER_CYCLE and seg["kind"] == "carry":
+                    pts, durs, desc = _draw_valid_rollercoaster(sim, seg["origin"], seg["target"], rng)
+                else:
+                    cruise_override = LEADOUT_SPEED_CM_S if seg["kind"] == "leadout" else None
+                    pts, durs, desc = _draw_valid_move(sim, seg["origin"], seg["target"], rng,
+                                                       cruise_override)
+                paths.append(pts)
+                all_durs.append(durs)
+                styles.append(desc)
+
+            _TAPE = []
+            try:
+                ok = _choreography(sim, segments, paths, all_durs, styles, rng)
+            finally:
+                tape, _TAPE = _TAPE, None
+        finally:
+            sim.close()
+        if not ok:
+            for step in tape:                      # show how far the rehearsal got
+                if step[0] == "say":
+                    print(step[1])
+            print("\nrehearsal failed (see above) -- nothing moved.")
+            return 1
+        n_moves = sum(1 for step in tape if step[0] == "plan")
+        print(f"precomputed {n_moves} motions in {time.perf_counter() - t_rehearse:.1f} s")
+        saved = _compiled.save(__file__, RANDOM_SEED,
+                               {"paths": paths, "all_durs": all_durs, "styles": styles, "tape": tape})
+        if saved:
+            print(f"compiled -> {_os.path.relpath(saved)}")
+    if args.compile_only:
+        return 0
+
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
     bridge = None
 
+    if args.rviz:
+        from _rviz_bridge import RvizBridge
+        flat_path = [tuple(map(float, p)) for seg_pts in paths for p in seg_pts]
+        cube_pts = [tuple(map(float, c)) for c in CUBES_INITIAL_POINTS]
+        try:
+            bridge = RvizBridge(arm.get_angles, path_xyz_cm=flat_path,
+                                cube_points=cube_pts, tip_source=arm.get_coords,
+                                gripper_source=arm.get_gripper_value)
+            bridge.start()
+            print("RViz bridge up: publishing /joint_states + /visualization_marker")
+        except RuntimeError as exc:
+            print(exc)
+            bridge = None
+
     try:
-        # power on FIRST -- homing and _draw_valid_move() below need a powered arm
-        # (arm.plan_path() refuses "arm reports power off" otherwise)
         if not arm.conn.is_power_on():
             print("powering on...")
             arm.conn.power_on()
@@ -1132,68 +1218,11 @@ def main():
         time.sleep(SETTLE_S)
         print(f"start pose (tip, cm/deg): {[round(v, 2) for v in arm.get_coords()]}")
 
-        # ---- precompute every arc + its durations (style/ease/speed all fresh per move) ----
-        # _draw_valid_move() validates each candidate arc against a live arm.plan_path()
-        # (reachability + MAX_JOINT_SPEED_DPS) before committing to it -- see the note
-        # above EASE_MIN/EASE_MAX. Purely planning; no motion happens here.
-        # Done AFTER homing on purpose: plan_path() plans from the arm's CURRENT
-        # pose, so the number of re-rolls (and with it every later draw from the
-        # shared rng) depends on where the arm is. From HOME it is the same every
-        # run, so RANDOM_SEED really reproduces the run.
-        paths, all_durs, styles = [], [], []
-        for ci, seg in enumerate(segments):
-            if ci == DIAGONAL_ARC_CYCLE and seg["kind"] == "reach":
-                pts, durs, desc = _draw_valid_diagonal(arm, seg["origin"], seg["target"], rng)
-            elif ci == ROLLERCOASTER_CYCLE and seg["kind"] == "carry":
-                pts, durs, desc = _draw_valid_rollercoaster(arm, seg["origin"], seg["target"], rng)
-            else:
-                cruise_override = LEADOUT_SPEED_CM_S if seg["kind"] == "leadout" else None
-                pts, durs, desc = _draw_valid_move(arm, seg["origin"], seg["target"], rng, cruise_override)
-            paths.append(pts)
-            all_durs.append(durs)
-            styles.append(desc)
-
-        if args.rviz:
-            from _rviz_bridge import RvizBridge
-            flat_path = [tuple(map(float, p)) for seg_pts in paths for p in seg_pts]
-            cube_pts = [tuple(map(float, c)) for c in CUBES_INITIAL_POINTS]
-            try:
-                bridge = RvizBridge(arm.get_angles, path_xyz_cm=flat_path,
-                                    cube_points=cube_pts, tip_source=arm.get_coords,
-                                    gripper_source=arm.get_gripper_value)
-                bridge.start()
-                print("RViz bridge up: publishing /joint_states + /visualization_marker")
-            except RuntimeError as exc:
-                print(exc)
-                bridge = None
-
         if PREFLIGHT and not preflight(arm, segments, paths, all_durs):
             print("\npreflight failed -- fix the cube/target coordinates or PICK_ORIENTATION_DEG. "
                   "Nothing moved.")
             go_home(arm)
             return 1
-
-        # ---- rehearsal: compute EVERYTHING now, on a simulated arm ----------
-        global _TAPE
-        print("\nrehearsing the whole run on a simulated arm (nothing moves yet)...")
-        t_rehearse = time.perf_counter()
-        sim = Arm(mock=True, quiet_mock=True)          # the rehearsal arm -- no MOCK warning
-        sim.conn.raw.set_angles_directly([float(v) for v in HOME])
-        _TAPE = []
-        try:
-            ok = _choreography(sim, segments, paths, all_durs, styles, rng)
-        finally:
-            tape, _TAPE = _TAPE, None
-            sim.close()
-        if not ok:
-            for step in tape:                      # show how far the rehearsal got
-                if step[0] == "say":
-                    print(step[1])
-            print("\nrehearsal failed (see above) -- the arm has not moved beyond homing.")
-            return 1
-        n_moves = sum(1 for step in tape if step[0] == "plan")
-        print(f"precomputed {n_moves} motions in {time.perf_counter() - t_rehearse:.1f} s "
-              f"-- playing back")
 
         # ---- playback: no computing between actions --------------------------
         if not _play(arm, tape):

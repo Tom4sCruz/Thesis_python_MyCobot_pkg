@@ -81,6 +81,16 @@ the cube, like a hand), right after the arc finishes -- no background thread.
 Everything you tune is a CONSTANT below. The cube coordinates,
 PICK_ORIENTATION_DEG and MAX_HEIGHT_TRAJECTORY are PLACEHOLDERS -- measure them
 on your arm first.
+
+COMPILED RUN
+------------
+The rehearsed run is saved to compiled/HighH-LowR.json and reused on the next
+launch until this script, armik/ or a _*.py helper changes (see
+_compiled.py). --recompile forces a fresh rehearsal; --compile-only builds
+it and exits without connecting to an arm (compile on the laptop, commit,
+and the Jetson only plays it back):
+
+    python3 scripts/Profiles/HighH-LowR.py --compile-only
 """
 
 from __future__ import annotations
@@ -104,6 +114,7 @@ from _gaze import (gaze_waypoints, gaze_then_level_waypoints, look_at_rpy, ease_
                    wrist_look_angles, wrist_track_angles)
 from armik.kinematics import check_joint_limits
 from _celebrate import celebration_durations, min_feasible_duration_s
+import _compiled
 
 # ===========================================================================
 # CONSTANTS
@@ -1382,6 +1393,11 @@ def main():
                     help="mock only: stream the simulated pose + precomputed path to RViz2 "
                          "(needs rclpy; run inside the Study-docker container)")
     ap.add_argument("--yes", action="store_true", help="skip the safety prompt")
+    ap.add_argument("--recompile", action="store_true",
+                    help="ignore the compiled run in compiled/ and rehearse it again")
+    ap.add_argument("--compile-only", action="store_true",
+                    help="rehearse (or check) the compiled run, save it, and exit -- "
+                         "no arm is connected")
     args = ap.parse_args()
 
     if args.rviz and not args.mock:
@@ -1391,7 +1407,7 @@ def main():
     if len(CUBES_INITIAL_POINTS) != len(CUBES_TARGET_POINTS):
         print("CUBES_INITIAL_POINTS and CUBES_TARGET_POINTS must be the same length.")
         return 1
-    if not args.mock and not args.yes:
+    if not args.mock and not args.yes and not args.compile_only:
         print("This will move the robot arm and actuate the gripper. Clear the workspace.")
         if input("Type 'go' to continue: ").strip().lower() != "go":
             return 1
@@ -1449,6 +1465,38 @@ def main():
         t_i = cruise_dur * (1.0 - ARC_TIME_EQUALIZATION) + cruise_dur_max * ARC_TIME_EQUALIZATION
         all_durs.append(get_durations(seg["origin"], seg["target"], h, ei, eo, duration=t_i))
 
+    # ---- the tape: load the compiled run, or rehearse it now on a simulated arm ----
+    # (see _compiled.py -- reused until any source it depends on changes)
+    tape = None if args.recompile else _compiled.load(__file__, RANDOM_SEED)
+    if tape is not None:
+        n_moves = sum(1 for step in tape if step[0] == "plan" and step[1] is not None)
+        print(f"loaded the compiled run ({n_moves} motions) -- skipping the rehearsal")
+    else:
+        global _TAPE
+        print("\nrehearsing the whole run on a simulated arm (nothing moves yet)...")
+        t_rehearse = time.perf_counter()
+        sim = Arm(mock=True, quiet_mock=True)          # the rehearsal arm -- no MOCK warning
+        sim.conn.raw.set_angles_directly([float(v) for v in HOME])
+        _TAPE = []
+        try:
+            ok = _choreography(sim, segments, paths, all_durs, d_max, cruise_dur_max, rng)
+        finally:
+            tape, _TAPE = _TAPE, None
+            sim.close()
+        if not ok:
+            for step in tape:                      # show how far the rehearsal got
+                if step[0] == "say":
+                    print(step[1])
+            print("\nrehearsal failed (see above) -- nothing moved.")
+            return 1
+        n_moves = sum(1 for step in tape if step[0] == "plan" and step[1] is not None)
+        print(f"precomputed {n_moves} motions in {time.perf_counter() - t_rehearse:.1f} s")
+        saved = _compiled.save(__file__, RANDOM_SEED, tape)
+        if saved:
+            print(f"compiled -> {_os.path.relpath(saved)}")
+    if args.compile_only:
+        return 0
+
     arm = Arm(port=args.port, baudrate=args.baud, mock=args.mock)
 
     bridge = None
@@ -1487,28 +1535,6 @@ def main():
                   "Nothing moved.")
             go_home(arm)
             return 1
-
-        # ---- rehearsal: compute EVERYTHING now, on a simulated arm ----------
-        global _TAPE
-        print("\nrehearsing the whole run on a simulated arm (nothing moves yet)...")
-        t_rehearse = time.perf_counter()
-        sim = Arm(mock=True, quiet_mock=True)          # the rehearsal arm -- no MOCK warning
-        sim.conn.raw.set_angles_directly([float(v) for v in HOME])
-        _TAPE = []
-        try:
-            ok = _choreography(sim, segments, paths, all_durs, d_max, cruise_dur_max, rng)
-        finally:
-            tape, _TAPE = _TAPE, None
-            sim.close()
-        if not ok:
-            for step in tape:                      # show how far the rehearsal got
-                if step[0] == "say":
-                    print(step[1])
-            print("\nrehearsal failed (see above) -- the arm has not moved beyond homing.")
-            return 1
-        n_moves = sum(1 for step in tape if step[0] == "plan" and step[1] is not None)
-        print(f"precomputed {n_moves} motions in {time.perf_counter() - t_rehearse:.1f} s "
-              f"-- playing back")
 
         # ---- playback: no computing between actions --------------------------
         if not _play(arm, tape):

@@ -151,11 +151,11 @@ CUBES_INITIAL_POINTS = [          # a row on the pick side
 CUBES_INITIAL_POINTS = CUBES_INITIAL_POINTS[::-1]
 
 CUBES_TARGET_POINTS = [           # clean, evenly-spaced drop row, uniform z -- no overshoot
-    (14.0, -23.0, Z_CUBE_COORD),
-    (14.0, -16.5, Z_CUBE_COORD),
+    (12.0, -23.0, Z_CUBE_COORD),
+    (17.0, -16.5, Z_CUBE_COORD),
     (14.0, -8.0, Z_CUBE_COORD),
-    #(15.0, -19.0, Z_CUBE_COORD),
 ]
+
 CUBES_TARGET_POINTS = CUBES_TARGET_POINTS[::-1]
 
 # Gripper orientation (rx, ry, rz DEG) held for EVERY move so the gripper stays

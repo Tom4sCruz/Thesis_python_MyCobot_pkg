@@ -149,13 +149,15 @@ CUBES_INITIAL_POINTS = [          # a row on the pick side (reused from HighH-Lo
 ]
 CUBES_INITIAL_POINTS = CUBES_INITIAL_POINTS[::-1]
 
-# PLACEHOLDER -- deliberately scattered, not a tidy row, to emphasize chaotic/
-# unintentional placement. Retune freely; keep count == len(CUBES_INITIAL_POINTS).
-TARGET_POSITIONS = [
-    (16.0, -9.0, Z_CUBE_COORD + 0.5),
-    (12.0, -19.5, Z_CUBE_COORD - 0.5),
-    (18.5, -14.0, Z_CUBE_COORD),
+
+TARGET_POSITIONS = [           # clean, evenly-spaced drop row, uniform z -- no overshoot
+    (8.0, -22.0, Z_CUBE_COORD),
+    (19.0, -17.5, Z_CUBE_COORD),
+    (18.0, -5.0, Z_CUBE_COORD),
+    #(15.0, -19.0, Z_CUBE_COORD),
 ]
+TARGET_POSITIONS = TARGET_POSITIONS[::-1]
+
 
 # Gripper orientation (rx, ry, rz DEG) held for EVERY move so the gripper stays
 # pointing straight down. CALIBRATION: jog to gripper-straight-down, read

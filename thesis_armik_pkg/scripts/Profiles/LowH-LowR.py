@@ -38,6 +38,10 @@ N_CYCLES = 2 * (number of cubes). Even cycle 2k = reach cube k and close;
 odd cycle 2k+1 = carry cube k to its target and open. A final lead-out arc
 returns to HOME.
 
+LOOP_REACH_CYCLE replaces one reach's drawn arc with a scripted loop: forward
+and fully stretched out in front, up, then over and down onto the cube (see
+the LOOP REACH constants).
+
 GRIPPER TIMING -- THE CORE OF THIS PROFILE
 -------------------------------------------
 Every other profile in this repo fires the gripper exactly at the arc's
@@ -118,8 +122,9 @@ import time
 
 import numpy as np
 
-from armik import Arm, config, pose_coords
+from armik import Arm, Plan, config, ik, pose_coords
 from armik.arm import Execution
+from armik.kinematics import check_joint_limits
 import _compiled
 
 # ===========================================================================
@@ -315,6 +320,31 @@ NORMAL_GRIP_CYCLES = (0, 2, 4, 5)   # () disables
 # the-next-arc override.
 EARLY_DROP_CYCLE = 1            # -1 disables
 EARLY_DROP_FRACTION = 0.5       # 0..1 -- fraction of THIS carry elapsed before the drop
+
+# 7) LOOP REACH -- must be an EVEN (reach) cycle: instead of the drawn arc, the
+# arm 1) moves forward (+x) from where it is, 2) stretches fully to the front
+# (LOOP_STRETCH_Q), 3) comes up through LOOP_TOP_CM, 4) curves over and down to
+# LOOP_ABOVE_CUBE_CM above the cube, then lands on it straight down and closes
+# (always at arrival -- this cycle ignores the random grip offset). A gripper
+# action deferred from the previous carry (DELAYED_OPEN_CYCLE) fires during
+# stage 1, DELAYED_OPEN_FRACTION of LOOP_STRETCH_S in.
+# Stages 1-4 are JOINT-space moves: the stretched arm is a singularity, which
+# Cartesian IK can neither reach exactly nor bend back out of. Every via pose
+# points the gripper down, and the joint blends between them keep it down.
+# Replaced the drawn arc from (8,-22) to cube #2 at (14,15.5), which swung J1
+# 114 deg in 2.3 s (192 deg/s) past 7 cm from the base: the real servos lagged
+# and the gripper arrived from the side. The loop keeps >= 20 cm from the base
+# and ~105 deg/s.
+LOOP_REACH_CYCLE = 4                       # -1 disables
+LOOP_STRETCH_Q = [0.0, -90.0, 0.0, 0.0, 0.0, 0.0]   # tip ~(28.0, -6.5, -0.7) cm, pointing down
+LOOP_STRETCH_S = 2.5                       # stages 1-2: forward + stretch (s)
+LOOP_STRETCH_HOLD_S = 0.3                  # pause at full stretch
+LOOP_TOP_CM = (20.0, 0.0, 15.0)            # stage 3's highest point -- pointing down, the arm
+                                           # reaches r ~21.5 cm at z=15, ~17 cm at z=18
+LOOP_UP_OVER_S = 3.5                       # stages 3-4: stretch -> top -> above the cube (s)
+LOOP_ABOVE_CUBE_CM = 8.0                   # height above the cube where the vertical landing starts
+LOOP_LAND_S = 1.2                          # the vertical landing (s)
+LOOP_LAND_WAYPOINTS = 20
 
 # -- gripper ---------------------------------------------------------------------
 GRIP_OPEN_DEG = 120.0           # 0 = closed .. config.MAX_GRIPPER_DEG = full open
@@ -902,6 +932,130 @@ def _send_arc(arm, pts, durs, label):
     return True
 
 
+# ---- LOOP_REACH_CYCLE: joint-space moves -------------------------------------
+
+def _ticks(total_s):
+    """Setpoint times for a move of total_s: one per control tick, ends included."""
+    n = max(1, int(round(total_s * config.CONTROL_RATE_HZ)))
+    return np.linspace(0.0, total_s, n + 1)
+
+
+def _ease_rows(q0, q1, total_s):
+    """(t, rows): rest-to-rest smootherstep from joint pose q0 to q1."""
+    q0 = np.asarray(q0, dtype=float)
+    q1 = np.asarray(q1, dtype=float)
+    t = _ticks(total_s)
+    return t, q0[None, :] + (q1 - q0)[None, :] * _smootherstep(t / total_s)[:, None]
+
+
+def _spline_rows(knots, total_s):
+    """(t, rows): one joint-space curve through every pose in `knots` -- at
+    rest at the first and last, flowing through the ones between (Catmull-Rom
+    tangents, knots spaced by joint distance), timed by smootherstep. Rows are
+    linear blends of the knots, so if every knot points the gripper down
+    (J2+J3+J4 and J1-J6 constant) the whole curve does too."""
+    K = np.asarray(knots, dtype=float)
+    seg = np.linalg.norm(np.diff(K, axis=0), axis=1)
+    u_k = np.concatenate([[0.0], np.cumsum(seg)]) / max(float(seg.sum()), 1e-9)
+    m = [np.zeros(K.shape[1])]
+    m += [(K[i + 1] - K[i - 1]) / max(u_k[i + 1] - u_k[i - 1], 1e-9) for i in range(1, len(K) - 1)]
+    m += [np.zeros(K.shape[1])]
+    t = _ticks(total_s)
+    rows = []
+    for u in _smootherstep(t / total_s):
+        i = int(min(max(np.searchsorted(u_k, u, side="right") - 1, 0), len(K) - 2))
+        h = max(u_k[i + 1] - u_k[i], 1e-9)
+        s = (u - u_k[i]) / h
+        rows.append((2 * s ** 3 - 3 * s ** 2 + 1) * K[i] + (s ** 3 - 2 * s ** 2 + s) * h * m[i]
+                    + (-2 * s ** 3 + 3 * s ** 2) * K[i + 1] + (s ** 3 - s ** 2) * h * m[i + 1])
+    return t, np.array(rows)
+
+
+def _joint_move(arm, t, rows, label):
+    """Run (or record) a joint-space move; rows[0] is the arm's current pose.
+    Goes straight to _do_plan(), so the joint limits and MAX_JOINT_SPEED_DPS
+    are checked here. Returns bool."""
+    for r in rows[1:]:
+        problems = check_joint_limits(r)
+        if problems:
+            _say(f"  {label} REFUSED -- violates joint limits: {'; '.join(problems)}")
+            return False
+    dps = np.max(np.abs(np.diff(rows, axis=0)) / np.diff(t)[:, None], axis=0)
+    over = [f"J{j + 1} {v:.0f} deg/s" for j, v in enumerate(dps) if v > config.MAX_JOINT_SPEED_DPS[j]]
+    if over:
+        _say(f"  {label} REFUSED -- too fast for the hardware: {', '.join(over)}")
+        return False
+    plan = Plan(ok=True, q_waypoints=rows, timestamps=t, duration_s=float(t[-1]),
+                peak_joint_dps=float(dps.max()))
+    ex = _do_plan(arm, plan)
+    if not ex.ok:
+        _say(f"  {label}: execution ABORTED -- {ex.error}")
+        return False
+    _say(f"  {label}: {t[-1]:.2f} s, peak {dps.max():.0f} deg/s")
+    if ex.late_deadlines:
+        _say(f"  !! {ex.late_deadlines} late control-loop deadline(s) during this move")
+    return True
+
+
+def _down_q(xyz, seed):
+    """Joint pose with the tip at xyz (cm) and the gripper pointing down
+    (PICK_ORIENTATION_DEG / ORIENT_LOCK), IK-seeded from `seed`; None if
+    unreachable."""
+    rx, ry = PICK_ORIENTATION_DEG[:2]
+    d = np.array([xyz[0] * 10.0, xyz[1] * 10.0, xyz[2] * 10.0, rx, ry, _yaw_one(xyz[:2])])
+    if config.Z_RELATIVE_TO_JOINT1:
+        d[2] += config.JOINT_1_HEIGHT_CM * 10.0
+    return ik.try_solve(d, np.ones(6, dtype=bool), np.asarray(seed, dtype=float))
+
+
+def _loop_reach(arm, cube, pending, label, grip_deg, action):
+    """LOOP_REACH_CYCLE: forward + full stretch, up over the top, down to above
+    `cube`, straight down onto it, close. `pending` is a gripper action
+    deferred from the previous carry -- it fires during stage 1. Returns bool."""
+    above = (cube[0], cube[1], cube[2] + LOOP_ABOVE_CUBE_CM)
+    q_top = _down_q(LOOP_TOP_CM, HOME)
+    q_above = _down_q(above, q_top) if q_top is not None else None
+    if q_above is None:
+        _say(f"  {label}: loop REFUSED -- "
+             f"{'LOOP_TOP_CM' if q_top is None else 'the point above the cube'} "
+             f"is unreachable pointing down")
+        return False
+
+    # stages 1-2: forward + full stretch (split where a deferred gripper action fires)
+    q0 = np.asarray(arm.get_angles(), dtype=float)
+    q_s = np.asarray(LOOP_STRETCH_Q, dtype=float)
+    tick = 1.0 / config.CONTROL_RATE_HZ
+    if pending is not None:
+        p_deg, p_label, p_off = pending
+        t_fire = float(np.clip(p_off, 0.0, LOOP_STRETCH_S))
+        q_mid = q0 + (q_s - q0) * float(_smootherstep(t_fire / LOOP_STRETCH_S))
+        if t_fire >= tick and not _joint_move(arm, *_ease_rows(q0, q_mid, t_fire),
+                                              f"{label} forward (deferred head)"):
+            return False
+        if not _grip(arm, p_deg, f"{p_label} (fired late)"):
+            return False
+        q0, rest_s = q_mid, LOOP_STRETCH_S - t_fire
+    else:
+        rest_s = LOOP_STRETCH_S
+    if rest_s >= tick and not _joint_move(arm, *_ease_rows(q0, q_s, rest_s),
+                                          f"{label} forward + full stretch"):
+        return False
+    _pause(LOOP_STRETCH_HOLD_S)
+
+    # stages 3-4: up through LOOP_TOP_CM, over and down to above the cube
+    if not _joint_move(arm, *_spline_rows([q_s, q_top, q_above], LOOP_UP_OVER_S),
+                       f"{label} up + over"):
+        return False
+
+    # straight down onto the cube, eased over equal time steps
+    n = max(int(LOOP_LAND_WAYPOINTS), 2)
+    zs = above[2] + (cube[2] - above[2]) * _smootherstep(np.linspace(0.0, 1.0, n + 1))
+    pts = [(cube[0], cube[1], float(z)) for z in zs]
+    if not _send_arc(arm, pts, [LOOP_LAND_S / n] * n, f"{label} landing"):
+        return False
+    return _grip(arm, grip_deg, f"{action} (loop)")
+
+
 # ===========================================================================
 # PREFLIGHT
 # ===========================================================================
@@ -934,8 +1088,8 @@ def preflight(arm, segments, paths, all_durs):
     print("--- preflight: planning every full arc (matches send_path exactly) ---")
     n_arcs = 0
     for ci, (seg, pts, durs) in enumerate(zip(segments, paths, all_durs)):
-        if len(pts) < 2:
-            continue
+        if len(pts) < 2 or (ci == LOOP_REACH_CYCLE and seg["kind"] == "reach"):
+            continue                       # the loop is joint-space -- the rehearsal checks it
         n_arcs += 1
         pl = arm.plan_path(x=[p[0] for p in pts[1:]], y=[p[1] for p in pts[1:]],
                            z=[p[2] for p in pts[1:]], rx=rx, ry=ry, rz=_yaw(pts[1:]),
@@ -990,6 +1144,15 @@ def _choreography(arm, segments, paths, all_durs, styles, rng):
         _say(f"\n=== cycle {ci}/{N_CYCLES - 1}  {label}  "
              f"cube #{seg['k'] + 1}  -> {tuple(round(v, 1) for v in seg['target'])}  "
              f"[{styles[ci]}] ===")
+
+        # LOOP_REACH_CYCLE: a scripted joint-space loop instead of the drawn arc;
+        # it fires anything deferred from the previous cycle itself
+        if ci == LOOP_REACH_CYCLE and kind == "reach":
+            if not _loop_reach(arm, seg["target"], pending, label, grip_deg, action):
+                return False
+            pending = None
+            _check(arm, "cube", seg["target"])
+            continue
 
         # fire anything deferred from the PREVIOUS cycle, near the start of this arc
         if pending is not None:
@@ -1110,6 +1273,9 @@ def main():
     if EARLY_DROP_CYCLE >= 0 and EARLY_DROP_CYCLE % 2 != 1:
         print(f"EARLY_DROP_CYCLE must be an ODD (carry) cycle, got {EARLY_DROP_CYCLE}.")
         return 1
+    if LOOP_REACH_CYCLE >= 0 and LOOP_REACH_CYCLE % 2 != 0:
+        print(f"LOOP_REACH_CYCLE must be an EVEN (reach) cycle, got {LOOP_REACH_CYCLE}.")
+        return 1
 
     if not args.mock and not args.yes and not args.compile_only:
         print("This will move the robot arm and actuate the gripper. Clear the workspace.")
@@ -1164,6 +1330,17 @@ def main():
                     cruise_override = LEADOUT_SPEED_CM_S if seg["kind"] == "leadout" else None
                     pts, durs, desc = _draw_valid_move(sim, seg["origin"], seg["target"], rng,
                                                        cruise_override)
+                if ci == LOOP_REACH_CYCLE and seg["kind"] == "reach":
+                    # still drawn above, so the shared rng -- and every later arc --
+                    # stays the same as without the loop. The loop itself is planned
+                    # in _loop_reach(); here: a preview path for RViz, and its stage
+                    # 1 duration, which a deferred gripper action (DELAYED_OPEN_
+                    # FRACTION of "the next leg") is measured against.
+                    t = seg["target"]
+                    p_s = pose_coords(LOOP_STRETCH_Q)
+                    pts = [seg["origin"], (p_s[0] / 10.0, p_s[1] / 10.0, p_s[2] / 10.0),
+                           tuple(LOOP_TOP_CM), (t[0], t[1], t[2] + LOOP_ABOVE_CUBE_CM), t]
+                    durs, desc = [LOOP_STRETCH_S], "loop: forward + stretch, up, over, down"
                 paths.append(pts)
                 all_durs.append(durs)
                 styles.append(desc)

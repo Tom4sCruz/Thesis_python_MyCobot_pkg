@@ -154,7 +154,7 @@ CUBES_INITIAL_POINTS = CUBES_INITIAL_POINTS[::-1]
 CUBES_TARGET_POINTS = [           # clean, evenly-spaced drop row, uniform z -- no overshoot
     (12.0, -23.0, Z_CUBE_COORD),
     (17.0, -16.5, Z_CUBE_COORD),
-    (14.0, -8.0, Z_CUBE_COORD),
+    (14.0, -7.7, Z_CUBE_COORD),
 ]
 
 CUBES_TARGET_POINTS = CUBES_TARGET_POINTS[::-1]
@@ -233,7 +233,7 @@ NEXT_LOOK_START_FRAC = 1.0       # fraction of a return's PATH after which the h
 # Keep MAX_HEIGHT_TRAJECTORY reachable at PICK_ORIENTATION_DEG: gripper-down the
 # arm runs out of reach around world z ~ 17-18 cm near the workspace edge -- and
 # a high degree holds the apex height across most of the move, not just mid-way.
-TRAJECTORY_DEGREE = 4            # 2 = parabola; 3, 4, 6, 8, 12, ... = boxier (any value >= 1)
+TRAJECTORY_DEGREE = 6            # 2 = parabola; 3, 4, 6, 8, 12, ... = boxier (any value >= 1)
 MAX_HEIGHT_TRAJECTORY = 15.0
 MIN_ARC_HEIGHT_CM = 9.0          # floor, so short moves still clear the table / other cubes --
                                  # also keeps the elbow (J3) from folding past its real limit on

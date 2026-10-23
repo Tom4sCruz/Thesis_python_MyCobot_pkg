@@ -23,6 +23,8 @@ python3 scripts/verify_fk.py --port /dev/ttyTHS1     # 2. does the DH table matc
 python3 scripts/test_arm.py --port /dev/ttyTHS1      # 3. does it actually move?
 ```
 
+The Jetson is shared: another student's robot server, `shared-growth-workstation.service`, starts at boot and keeps `/dev/ttyTHS1` open, so armik's reads fail and streamed moves stutter while it runs. Run `scripts/take_arm.sh` before a hardware session (stops it, checks the port is free) and `scripts/release_arm.sh` after (starts it again). armik's `ArmConnection` also refuses to open a port another process holds, and `sudo python3 scripts/diag_port.py` reports who holds it and how it was started.
+
 There is no pytest/unittest suite and no CI. Validation is done by standalone, self-contained scripts in `scripts/` (`test_arm.py`, `test_lock.py`, `test_path.py`, `test_gripper_tcp.py`, `verify_fk.py`, ...), each printing its own PASS/FAIL stage banners; most support `--mock` (no hardware) and `--yes` (skip the confirmation prompt). There's no "run a single test" — each script *is* one suite; run the whole script.
 
 Movement-profile scripts (the current focus of thesis work) live in `scripts/Profiles/` and run the same way:
@@ -30,7 +32,11 @@ Movement-profile scripts (the current focus of thesis work) live in `scripts/Pro
 python3 scripts/Profiles/<name>.py --mock --yes            # simulate, no hardware
 python3 scripts/Profiles/<name>.py --port /dev/ttyTHS1     # real hardware
 python3 scripts/Profiles/<name>.py --mock --yes --rviz     # simulate + stream to RViz2 (needs Study-docker, see below)
+python3 scripts/Profiles/<name>.py --compile-only          # rehearse + save the run, no arm connected
+python3 scripts/Profiles/<name>.py --recompile ...         # ignore the saved run, rehearse again
 ```
+
+**Compiled runs** (`HighH-LowR.py`, `HighH-HighR.py`, `LowH-HighR_v2.py`, `LowH-LowR.py`): each rehearses its whole run on a simulated arm into a "tape" of finished plans, then plays it back. `scripts/Profiles/_compiled.py` saves that tape to `scripts/Profiles/compiled/<name>.json` (portable JSON, committed to git) keyed by a SHA-256 of the script, every `armik/*.py`, every `scripts/Profiles/_*.py` except `_rviz_bridge.py`, and `RANDOM_SEED`. A matching key loads the tape and skips the rehearsal; any edit to those files (even a comment) re-rehearses and re-saves. `RANDOM_SEED = None` is never cached. Workflow: `--compile-only` on the laptop → commit `compiled/` → pull on the Jetson, which then only plays back.
 
 ## Architecture
 

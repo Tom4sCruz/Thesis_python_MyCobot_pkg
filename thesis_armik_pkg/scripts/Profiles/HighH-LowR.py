@@ -26,8 +26,9 @@ TEST of HighH-LowR.py with the GRIPPER MOVING WHILE THE ARM MOVES:
     reopens as the arm reaches for the moved cube;
   * Phase 1 looks at the cubes (straight at the first one) and then reaches
     for it right away.
-  * after the nudge recoil the head glances, confused, between the moved
-    cube and a point CONFUSED_OFFSET_CM beside it (CONFUSED_* constants).
+  * after the nudge recoil the head glances once, confused, at a point
+    CONFUSED_OFFSET_CM beside the moved cube and back (CONFUSED_* constants,
+    NUDGE_SETTLE_S).
 arm.move_joints() / arm.send_path() only return once the motion is over (they
 stream setpoints in a loop), so a gripper call written after them runs too
 late. Here the gripper command is sent from a short background thread while
@@ -311,24 +312,24 @@ NUDGE_LOOK_SPEED_DPS = 80.0    # the head starts turning to the cube's NEW posit
                                # travel / time, eased by HEAD_SWING_EASE_IN / OUT). The turn
                                # runs alongside the recoil on its own clock: it may finish
                                # before the hop back does, or just after it
-NUDGE_SETTLE_S = 1.5           # pause after the confused glances, "waiting for the cube to stop"
 
-# -- confused glances after the recoil ---------------------------------------------
+# -- confused glance after the recoil ----------------------------------------------
 # Once the recoil is over (the head already looking at the moved cube), the head
-# glances back and forth between the moved cube and a point CONFUSED_OFFSET_CM
-# beside it -- wrist only (J4/J5), the arm stays where the recoil left it.
+# glances ONCE at a point CONFUSED_OFFSET_CM beside the moved cube and back --
+# wrist only (J4/J5), the arm stays where the recoil left it:
+#   stare at the cube (CONFUSED_CUBE_STARE_S) -> glance to the other point ->
+#   stare there (CONFUSED_OTHER_STARE_S) -> glance back to the cube ->
+#   wait (NUDGE_SETTLE_S) -> start moving toward the cube.
 CONFUSED_ENABLED = True
 CONFUSED_OFFSET_CM = (10.0, 0.0, 0.0)   # the "other" point, relative to the moved cube
-CONFUSED_GLANCE_COUNT = 4      # head swings in the main sequence; each cube -> other or
-                               # other -> cube swing counts as one (4: other, cube, other, cube)
-CONFUSED_START_DELAY_S = 0.5   # pause after the recoil ends, before the first glance
-CONFUSED_REPEAT_ENABLED = True # after a pause, one more glance: other, then back to the cube
-CONFUSED_REPEAT_DELAY_S = 0.5  # the pause before that last glance
+CONFUSED_CUBE_STARE_S = 0.5    # stare at the moved cube (after the recoil) before glancing away
+CONFUSED_OTHER_STARE_S = 0.5   # stare at the other point before looking back at the cube
+NUDGE_SETTLE_S = 1.5           # back on the moved cube -> starts moving toward it ("waiting
+                               # for the cube to stop"); also used when CONFUSED_ENABLED=False
 CONFUSED_SPEED_DPS = 70.0      # average speed of a glance (largest wrist travel / time)
 CONFUSED_EASE_IN = 2.0         # [0,10] acceleration into each glance -- see EASE_IN's doc
 CONFUSED_EASE_OUT = 2.0        # [0,10] deceleration out of each glance
 CONFUSED_WAYPOINTS = 20        # samples per glance
-CONFUSED_HOLD_S = 0.2         # beat held at the end of each glance
 
 # where the nudged cube visually ends up -- always fed to RvizBridge as the yellow
 # preview cube, independent of whether nudging is enabled this run
@@ -1140,13 +1141,11 @@ def _play_nod(arm):
 
 
 def _confused_glances(arm, cube):
-    """After the recoil: the head (J4/J5 only, the arm holds still) glances
-    between `cube` and a point CONFUSED_OFFSET_CM beside it --
-    a CONFUSED_START_DELAY_S beat, CONFUSED_GLANCE_COUNT swings starting
-    toward the other point, then
-    (CONFUSED_REPEAT_ENABLED) a CONFUSED_REPEAT_DELAY_S pause and one more
-    other -> cube glance. A pose the head cannot aim from here skips the
-    glances (with a message) rather than failing the run. Returns bool."""
+    """After the recoil: the head (J4/J5 only, the arm holds still) stares at
+    `cube` for CONFUSED_CUBE_STARE_S, glances once at a point CONFUSED_OFFSET_CM
+    beside it, stares there for CONFUSED_OTHER_STARE_S, and glances back to the
+    cube. A pose the head cannot aim from here skips the glance (with a
+    message) rather than failing the run. Returns bool."""
     if not (GAZE_ENABLED and CONFUSED_ENABLED):
         return True
     other = tuple(float(c + o) for c, o in zip(cube, CONFUSED_OFFSET_CM))
@@ -1154,29 +1153,20 @@ def _confused_glances(arm, cube):
     q_cube, _e1 = wrist_look_angles(q_here, cube, LOOK_MIN_TIP_Z_CM)
     q_other, _e2 = wrist_look_angles(q_here, other, LOOK_MIN_TIP_Z_CM)
     if q_cube is None or q_other is None:
-        _say(f"  confused glances skipped -- no head pose looks at "
+        _say(f"  confused glance skipped -- no head pose looks at "
              f"{'the cube' if q_cube is None else tuple(round(v, 1) for v in other)} from here")
         return True
 
-    n = max(int(CONFUSED_GLANCE_COUNT), 0)
-    seq = [q_other if i % 2 == 0 else q_cube for i in range(n)]
-    if CONFUSED_REPEAT_ENABLED:
-        seq += [None, q_other, q_cube]                  # None = the pause
-    _say(f"  confused: glancing between the cube and {tuple(round(v, 1) for v in other)} "
-         f"({n} glances" + (", then one more after a pause" if CONFUSED_REPEAT_ENABLED else "")
-         + f"; aim error {_e1:.1f} / {_e2:.1f} deg, J4/J5 swing "
+    _say(f"  confused: one glance to {tuple(round(v, 1) for v in other)} and back "
+         f"(aim error {_e1:.1f} / {_e2:.1f} deg, J4/J5 swing "
          f"{abs(q_other[3] - q_cube[3]):.0f} / {abs(q_other[4] - q_cube[4]):.0f} deg)")
-    _pause(CONFUSED_START_DELAY_S)
-    for q_goal in seq:
-        if q_goal is None:
-            _pause(CONFUSED_REPEAT_DELAY_S)
-            continue
+    for stare_s, q_goal in ((CONFUSED_CUBE_STARE_S, q_other), (CONFUSED_OTHER_STARE_S, q_cube)):
+        _pause(stare_s)
         q_now = arm.get_angles()
         if not _eased_joint_move(arm, _line_to(q_now, q_goal, CONFUSED_WAYPOINTS),
                                  CONFUSED_SPEED_DPS, CONFUSED_EASE_IN, CONFUSED_EASE_OUT,
                                  "  confused glance"):
             return False
-        _pause(CONFUSED_HOLD_S)
     return True
 
 

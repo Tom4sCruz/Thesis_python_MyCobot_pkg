@@ -242,7 +242,7 @@ MIN_PATH_RADIUS_CM = 14.0        # keep-out radius around the base, horizontal (
                                  # orientation reaches -- both END points were fine. 14.0 bows
                                  # this run's arcs by 0.6-2.3 cm and leaves that carry ~5 deg
                                  # of J3 headroom; 0 disables.
-CRUISE_SPEED_CM_S = 14.0          # peak tip speed; the ease dials stretch the move time
+CRUISE_SPEED_CM_S = 15.0          # peak tip speed; the ease dials stretch the move time
 ARC_TIME_EQUALIZATION = 0.5   # 0..1: blends each reach/carry arc's own duration at
                               # CRUISE_SPEED_CM_S (0 = today, duration grows with arc
                               # length) toward the WIDEST arc's own duration at that

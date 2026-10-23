@@ -37,7 +37,9 @@ time-elapsed, since what matters is "how long before touchdown does it start
 leveling out", independent of how long the arc as a whole takes:
 beta = exp(-remaining_s / ease_out_s), so beta ~= 0 (pure gaze) while
 remaining_s >> ease_out_s and beta -> 1 (pure level) as remaining_s -> 0,
-landing exactly on the level pose at the arc's last waypoint. Blended via the
+landing exactly on the level pose at the arc's last waypoint. It is rescaled
+to be exactly 0 at the arc's start (see _level_out_weights) -- otherwise a
+short arc starts with a jump toward level. Blended via the
 same quaternion slerp as ease-in, between the (already ease-in-eased) live
 gaze matrix and the level matrix -- not a second independent easer.
 """
@@ -236,8 +238,15 @@ def gaze_waypoints(points_xyz, target_xyz, start_rpy, durations, ease_in_s):
 
 def _level_out_weights(durs, ease_out_s):
     """Per-waypoint blend weight toward the level pose: exp(-remaining/ease_out_s),
-    i.e. 0 early in the arc and exactly 1 on the LAST waypoint. durs[i] is the
-    time spent reaching waypoint i."""
+    rescaled to be exactly 0 at the arc's START (remaining = the whole arc) and
+    exactly 1 on the LAST waypoint. durs[i] is the time spent reaching waypoint i.
+
+    Unscaled, the start would already carry exp(-T/ease_out_s) -- 0.145 on a
+    3.9 s arc with ease_out_s = 2 -- that the actual start pose does not have,
+    so waypoint 1 demanded a sudden turn toward level (~6 deg from a head-
+    tilted look pose). It landed on the arc's slowest, longest first segment
+    (the ease-in), where the joint spline overshot: a burst of joint motion
+    with the tip still, a dip, then the real move -- "stops, then proceeds"."""
     n = len(durs)
     remaining_s = [0.0] * n
     running = 0.0
@@ -247,7 +256,10 @@ def _level_out_weights(durs, ease_out_s):
     tau_out = max(float(ease_out_s), 0.0)
     if tau_out <= 1e-9:
         return [1.0 if r <= 1e-9 else 0.0 for r in remaining_s]
-    return [math.exp(-r / tau_out) for r in remaining_s]
+    if running <= 1e-9:                          # zero-length arc: just land
+        return [1.0] * n
+    e_start = math.exp(-running / tau_out)       # running == the whole arc's duration here
+    return [(math.exp(-r / tau_out) - e_start) / (1.0 - e_start) for r in remaining_s]
 
 
 def gaze_then_level_waypoints(points_xyz, target_xyz, level_rpy_sequence,

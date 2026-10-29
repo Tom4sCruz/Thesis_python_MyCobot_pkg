@@ -8,6 +8,13 @@ distortion from views of a printed chessboard, and saves them for
 aruco_cube.py --calib. Without this, aruco_cube.py guesses the intrinsics,
 which is fine for eyeballing the overlay but not for measuring positions.
 
+RealSense: the camera is calibrated at the factory, and
+  python3 scripts/Vision/calibrate_camera.py --from-realsense
+saves those intrinsics to camera_calib.npz and exits -- no chessboard needed
+(reach_cube.py even reads them live when --calib is not given). The
+chessboard flow below is then an optional cross-check, or the way to go with
+--source v4l2 when pyrealsense2 is not installed.
+
 How to calibrate:
   1. python3 scripts/Vision/calibrate_camera.py --print-board
      Print chessboard_9x6.png at 100 % scale (no "fit to page"), measure one
@@ -20,7 +27,7 @@ How to calibrate:
      still and sharp (no motion blur).
   3. Press C -> calibrates and writes camera_calib.npz. RMS reprojection
      error: < 0.5 px good, < 1 px OK, more -> recapture (blurry/bent views).
-  4. python3 scripts/Vision/aruco_cube.py --calib camera_calib.npz
+  4. python3 scripts/Vision/reach_cube.py --calib camera_calib.npz
 The calibration is only valid for this camera at this resolution.
 
 Keys (live): SPACE keep view, U drop last view, C calibrate + save, Q/Esc quit.
@@ -36,6 +43,8 @@ import sys
 import cv2
 import numpy as np
 
+import _vision as V
+
 
 # =============================================================================
 # CONSTANTS  (each one can be overridden from the command line)
@@ -45,8 +54,7 @@ BOARD_COLS = 9                   # INNER corners per row (squares per row - 1)
 BOARD_ROWS = 6                   # INNER corners per column
 SQUARE_CM = 2.5                  # printed square side -- measure after printing
 MIN_VIEWS = 15                   # views needed before C is accepted
-CAMERA_INDEX = 0                 # /dev/videoN
-OUT_PATH = "camera_calib.npz"
+OUT_PATH = V.CAMERA_CALIB_PATH   # scripts/Vision/camera_calib.npz
 
 DETECT_WIDTH_PX = 640            # corners are searched on a copy this wide (speed), then
                                  # refined with cornerSubPix on the full-resolution image
@@ -131,23 +139,35 @@ def put_text(img, text, org, color=(255, 255, 255), scale=0.6):
 
 def main():
     ap = argparse.ArgumentParser(description="Chessboard camera calibration -> .npz")
-    ap.add_argument("--camera", type=int, default=CAMERA_INDEX, help="camera index (/dev/videoN)")
+    V.add_camera_args(ap)
     ap.add_argument("--cols", type=int, default=BOARD_COLS, help="inner corners per row")
     ap.add_argument("--rows", type=int, default=BOARD_ROWS, help="inner corners per column")
     ap.add_argument("--square-cm", type=float, default=SQUARE_CM, help="printed square side, cm")
     ap.add_argument("--min-views", type=int, default=MIN_VIEWS, help="views needed to calibrate")
     ap.add_argument("--out", default=OUT_PATH, help="output .npz")
     ap.add_argument("--print-board", action="store_true", help="write a printable chessboard PNG and exit")
+    ap.add_argument("--from-realsense", action="store_true",
+                    help="save the RealSense factory intrinsics to --out and exit")
     args = ap.parse_args()
 
     if args.print_board:
         print_board(args.cols, args.rows)
         return 0
 
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        print(f"Could not open camera {args.camera}", file=sys.stderr)
-        return 1
+    if args.from_realsense:
+        cam = V.open_camera("realsense", width=args.width, height=args.height)
+        try:
+            K, dist, image_size = cam.intrinsics()
+        finally:
+            cam.release()
+        save_calibration(args.out, K, dist, image_size, 0.0)
+        print(f"Factory intrinsics at {image_size[0]}x{image_size[1]}: "
+              f"fx={K[0, 0]:.1f} fy={K[1, 1]:.1f} cx={K[0, 2]:.1f} cy={K[1, 2]:.1f} "
+              f"dist={np.round(dist, 4)}")
+        print(f"Saved {args.out}")
+        return 0
+
+    cap = V.open_camera(args.source, args.camera, args.width, args.height)
 
     window = "calibrate_camera  (SPACE keep, U undo, C calibrate, Q quit)"
     views = []
@@ -187,7 +207,7 @@ def main():
                 rms, K, dist, errors = calibrate(views, image_size, args.cols, args.rows, args.square_cm)
                 report(rms, K, dist, errors, image_size)
                 save_calibration(args.out, K, dist, image_size, rms)
-                print(f"Saved {args.out}  ->  aruco_cube.py --calib {args.out}")
+                print(f"Saved {args.out}  ->  reach_cube.py --calib {args.out}")
                 break
     finally:
         cap.release()

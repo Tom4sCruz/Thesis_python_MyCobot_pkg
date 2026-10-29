@@ -82,6 +82,10 @@ Current family, by choreography:
 
 Shared dials worth knowing: `NUDGE_CYCLE` (which "reach" cycle triggers a scripted interruption; `-1` disables) appears in every profile script; `STUTTER_TYPE` lives centrally in `armik/config.py` rather than per-script.
 
+### Vision (`scripts/Vision/`)
+
+Camera-guided pick-and-place (OpenCV, kept out of `armik`). ArUco DICT_4X4_50: cube faces IDs 0-5 (3.0 cm on 3.4 cm tiles), BASE 10 and TARGET 11 (8 cm), all printed on one A4 page by `make_markers.py`. `_vision.py` holds the shared constants (incl. `BASE_MARKER_POSE`, the base marker's pose in the robot frame), the camera layer (`--source realsense` via pyrealsense2, or `v4l2`) and the pose maths. Order: `make_markers.py` → `calibrate_camera.py --from-realsense` (factory intrinsics; the chessboard flow is the fallback) → `calibrate_base.py` (hand-guided teach pairs → `base_calib.json`) → `reach_cube.py` (SPACE starts / stops a pick-and-place; state machine tracks whether a cube is held). `reach_cube.py` stops mid-move through `AbortableConnection`, an `ArmConnection` subclass whose `send_angles()` raises once SPACE is pressed — no `armik/` change needed. `aruco_cube.py` is the older stage-1 overlay demo (6x6 by default).
+
 ### RViz mock visualization (`--rviz`)
 
 Mock-only — profile scripts force it off unless `--mock` is also passed. `scripts/Profiles/_rviz_bridge.py` (`RvizBridge`) is the only place `rclpy` is imported anywhere in the repo, guarded so `armik` itself stays ROS-free. It does not launch RViz itself — it only publishes `/joint_states` (polled from the mock `Arm`'s live state — deliberately not `joint_state_publisher`, to avoid a duplicate publisher) and `visualization_msgs/Marker` (planned path, cube markers, live tip). RViz2 + `robot_state_publisher` are started separately via `thesis_armik_pkg/ros/launch/mock_display.launch.py`, using the URDF/RViz config under `thesis_armik_pkg/ros/`.

@@ -46,9 +46,9 @@ BASE_ID = 10
 TARGET_ID = 11
 
 CUBE_SIDE_CM = 3.5               # edge of the real cube
-CUBE_MARKER_CM = 3.0             # black square of a cube-face marker -- MEASURE the print
+CUBE_MARKER_CM = 2.85             # black square of a cube-face marker -- MEASURE the print
 CUBE_TILE_CM = 3.4               # white tile it is printed on (cut to this, glue centred)
-BIG_MARKER_CM = 8.0              # black square of the BASE / TARGET markers -- MEASURE the print
+BIG_MARKER_CM = 7.6              # black square of the BASE / TARGET markers -- MEASURE the print
 
 # Pose of the BASE marker's centre in the robot frame: (x, y, z cm, yaw deg).
 # yaw = angle from robot +x to the marker's x axis (its printed "right"),

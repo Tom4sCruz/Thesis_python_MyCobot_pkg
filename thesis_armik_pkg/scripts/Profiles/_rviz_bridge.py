@@ -14,6 +14,9 @@ with --rviz (which implies --mock). On the ROS 2 graph it publishes:
   * visualization_msgs/Marker on /visualization_marker -- a LINE_STRIP of the
     whole precomputed Cartesian path, a CUBE_LIST of green 3.5 cm cubes at the
     cube start positions, and (optionally) a live SPHERE at the tool tip.
+    Optional extras used by scripts/Vision/sim_pick_rviz.py: a flat disc for a
+    target zone, a ring on the table (reach limit) and a LIVE cube that is
+    re-published at the joint rate so it can ride along in the gripper.
 
 armik stays ROS-free: this module is the only place rclpy is imported, the
 import is guarded, and nothing here runs unless a profile script asks for it.
@@ -117,6 +120,10 @@ NUDGE_CUBE_COLOR_RGBA = (1.00, 0.90, 0.00, 0.55)   # yellow, semi-transparent
 TIP_COLOR_RGBA = (0.10, 1.00, 0.20, 0.90)    # green, near-solid
 LOOK_POINT_COLOR_RGBA = (1.00, 0.10, 0.10, 0.35)   # red, as transparent as the cubes
 LOOK_POINT_RADIUS_CM = 1.0                   # the look-point sphere's radius
+TARGET_COLOR_RGBA = (0.90, 0.10, 0.90, 0.35)  # magenta disc (target zone)
+RING_COLOR_RGBA = (0.60, 0.60, 0.60, 0.80)    # grey circle (reach ring)
+LIVE_CUBE_COLOR_RGBA = (1.00, 0.55, 0.10, 0.85)   # orange, near-solid
+TARGET_DISC_THICKNESS_CM = 0.2
 
 
 def _cm_xyz_to_frame(x_cm, y_cm, z_cm):
@@ -160,11 +167,17 @@ class RvizBridge:
     sequential_joints: True for single-joint profiles (LowH-HighR) -- animate
                     exactly one arm joint at a time, each over VIZ_SEQ_MOVE_S,
                     instead of the deg/s slew. Default False.
+    target_zone   : optional (x, y, z, diameter) CM -- a flat magenta disc.
+    reach_ring    : optional (radius, z) CM -- a grey circle around the base axis.
+    live_cube_source: optional zero-arg callable -> (x, y, z CM, yaw DEG) or None;
+                    drawn as one orange 3.5 cm cube, re-published every joint
+                    tick so it moves smoothly (e.g. while carried).
     """
 
     def __init__(self, joint_source, path_xyz_cm=None, cube_points=None,
                  nudge_cube_point=None, look_point=None,
                  tip_source=None, gripper_source=None, sequential_joints=False,
+                 target_zone=None, reach_ring=None, live_cube_source=None,
                  node_name="thesis_mock_rviz_bridge",
                  joint_rate_hz=30.0, marker_period_s=2.0):
         self._joint_source = joint_source
@@ -175,6 +188,11 @@ class RvizBridge:
         self._cube_points = [tuple(p) for p in cube_points] if cube_points else []
         self._nudge_cube_point = tuple(map(float, nudge_cube_point)) if nudge_cube_point else None
         self._look_point = tuple(map(float, look_point)) if look_point else None
+        self._target_zone = tuple(map(float, target_zone)) if target_zone else None
+        self._reach_ring = tuple(map(float, reach_ring)) if reach_ring else None
+        self._live_cube_source = live_cube_source
+        self._target_marker = None
+        self._ring_marker = None
         self._node_name = node_name
         self._joint_period = 1.0 / float(joint_rate_hz)
         self._marker_period = float(marker_period_s)
@@ -238,6 +256,8 @@ class RvizBridge:
         self._cube_marker = self._build_cube_marker()
         self._nudge_cube_marker = self._build_nudge_cube_marker()
         self._look_point_marker = self._build_look_point_marker()
+        self._target_marker = self._build_target_marker()
+        self._ring_marker = self._build_ring_marker()
 
         # One publish while this is still the only thread -> no cross-thread
         # races on the publishers; the spin thread takes over from here.
@@ -309,6 +329,13 @@ class RvizBridge:
             self._joint_pub.publish(msg)
         except Exception:                     # noqa: BLE001
             pass
+        if self._live_cube_source is not None:
+            cube = self._live_cube_marker(msg.header.stamp)
+            if cube is not None:
+                try:
+                    self._marker_pub.publish(cube)
+                except Exception:             # noqa: BLE001
+                    pass
 
     def _slew(self, target):
         """Display-only: ease the published pose toward `target` so the mock's
@@ -388,6 +415,10 @@ class RvizBridge:
             if self._look_point_marker is not None:
                 self._look_point_marker.header.stamp = now
                 self._marker_pub.publish(self._look_point_marker)
+            for m in (self._target_marker, self._ring_marker):
+                if m is not None:
+                    m.header.stamp = now
+                    self._marker_pub.publish(m)
             if self._tip_source is not None:
                 tip = self._tip_marker(now)
                 if tip is not None:
@@ -466,6 +497,67 @@ class RvizBridge:
         x, y, z = _cm_xyz_to_frame(*self._look_point)
         m.pose.position.x, m.pose.position.y, m.pose.position.z = x, y, z
         m.pose.orientation.w = 1.0
+        m.lifetime = _DurationMsg(sec=0, nanosec=0)
+        return m
+
+    def _build_target_marker(self):
+        if self._target_zone is None:
+            return None
+        x_cm, y_cm, z_cm, d_cm = self._target_zone
+        m = _Marker()
+        m.header.frame_id = MARKER_FRAME
+        m.ns = "thesis_target_zone"
+        m.id = 5
+        m.type = _Marker.CYLINDER
+        m.action = _Marker.ADD
+        m.scale.x = m.scale.y = d_cm / 100.0
+        m.scale.z = TARGET_DISC_THICKNESS_CM / 100.0
+        m.color = _rgba(TARGET_COLOR_RGBA)
+        x, y, z = _cm_xyz_to_frame(x_cm, y_cm, z_cm + TARGET_DISC_THICKNESS_CM / 2.0)
+        m.pose.position.x, m.pose.position.y, m.pose.position.z = x, y, z
+        m.pose.orientation.w = 1.0
+        m.lifetime = _DurationMsg(sec=0, nanosec=0)
+        return m
+
+    def _build_ring_marker(self):
+        if self._reach_ring is None:
+            return None
+        r_cm, z_cm = self._reach_ring
+        m = _Marker()
+        m.header.frame_id = MARKER_FRAME
+        m.ns = "thesis_reach_ring"
+        m.id = 6
+        m.type = _Marker.LINE_STRIP
+        m.action = _Marker.ADD
+        m.scale.x = 0.003
+        m.color = _rgba(RING_COLOR_RGBA)
+        m.pose.orientation.w = 1.0
+        m.points = [self._point((r_cm * math.cos(a), r_cm * math.sin(a), z_cm))
+                    for a in (2.0 * math.pi * k / 72 for k in range(73))]
+        m.lifetime = _DurationMsg(sec=0, nanosec=0)
+        return m
+
+    def _live_cube_marker(self, stamp):
+        try:
+            c = self._live_cube_source()
+        except Exception:                    # noqa: BLE001
+            return None
+        if c is None:
+            return None
+        m = _Marker()
+        m.header.frame_id = MARKER_FRAME
+        m.header.stamp = stamp
+        m.ns = "thesis_live_cube"
+        m.id = 7
+        m.type = _Marker.CUBE
+        m.action = _Marker.ADD
+        m.scale.x = m.scale.y = m.scale.z = 0.035
+        m.color = _rgba(LIVE_CUBE_COLOR_RGBA)
+        x, y, z = _cm_xyz_to_frame(c[0], c[1], c[2])
+        m.pose.position.x, m.pose.position.y, m.pose.position.z = x, y, z
+        half = math.radians(float(c[3])) / 2.0          # yaw about z -> quaternion
+        m.pose.orientation.z = math.sin(half)
+        m.pose.orientation.w = math.cos(half)
         m.lifetime = _DurationMsg(sec=0, nanosec=0)
         return m
 

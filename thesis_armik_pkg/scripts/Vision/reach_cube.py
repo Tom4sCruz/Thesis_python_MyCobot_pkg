@@ -62,6 +62,16 @@ STOPPING
     that into a firmware stop() and a failed (ok=False) execution, so armik/
     itself is untouched -- the compiled profile tapes stay valid.
 
+GRASP POINT AND TILT
+    The tip is sent to the cube centre + GRASP_OFFSET_MM, an offset in the
+    gripper's own frame (along / across the pad line) for a pad centre that
+    is not on armik's tip. Before SPACE the overlay marks the L / R pad
+    positions and the +across direction to tune it by.
+    The gripper grabs straight down when it can. Beyond ~28 cm it leans
+    outward about the pad line (pads stay flat on the cube), in
+    TILT_STEP_DEG steps up to MAX_GRASP_TILT_DEG (~33 cm), and it may take
+    the other pair of faces if that solves first. Same for the target.
+
 Every waypoint is IK-checked before the first command; an unreachable cube or
 target is refused with the reason and the arm does not move.
 
@@ -86,7 +96,8 @@ import cv2
 import numpy as np
 
 from armik import Arm, ArmConnection, ArmError, config, ik
-from armik.kinematics import check_joint_limits, check_workspace_bounds, pose_coords
+from armik.kinematics import (check_joint_limits, check_workspace_bounds, matrix_to_rpy,
+                              pose_coords, rpy_to_matrix)
 import _vision as V
 
 
@@ -98,8 +109,9 @@ import _vision as V
 HOME = [0.0, 0.0, -90.0, 0.0, 0.0, 0.0]
 HOME_MOVE_S = 2.5                # minimum duration of the joint-space move home
 JOINT_MOVE_DPS = 35.0            # ... longer if the biggest joint travel needs it
-MAX_DOWN_REACH_CM = 28.0         # a straight-down grasp reaches ~28 cm from the J1 axis
-                                 # (IK scan); only used to word the refusal message
+MAX_DOWN_REACH_CM = 28.0         # a straight-down grasp reaches ~28 cm from the J1 axis ...
+MAX_TILTED_REACH_CM = 33.0       # ... and ~33 cm leaned MAX_GRASP_TILT_DEG (IK scan); only
+                                 # used to word the refusal message
 
 # Gripper straight down (rx, ry, rz) -- same as the profiles' PICK_ORIENTATION_DEG.
 PICK_ORIENTATION_DEG = (180.0, 0.0, -45.0)
@@ -111,6 +123,25 @@ ORIENT_DOWN_TOL_DEG = 10.0       # rx/ry within this of PICK_ORIENTATION = "alre
 GRIP_SQUARE_YAW_DEG = 0.0
 YAW_SIGN = 1.0                   # flip to -1 if the gripper turns the wrong way to meet the cube
 ALIGN_YAW = True                 # False = always grab at PICK_ORIENTATION_DEG's rz
+
+# Where the pads' centre sits relative to armik's tip (TCP), in the GRIPPER's
+# frame, mm: (along the pad line toward the RIGHT pad, across it toward the
+# robot's left at the default rz). At PICK_ORIENTATION_DEG's rz the pad line
+# points along robot +x (right pad = the one further from the robot, seen
+# from +x); both directions turn with the gripper. The tip is sent to cube
+# centre + this offset, and at the target to target + this offset, so the
+# CUBE lands on the target. Before SPACE the overlay marks where the pads
+# should close (L / R dots), the "+across" direction and the tip it will
+# command (white dot). If the real pads land off those dots, move them by
+# that much: along = toward R, across = along the arrow.
+GRASP_OFFSET_MM = (2.0, 0.0)
+PAD_LINE_AT_DEFAULT_DEG = 0.0    # pad-line direction (robot frame) at the default rz
+
+# Tilt when needed: a cube or target too far for a straight-down gripper is
+# reached by leaning the gripper outward about the pad line (the pads stay
+# flat on the cube's faces), smallest tilt first.
+MAX_GRASP_TILT_DEG = 30.0
+TILT_STEP_DEG = 5.0
 
 # -- heights (cm) ---------------------------------------------------------------
 GRASP_Z_OFFSET_CM = 0.0          # grasp tip z = cube centre z + this. 0 after calibrate_base.py
@@ -250,11 +281,68 @@ def _angle_diff(a, b):
     return (a - b + 180.0) % 360.0 - 180.0
 
 
-def _pointing_down(tip):
-    """Is the gripper already (nearly) straight down? tip = get_coords()."""
+def _down(rz):
+    """Straight-down gripper orientation (rx, ry, rz) at yaw rz."""
     rx, ry, _ = PICK_ORIENTATION_DEG
-    return (abs(_angle_diff(tip[3], rx)) <= ORIENT_DOWN_TOL_DEG
-            and abs(_angle_diff(tip[4], ry)) <= ORIENT_DOWN_TOL_DEG)
+    return (rx, ry, float(rz))
+
+
+# The pad line in the gripper's own frame (constant): robot-frame direction
+# PAD_LINE_AT_DEFAULT_DEG seen from the default straight-down orientation.
+_PAD_AXIS_TOOL = rpy_to_matrix(*PICK_ORIENTATION_DEG).T @ np.array(
+    [math.cos(math.radians(PAD_LINE_AT_DEFAULT_DEG)),
+     math.sin(math.radians(PAD_LINE_AT_DEFAULT_DEG)), 0.0])
+
+
+def pad_line(orient):
+    """Unit vector (robot frame) from the left pad to the right pad."""
+    return rpy_to_matrix(*orient) @ _PAD_AXIS_TOOL
+
+
+def grasp_offset_xy(orient):
+    """GRASP_OFFSET_MM turned with the gripper -> (dx, dy) robot cm."""
+    u = pad_line(orient)[:2]
+    u = u / max(np.linalg.norm(u), 1e-9)
+    along, across = GRASP_OFFSET_MM
+    return (along * u + across * np.array([-u[1], u[0]])) / 10.0
+
+
+def grip_yaw_of(orient):
+    """The straight-down yaw rz whose pad line matches this orientation's."""
+    u = pad_line(orient)
+    a = math.degrees(math.atan2(u[1], u[0]))
+    return PICK_ORIENTATION_DEG[2] + _angle_diff(a, PAD_LINE_AT_DEFAULT_DEG)
+
+
+def _tilt_deg(orient):
+    """How far the gripper is from straight down."""
+    return math.degrees(math.acos(float(np.clip(-rpy_to_matrix(*orient)[2, 2], -1.0, 1.0))))
+
+
+def _rot_axis(axis, deg):
+    a = math.radians(deg)
+    x, y, z = np.asarray(axis, dtype=float) / np.linalg.norm(axis)
+    K = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+    return np.eye(3) + math.sin(a) * K + (1.0 - math.cos(a)) * K @ K
+
+
+def tilted(rz, tilt, toward_xy):
+    """Straight down at yaw rz, then leaned `tilt` deg about the pad line so the
+    gripper's tip points away from the base (toward_xy = where it is going)."""
+    if tilt <= 0.0:
+        return _down(rz)
+    R = rpy_to_matrix(*_down(rz))
+    u = R @ _PAD_AXIS_TOOL
+    for sign in (1.0, -1.0):
+        Rt = _rot_axis(u, sign * tilt) @ R
+        if float(np.dot(Rt[:2, 2], toward_xy)) >= 0.0:        # tool z (the tip) leans outward
+            break
+    return tuple(float(v) for v in matrix_to_rpy(Rt))
+
+
+def _pointing_down(tip):
+    """Is the gripper down, or leaned no more than a tilted grasp? tip = get_coords()."""
+    return _tilt_deg(tip[3:6]) <= MAX_GRASP_TILT_DEG + ORIENT_DOWN_TOL_DEG
 
 
 def joint_move_duration(q_from, q_to):
@@ -268,28 +356,53 @@ def _ik_target(x, y, z, rx, ry, rz):
     return np.array([x * 10.0, y * 10.0, z_mm, rx, ry, rz], dtype=float)
 
 
-def ik_check(points, q_seed):
-    """IK-solve each (name, x, y, z, rz) gripper-down point in order, seeding each from
-    the previous solution. Returns (None, last_q) if all are fine, else (reason, None)."""
-    rx, ry, _ = PICK_ORIENTATION_DEG
+def ik_check(points, orient, q_seed):
+    """IK-solve each (name, x, y, z) point at orientation (rx, ry, rz) in order, seeding
+    each from the previous solution. Returns (None, last_q) if all are fine, else
+    (reason, None)."""
     mask = np.ones(6, dtype=bool)
     q = np.asarray(q_seed, dtype=float)
-    for name, x, y, z, rz in points:
+    for name, x, y, z in points:
         why = check_workspace_bounds([x * 10.0, y * 10.0, z * 10.0])
         if why:
             return f"{name} ({x:.1f}, {y:.1f}, {z:.1f}) cm: {why}", None
-        sol = ik.try_solve(_ik_target(x, y, z, rx, ry, rz), mask, q)
+        sol = ik.try_solve(_ik_target(x, y, z, *orient), mask, q)
         if sol is None:
-            r = math.hypot(x, y)
-            if r > MAX_DOWN_REACH_CM:
-                return (f"{name} ({x:.1f}, {y:.1f}) is {r:.1f} cm from the base axis -- a "
-                        f"straight-down grasp reaches ~{MAX_DOWN_REACH_CM:.0f} cm; move it closer"), None
             return f"{name} ({x:.1f}, {y:.1f}, {z:.1f}) cm: no IK solution", None
         problems = check_joint_limits(sol)
         if problems:
             return f"{name}: " + "; ".join(problems), None
         q = sol
     return None, q
+
+
+def plan_orientation(build, yaw, seeds, toward_xy, what):
+    """Find the gripper orientation for one group of points (the cube's, or the
+    target's): straight down at `yaw` first, then the other pair of faces
+    (yaw -+ 90), then leaned TILT_STEP_DEG more each round up to
+    MAX_GRASP_TILT_DEG. build(orient) -> [(name, x, y, z)] (the points move
+    with the grasp offset). Each orientation is tried from every seed.
+
+    Returns (plan, None), plan = dict(orient, yaw, tilt, q, seed), or (None, reason)."""
+    alt = yaw - 90.0 if yaw > PICK_ORIENTATION_DEG[2] else yaw + 90.0
+    first_why = None
+    n = int(round(MAX_GRASP_TILT_DEG / TILT_STEP_DEG))
+    for tilt in (k * TILT_STEP_DEG for k in range(n + 1)):
+        for rz in (yaw, alt):
+            orient = tilted(rz, tilt, toward_xy)
+            pts = build(orient)
+            for seed in seeds:
+                why, q = ik_check(pts, orient, seed)
+                if why is None:
+                    return {"orient": orient, "yaw": rz, "tilt": tilt, "q": q, "seed": seed}, None
+                first_why = first_why or why
+    r = math.hypot(*toward_xy)
+    if r > MAX_DOWN_REACH_CM:
+        return None, (f"{what} ({toward_xy[0]:.1f}, {toward_xy[1]:.1f}) is {r:.1f} cm from the "
+                      f"base axis -- the gripper reaches ~{MAX_DOWN_REACH_CM:.0f} cm straight down, "
+                      f"~{MAX_TILTED_REACH_CM:.0f} cm tilted {MAX_GRASP_TILT_DEG:.0f} deg; "
+                      f"move {what} closer")
+    return None, f"{first_why} (also tried tilting up to {MAX_GRASP_TILT_DEG:.0f} deg)"
 
 
 class Runner:
@@ -324,72 +437,104 @@ class Runner:
         q0 = np.array(self.arm.get_angles(), dtype=float)
         tip = self.arm.get_coords()
         down = _pointing_down(tip)
-
-        place_z = table_z + V.CUBE_SIDE_CM / 2.0 + RELEASE_CLEARANCE_CM + GRASP_Z_OFFSET_CM
-        carry_z = place_z + HOVER_ABOVE_CM
-        if not self.holding:
-            rz = grip_rz(cube_yaw)
-            grasp = (float(cube_center[0]), float(cube_center[1]),
-                     float(cube_center[2]) + GRASP_Z_OFFSET_CM)
-            hover_z = grasp[2] + HOVER_ABOVE_CM
-            carry_z = max(carry_z, hover_z)
-        else:
-            # resuming with the cube in hand: keep the yaw it was grabbed with
-            rz = tip[5] if down else PICK_ORIENTATION_DEG[2]
-
-        steps, checks = [], []
-        if not self.holding:
-            # from wherever the arm is: up, across, down onto the cube
-            steps.append(("rise", lambda: self._rise(hover_z, rz)))
-            steps.append(("open gripper", lambda: self._grip(GRIP_OPEN_DEG)))
-            steps.append(("above cube", lambda: self._move(grasp[0], grasp[1], hover_z, rz)))
-            steps.append(("descend", lambda: self._move(*grasp, rz, APPROACH_SPEED_CM_S)))
-            steps.append(("grasp", self._grasp))
-            steps.append(("lift", lambda: self._move(grasp[0], grasp[1], carry_z, rz)))
-            checks += [("above cube", grasp[0], grasp[1], hover_z, rz),
-                       ("grasp", *grasp, rz),
-                       ("lift", grasp[0], grasp[1], carry_z, rz)]
-        else:
-            steps.append(("rise", lambda: self._rise(carry_z, rz)))
-
-        if not self.no_place:
-            if target_xy is None:
-                return "TARGET marker not seen yet"
-            tx, ty = float(target_xy[0]), float(target_xy[1])
-            steps += [("above target", lambda: self._move(tx, ty, carry_z, rz)),
-                      ("lower", lambda: self._move(tx, ty, place_z, rz, APPROACH_SPEED_CM_S)),
-                      ("release", self._release),
-                      ("retreat", lambda: self._move(tx, ty, carry_z, rz)),
-                      ("home", self._home)]
-            checks += [("above target", tx, ty, carry_z, rz),
-                       ("place", tx, ty, place_z, rz)]
-
         # Plan from the current configuration if it is a good start; otherwise
         # (gripper not down, or an odd elbow/wrist branch the solver can't get
         # out of -- e.g. wherever calibrate_base left the arm) go HOME first in
         # joint space and plan from there.
-        why = "gripper not pointing down"
-        if down:
-            why, _ = ik_check(checks, q0)
-        home_tip = [float(v) / 10.0 for v in pose_coords(np.array(HOME, dtype=float))[:3]]
+        home_q = np.array(HOME, dtype=float)
+        seeds = [q0, home_q] if down else [home_q]
+
+        place_z = table_z + V.CUBE_SIDE_CM / 2.0 + RELEASE_CLEARANCE_CM + GRASP_Z_OFFSET_CM
+        carry_z = place_z + HOVER_ABOVE_CM
+        cube_plan, cube_pts, seed = None, [], None
+        if not self.holding:
+            cx, cy = float(cube_center[0]), float(cube_center[1])
+            grasp_z = float(cube_center[2]) + GRASP_Z_OFFSET_CM
+            hover_z = grasp_z + HOVER_ABOVE_CM
+            carry_z = max(carry_z, hover_z)
+
+            def cube_points(orient):
+                dx, dy = grasp_offset_xy(orient)
+                return [("above cube", cx + dx, cy + dy, hover_z),
+                        ("grasp", cx + dx, cy + dy, grasp_z),
+                        ("lift", cx + dx, cy + dy, carry_z)]
+
+            cube_plan, why = plan_orientation(cube_points, grip_rz(cube_yaw), seeds, (cx, cy),
+                                              "the cube")
+            if why:
+                return why
+            cube_pts = cube_points(cube_plan["orient"])
+            seed = cube_plan["seed"]
+            yaw = cube_plan["yaw"]
+        else:
+            # resuming with the cube in hand: keep the yaw it was grabbed with
+            yaw = grip_yaw_of(tip[3:6]) if down else PICK_ORIENTATION_DEG[2]
+
+        target_plan, target_pts = None, []
+        if not self.no_place:
+            if target_xy is None:
+                return "TARGET marker not seen yet"
+            tx, ty = float(target_xy[0]), float(target_xy[1])
+
+            def target_points(orient):
+                dx, dy = grasp_offset_xy(orient)      # the CUBE, not the tip, lands on the target
+                return [("above target", tx + dx, ty + dy, carry_z),
+                        ("place", tx + dx, ty + dy, place_z)]
+
+            target_plan, why = plan_orientation(
+                target_points, yaw, [cube_plan["q"]] if cube_plan else seeds, (tx, ty),
+                "the TARGET marker")
+            if why:
+                return why
+            target_pts = target_points(target_plan["orient"])
+            if seed is None:
+                seed = target_plan["seed"]
+
+        steps = []
+        if not self.holding:
+            # from wherever the arm is: up, across, down onto the cube
+            o = cube_plan["orient"]
+            _, gx, gy, _ = cube_pts[0]
+            steps.append(("rise", lambda: self._rise(hover_z, o)))
+            steps.append(("open gripper", lambda: self._grip(GRIP_OPEN_DEG)))
+            steps.append(("above cube", lambda: self._move(gx, gy, hover_z, o)))
+            steps.append(("descend", lambda: self._move(gx, gy, grasp_z, o, APPROACH_SPEED_CM_S)))
+            steps.append(("grasp", self._grasp))
+            steps.append(("lift", lambda: self._move(gx, gy, carry_z, o)))
+        else:
+            o_hold = target_plan["orient"] if target_plan else _down(yaw)
+            steps.append(("rise", lambda: self._rise(carry_z, o_hold)))
+
+        if target_plan:
+            po = target_plan["orient"]
+            _, px, py, _ = target_pts[0]
+            steps += [("above target", lambda: self._move(px, py, carry_z, po)),
+                      ("lower", lambda: self._move(px, py, place_z, po, APPROACH_SPEED_CM_S)),
+                      ("release", self._release),
+                      ("retreat", lambda: self._move(px, py, carry_z, po)),
+                      ("home", self._home)]
+
+        home_tip = [float(v) / 10.0 for v in pose_coords(home_q)[:3]]
         start = tip[:3]
-        if why:
-            why_home, _ = ik_check(checks, np.array(HOME, dtype=float))
-            if why_home:
-                return why_home
-            print(f"[run] starting from HOME ({why})")
+        if seed is home_q or (seed is None and not down):
+            print("[run] starting from HOME ("
+                  + ("gripper not pointing down" if not down else "no plan from the current pose")
+                  + ")")
             steps.insert(0, ("home", self._home))
             start = home_tip
         # waypoints of the run in order (cm), for drawing the path (sim_pick_rviz.py)
         rise_z = carry_z if self.holding else hover_z
         self.planned_points = ([tuple(start), (start[0], start[1], max(start[2], rise_z))]
-                               + [tuple(c[1:4]) for c in checks]
+                               + [tuple(p[1:4]) for p in cube_pts + target_pts]
                                + ([tuple(home_tip)] if not self.no_place else []))
 
         self.conn.abort.clear()
         self.status, self.step = "RUNNING", ""
-        self.message = (f"cube ({grasp[0]:.1f}, {grasp[1]:.1f}, {grasp[2]:.1f}) cm  rz {rz:.0f}"
-                        if not self.holding else "carrying the held cube")
+        tilts = [f"{n} tilt {p['tilt']:.0f}" for n, p in (("grasp", cube_plan), ("place", target_plan))
+                 if p and p["tilt"] > 0]
+        self.message = ((f"cube ({cx:.1f}, {cy:.1f}, {grasp_z:.1f}) cm  rz {yaw:.0f}"
+                         if not self.holding else "carrying the held cube")
+                        + ("  " + ", ".join(tilts) if tilts else ""))
         print(f"[run] {'carry' if self.holding else 'pick'}: {self.message}; "
               f"steps: {', '.join(n for n, _ in steps)}")
         self._thread = threading.Thread(target=self._run, args=(steps,), daemon=True)
@@ -428,18 +573,18 @@ class Runner:
             self.status, self.message = "DONE", "done -- SPACE for another pick"
         print(f"[run] {self.status}")
 
-    def _move(self, x, y, z, rz, speed=TRAVEL_SPEED_CM_S):
-        rx, ry, _ = PICK_ORIENTATION_DEG
-        if self.arm.send_coords(x, y, z, rx, ry, rz, speed=speed):
+    def _move(self, x, y, z, orient, speed=TRAVEL_SPEED_CM_S):
+        """Tip to (x, y, z) cm at orientation (rx, ry, rz)."""
+        if self.arm.send_coords(x, y, z, *orient, speed=speed):
             return True
         return "already at the requested coordinates" in (self.arm.last_error or "")
 
-    def _rise(self, z, rz):
+    def _rise(self, z, orient):
         """Straight up to height z (skipped if already at least that high)."""
         tip = self.arm.get_coords()
         if tip[2] >= z - 0.3:
             return True
-        return self._move(tip[0], tip[1], z, rz)
+        return self._move(tip[0], tip[1], z, orient)
 
     def _home(self):
         q0 = self.arm.get_angles()
@@ -473,6 +618,26 @@ STATUS_COLORS = {"IDLE": (255, 255, 255), "RUNNING": (0, 220, 255), "STOPPED": (
                  "DONE": (0, 220, 0), "HOLDING": (255, 200, 0), "FAILED": (0, 0, 255)}
 
 
+def draw_grasp_preview(frame, center, yaw, T, K, dist):
+    """Where SPACE will close the pads (L / R, at the straight-down yaw; a tilt or
+    the other pair of faces may be chosen for a far cube), the +across direction
+    of GRASP_OFFSET_MM and the tip that will be commanded (white)."""
+    o = _down(grip_rz(yaw))
+    u = pad_line(o)
+    u[2] = 0.0
+    u /= np.linalg.norm(u)
+    v = np.array([-u[1], u[0], 0.0])
+    c = np.asarray(center, dtype=float)
+    half = V.CUBE_SIDE_CM / 2.0 + 0.5
+    dx, dy = grasp_offset_xy(o)
+    V.draw_point(frame, c + [dx, dy, 0.0], T, K, dist, (255, 255, 255), radius=3)
+    V.draw_point(frame, c - half * u, T, K, dist, (0, 255, 255), "L", radius=4)
+    V.draw_point(frame, c + half * u, T, K, dist, (0, 255, 255), "R", radius=4)
+    a, b = V.project_robot_points([c, c + 2.5 * v], T, K, dist)
+    cv2.arrowedLine(frame, V._pt(a), V._pt(b), (0, 255, 255), 1, cv2.LINE_AA, tipLength=0.25)
+    V.put_text(frame, "+across", V._pt(b + 4), (0, 255, 255), scale=0.4)
+
+
 def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable):
     K, dist = scene.K, scene.dist
     if scene.markers:
@@ -501,6 +666,8 @@ def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable):
             x, yy, z = c["center"]
             line(f"cube ({x:6.1f}, {yy:6.1f}, {z:5.1f}) cm  yaw {c['yaw']:5.1f}  "
                  f"faces {c['faces']}  {'steady' if stable else 'settling'}")
+            if stable and not runner.running and not runner.holding:
+                draw_grasp_preview(frame, c["center"], c["yaw"], T, K, dist)
             dz = c["raw_z"] - (scene.table_z + V.CUBE_SIDE_CM / 2.0)
             if abs(dz) > VISION_Z_WARN_CM and not scene.args.vision_z:
                 line(f"  seen z is {dz:+.1f} cm off the table plane (held? stacked? bad base pose?)",

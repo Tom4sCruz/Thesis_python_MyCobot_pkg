@@ -88,7 +88,8 @@ class SimCube:
             if self._attached is None:
                 if np.linalg.norm(self.center - t) > ATTACH_SNAP_CM:
                     # "holding" set by hand away from the cube: put it in the gripper
-                    self.center = t - np.array([0.0, 0.0, RC.GRASP_Z_OFFSET_CM])
+                    dx, dy = RC.grasp_offset_xy(tip[3:6])
+                    self.center = t - np.array([dx, dy, RC.GRASP_Z_OFFSET_CM])
                 self._attached = (self.center - t, self.yaw - float(tip[5]))
             off, yaw_off = self._attached
             self.center = t + off
@@ -191,7 +192,8 @@ class Sim:
     def _report_cube(self, what):
         x, y, z, yaw = self.cube.pose()
         d = math.hypot(x, y)
-        ok = "OK" if d <= RC.MAX_DOWN_REACH_CM else f"out of reach (> ~{RC.MAX_DOWN_REACH_CM:.0f} cm)"
+        ok = ("OK" if d <= RC.MAX_DOWN_REACH_CM else "OK, tilted grasp" if d <= RC.MAX_TILTED_REACH_CM
+              else f"out of reach (> ~{RC.MAX_TILTED_REACH_CM:.0f} cm)")
         print(f"  cube {what}: ({x:.1f}, {y:.1f}, {z:.1f}) cm  yaw {yaw:.0f}  "
               f"-> {d:.1f} cm from the base axis, {ok}")
 

@@ -44,7 +44,7 @@ import cv2
 import numpy as np
 
 import _vision as V
-from reach_cube import MAX_DOWN_REACH_CM, Scene
+from reach_cube import MAX_TILTED_REACH_CM, Scene
 
 
 # =============================================================================
@@ -114,7 +114,7 @@ def scene_dict(cube_center, cube_yaw, target_xy, table_z, faces, camera, intrins
 def reach_report(scene):
     for name, xy in (("cube", scene["cube"]["center"][:2]), ("target", scene["target"]["xy"])):
         r = math.hypot(*xy)
-        ok = "OK" if r <= MAX_DOWN_REACH_CM else f"OUT OF REACH (> ~{MAX_DOWN_REACH_CM:.0f} cm)"
+        ok = "OK" if r <= MAX_TILTED_REACH_CM else f"OUT OF REACH (> ~{MAX_TILTED_REACH_CM:.0f} cm)"
         print(f"  {name:6s} ({xy[0]:6.1f}, {xy[1]:6.1f}) cm  -> {r:5.1f} cm from the base axis  {ok}")
 
 

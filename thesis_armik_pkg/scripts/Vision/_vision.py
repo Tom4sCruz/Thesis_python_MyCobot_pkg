@@ -146,6 +146,18 @@ def open_camera(source=CAMERA_SOURCE, index=CAMERA_INDEX,
     raise SystemExit(f"unknown camera source {source!r} (realsense or v4l2)")
 
 
+def check_out_path(path, flag):
+    """Absolute form of an output path, or exit at once if its folder doesn't
+    exist -- BEFORE any capturing, so a typo can't throw away finished work.
+    Relative paths are relative to the current directory, not to this folder."""
+    out = os.path.abspath(path)
+    folder = os.path.dirname(out)
+    if not os.path.isdir(folder):
+        raise SystemExit(f"{flag} {path}: folder {folder} does not exist (relative paths are "
+                         f"relative to where you run the command: {os.getcwd()})")
+    return out
+
+
 def add_camera_args(ap):
     """The camera flags every vision script shares."""
     ap.add_argument("--source", choices=("realsense", "v4l2"), default=CAMERA_SOURCE,

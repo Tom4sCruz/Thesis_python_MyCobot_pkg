@@ -20,6 +20,8 @@ How to calibrate:
      Print chessboard_9x6.png at 100 % scale (no "fit to page"), measure one
      square with a ruler and tape/glue the sheet FLAT (cardboard, a book).
   2. python3 scripts/Vision/calibrate_camera.py --square-cm <measured>
+     (laptop webcam: add --source v4l2 --camera 0 --out webcam_calib.npz; a
+     relative --out is relative to the folder you run the command from)
      Hold the board in front of the camera. When the corners are drawn in
      colour the board is found -- press SPACE to keep that view. Collect ~20
      views: near and far, the board at all four corners and edges of the image
@@ -38,6 +40,7 @@ per-view translations, not the intrinsics.
 """
 
 import argparse
+import os
 import sys
 
 import cv2
@@ -149,6 +152,7 @@ def main():
     ap.add_argument("--from-realsense", action="store_true",
                     help="save the RealSense factory intrinsics to --out and exit")
     args = ap.parse_args()
+    args.out = V.check_out_path(args.out, "--out")
 
     if args.print_board:
         print_board(args.cols, args.rows)
@@ -206,8 +210,16 @@ def main():
                     continue
                 rms, K, dist, errors = calibrate(views, image_size, args.cols, args.rows, args.square_cm)
                 report(rms, K, dist, errors, image_size)
-                save_calibration(args.out, K, dist, image_size, rms)
-                print(f"Saved {args.out}  ->  reach_cube.py --calib {args.out}")
+                out = args.out
+                try:
+                    save_calibration(out, K, dist, image_size, rms)
+                except OSError as exc:
+                    # never lose a finished calibration: fall back to this script's folder
+                    out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       os.path.basename(args.out))
+                    print(f"Could not write {args.out} ({exc}); saving to {out} instead")
+                    save_calibration(out, K, dist, image_size, rms)
+                print(f"Saved {out}  ->  reach_cube.py --calib {out}")
                 break
     finally:
         cap.release()

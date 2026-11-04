@@ -23,11 +23,15 @@ PROCEDURE (the camera and the base marker must not move afterwards)
     2. Put the cube somewhere in the workspace, keep the arm out of the way
        until the cube box turns green, press C (cube position captured).
     3. Guide the gripper down around the cube, centred and gripper-down as for
-       a grasp, hold it still, press T (tip captured -> one pair).
+       a grasp, hold it still, press T (tip captured -> one pair). The live
+       "tilt" readout must be under MAX_TILT_DEG (3 deg) or T is refused: the
+       tool offset is only nominal, so a tilted gripper adds its error x a
+       9 cm lever.
     4. Repeat 2-3 at 3-5 spots spread over the area you'll use (near / far,
        left / right). U drops the last pair.
     5. F fits, prints the per-pair residual and saves. Residuals of a few mm
-       are good; a pair far off the rest is a bad capture -- U it and redo.
+       are good; a pair far off the rest is a bad capture -- W drops the
+       worst pair of the last fit, then capture a new one and F again.
     Q / Esc quits (servos are re-engaged on the way out).
 
 Uses the same camera flags as reach_cube.py (--source, --calib, ...).
@@ -53,8 +57,16 @@ import _vision as V
 from reach_cube import Scene
 
 
-WINDOW = "calibrate_base  (C cube, T tip, U undo, F fit+save, Q quit)"
+WINDOW = "calibrate_base  (C cube, T tip, U undo, W drop worst, F fit+save, Q quit)"
 MIN_PAIRS = 3
+MAX_TILT_DEG = 3.0               # T is refused unless the gripper is this close to straight down
+TIP_POLL_S = 0.2                 # live tip / tilt readout (servos released, nothing streamed)
+
+
+def gripper_tilt(coords):
+    """Degrees the gripper is off straight down (rx 180, ry 0), from get_coords()."""
+    drx = (coords[3] - 180.0 + 180.0) % 360.0 - 180.0
+    return math.hypot(drx, coords[4])
 
 
 # =============================================================================
@@ -94,6 +106,7 @@ def main():
     ap.add_argument("--cube-marker-cm", type=float, default=V.CUBE_MARKER_CM)
     ap.add_argument("--big-marker-cm", type=float, default=V.BIG_MARKER_CM)
     args = ap.parse_args()
+    args.out = V.check_out_path(args.out, "--out")
     args.vision_z = False                     # Scene option: cube z from the table plane
 
     cam = V.open_camera(args.source, args.camera, args.width, args.height)
@@ -106,6 +119,7 @@ def main():
     pairs = []                                 # (cube xyz, tip xyz), nominal frame
     pending = None                             # captured cube waiting for its tip
     msg = "place the cube, arm clear, press C"
+    coords, t_poll = None, 0.0
     try:
         while True:
             ok, frame = cam.read()
@@ -130,6 +144,18 @@ def main():
                     V.draw_point(frame, pending, T, K, dist, (255, 200, 0), "captured")
             V.put_text(frame, f"pairs: {len(pairs)}   {'BASE not seen' if T is None else ''}", (10, 25))
             V.put_text(frame, msg, (10, 50), (0, 220, 255))
+            now = time.monotonic()
+            if now - t_poll > TIP_POLL_S:
+                try:
+                    coords = arm.get_coords()
+                except Exception as exc:            # a missed serial read: keep the last one
+                    print(f"tip read failed: {exc}")
+                t_poll = now
+            if coords is not None:
+                tilt = gripper_tilt(coords)
+                V.put_text(frame, f"tip ({coords[0]:.1f}, {coords[1]:.1f}, {coords[2]:.1f}) cm   "
+                           f"tilt {tilt:.1f} deg", (10, 75),
+                           (0, 220, 0) if tilt <= MAX_TILT_DEG else (0, 0, 255))
             cv2.imshow(WINDOW, frame)
 
             key = cv2.waitKey(1) & 0xFF
@@ -146,7 +172,12 @@ def main():
                 if pending is None:
                     msg = "T: capture the cube with C first"
                 else:
-                    tip = np.array(arm.get_coords()[:3], dtype=float)
+                    c = arm.get_coords()
+                    tilt = gripper_tilt(c)
+                    if tilt > MAX_TILT_DEG:
+                        msg = f"T refused: gripper tilted {tilt:.1f} deg -- hold it straight down"
+                        continue
+                    tip = np.array(c[:3], dtype=float)
                     pairs.append((pending, tip))
                     d = np.linalg.norm(tip - pending)
                     print(f"pair {len(pairs)}: cube {np.round(pending, 2)}  tip {np.round(tip, 2)}  "
@@ -159,6 +190,12 @@ def main():
                 else:
                     pairs.pop()
                 msg = f"undone, {len(pairs)} pairs"
+            elif key == ord("w") and len(pairs) > MIN_PAIRS - 1:
+                _, res = fit_correction([p for p, _ in pairs], [q for _, q in pairs])
+                worst = int(np.argmax(res))
+                pairs.pop(worst)
+                msg = f"dropped pair {worst + 1} ({10 * res[worst]:.1f} mm), {len(pairs)} left"
+                print(msg)
             elif key == ord("f"):
                 if len(pairs) < MIN_PAIRS:
                     msg = f"F: need at least {MIN_PAIRS} pairs, have {len(pairs)}"
@@ -169,7 +206,12 @@ def main():
                 for i, r in enumerate(res):
                     print(f"  pair {i + 1}: residual {10 * r:.1f} mm")
                 rms = float(np.sqrt(np.mean(res ** 2)))
+                worst = int(np.argmax(res))
                 print(f"  RMS {10 * rms:.1f} mm  ({'PASS' if rms < 0.5 else 'check the worst pair'})")
+                if rms >= 0.5:
+                    print(f"  worst: pair {worst + 1} ({10 * res[worst]:.1f} mm). If it stands out, "
+                          "press W to drop it and capture a new one; if all are similar, check the "
+                          "marker sizes and the camera calibration")
                 calib["rms_cm"] = rms
                 calib["pairs"] = [{"cube": p.tolist(), "tip": q.tolist()} for p, q in pairs]
                 calib["base_marker_pose"] = list(V.BASE_MARKER_POSE)

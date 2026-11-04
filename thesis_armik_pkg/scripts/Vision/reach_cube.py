@@ -24,9 +24,14 @@ KEYS
 STATES
     A run is a list of steps; "holding" records whether the gripper has a cube:
 
-        ready -> rise -> above cube -> descend -> GRASP (holding = True)
+        [home] -> rise -> above cube -> descend -> GRASP (holding = True)
               -> lift -> above target -> lower -> RELEASE (holding = False)
               -> retreat -> home
+
+    [home] is only added when the arm's current configuration is a bad start
+    (gripper not pointing down, or the waypoints don't solve from it): a
+    joint-space move to HOME, which is gripper-down, and the run is planned
+    from there.
 
     SPACE mid-run stops the arm where it is. The next SPACE plans a FRESH run
     from the arm's current pose: not holding -> detect the cube again and
@@ -81,7 +86,7 @@ import cv2
 import numpy as np
 
 from armik import Arm, ArmConnection, ArmError, config, ik
-from armik.kinematics import check_joint_limits, check_workspace_bounds
+from armik.kinematics import check_joint_limits, check_workspace_bounds, pose_coords
 import _vision as V
 
 
@@ -91,10 +96,10 @@ import _vision as V
 
 # -- arm ------------------------------------------------------------------------
 HOME = [0.0, 0.0, -90.0, 0.0, 0.0, 0.0]
-HOME_MOVE_S = 2.5                # minimum duration of a joint-space move (home / ready)
+HOME_MOVE_S = 2.5                # minimum duration of the joint-space move home
 JOINT_MOVE_DPS = 35.0            # ... longer if the biggest joint travel needs it
-READY_CM = (15.0, 0.0, 8.0)      # gripper-down pose reached in JOINT space first when the
-                                 # gripper is not already pointing down (e.g. from HOME)
+MAX_DOWN_REACH_CM = 28.0         # a straight-down grasp reaches ~28 cm from the J1 axis
+                                 # (IK scan); only used to word the refusal message
 
 # Gripper straight down (rx, ry, rz) -- same as the profiles' PICK_ORIENTATION_DEG.
 PICK_ORIENTATION_DEG = (180.0, 0.0, -45.0)
@@ -161,10 +166,13 @@ class AbortableConnection(ArmConnection):
 class Scene:
     """Per-frame marker detection -> base lock, target and cube estimates."""
 
-    def __init__(self, K, dist, base_calib, args):
+    def __init__(self, K, dist, base_calib, args, base_pose=V.BASE_MARKER_POSE):
+        """base_pose: the BASE marker's pose in the robot frame (x, y, z cm, yaw deg);
+        capture_scene.py passes one with x = y = 0 (robot drawn on the marker)."""
         self.K, self.dist = K, dist
         self.calib = base_calib
         self.args = args
+        self.base_pose = base_pose
         self.detector = V.make_detector()
         self.base_hist = deque(maxlen=BASE_LOCK_FRAMES)      # T_cam_base
         self.target_hist = deque(maxlen=BASE_LOCK_FRAMES)    # target (x, y) robot cm
@@ -182,7 +190,7 @@ class Scene:
 
     @property
     def table_z(self):
-        return V.table_z(self.calib)
+        return V.table_z(self.calib, self.base_pose)
 
     def update(self, frame, frozen):
         """frozen=True while the arm moves: base/target locks are not updated."""
@@ -191,7 +199,8 @@ class Scene:
         if not frozen and V.BASE_ID in m:
             self.base_hist.append(V.marker_pose(m[V.BASE_ID], self.args.big_marker_cm,
                                                 self.K, self.dist))
-            self.T_robot_cam = V.robot_from_camera(V.mean_pose(list(self.base_hist)), self.calib)
+            self.T_robot_cam = V.robot_from_camera(V.mean_pose(list(self.base_hist)), self.calib,
+                                                   self.base_pose)
         if self.T_robot_cam is None:
             self.cube = None
             return
@@ -271,6 +280,10 @@ def ik_check(points, q_seed):
             return f"{name} ({x:.1f}, {y:.1f}, {z:.1f}) cm: {why}", None
         sol = ik.try_solve(_ik_target(x, y, z, rx, ry, rz), mask, q)
         if sol is None:
+            r = math.hypot(x, y)
+            if r > MAX_DOWN_REACH_CM:
+                return (f"{name} ({x:.1f}, {y:.1f}) is {r:.1f} cm from the base axis -- a "
+                        f"straight-down grasp reaches ~{MAX_DOWN_REACH_CM:.0f} cm; move it closer"), None
             return f"{name} ({x:.1f}, {y:.1f}, {z:.1f}) cm: no IK solution", None
         problems = check_joint_limits(sol)
         if problems:
@@ -289,6 +302,7 @@ class Runner:
         self.step = ""
         self.status = "IDLE"           # IDLE / RUNNING / STOPPED / DONE / HOLDING / FAILED
         self.message = "press SPACE to pick the cube"
+        self.planned_points = []        # last run's waypoints (cm), set by start_pick
         self._thread = None
 
     @property
@@ -324,11 +338,6 @@ class Runner:
             rz = tip[5] if down else PICK_ORIENTATION_DEG[2]
 
         steps, checks = [], []
-        need_ready = not down
-        if need_ready:
-            checks.append(("ready", *READY_CM, rz))
-            steps.append(("ready", lambda: self._ready(rz)))
-
         if not self.holding:
             # from wherever the arm is: up, across, down onto the cube
             steps.append(("rise", lambda: self._rise(hover_z, rz)))
@@ -355,16 +364,27 @@ class Runner:
             checks += [("above target", tx, ty, carry_z, rz),
                        ("place", tx, ty, place_z, rz)]
 
-        seed = q0
-        if need_ready:
-            # check the ready pose from the current angles, the rest from there
-            why, seed = ik_check(checks[:1], q0)
-            if why:
-                return why
-            checks = checks[1:]
-        why, _ = ik_check(checks, seed)
+        # Plan from the current configuration if it is a good start; otherwise
+        # (gripper not down, or an odd elbow/wrist branch the solver can't get
+        # out of -- e.g. wherever calibrate_base left the arm) go HOME first in
+        # joint space and plan from there.
+        why = "gripper not pointing down"
+        if down:
+            why, _ = ik_check(checks, q0)
+        home_tip = [float(v) / 10.0 for v in pose_coords(np.array(HOME, dtype=float))[:3]]
+        start = tip[:3]
         if why:
-            return why
+            why_home, _ = ik_check(checks, np.array(HOME, dtype=float))
+            if why_home:
+                return why_home
+            print(f"[run] starting from HOME ({why})")
+            steps.insert(0, ("home", self._home))
+            start = home_tip
+        # waypoints of the run in order (cm), for drawing the path (sim_pick_rviz.py)
+        rise_z = carry_z if self.holding else hover_z
+        self.planned_points = ([tuple(start), (start[0], start[1], max(start[2], rise_z))]
+                               + [tuple(c[1:4]) for c in checks]
+                               + ([tuple(home_tip)] if not self.no_place else []))
 
         self.conn.abort.clear()
         self.status, self.step = "RUNNING", ""
@@ -420,16 +440,6 @@ class Runner:
         if tip[2] >= z - 0.3:
             return True
         return self._move(tip[0], tip[1], z, rz)
-
-    def _ready(self, rz):
-        """Joint-space move to a gripper-down pose (no Cartesian line from HOME)."""
-        rx, ry, _ = PICK_ORIENTATION_DEG
-        q0 = np.array(self.arm.get_angles(), dtype=float)
-        q = ik.try_solve(_ik_target(*READY_CM, rx, ry, rz), np.ones(6, dtype=bool), q0)
-        if q is None:
-            self.arm.last_error = "no IK solution for READY_CM"
-            return False
-        return bool(self.arm.move_joints(q, joint_move_duration(q0, q)))
 
     def _home(self):
         q0 = self.arm.get_angles()

@@ -18,6 +18,7 @@ Units: cm, robot frame (as _vision.py).
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import cv2
@@ -44,11 +45,22 @@ class HandTracker:
     """detect(frame) -> (21, 2) pixel landmarks of the most confident hand, or None."""
 
     def __init__(self, model_path=HAND_MODEL_PATH):
+        # MediaPipe imports tensorflow if it is installed, guarded only for
+        # ImportError. The Jetson's TF 2.4.1 is broken under the newer numpy
+        # MediaPipe pulled in (AttributeError: np.object), so hide it for this
+        # import: `import tensorflow` then raises ImportError and MediaPipe
+        # skips its optional TF path (hand tracking never needs it).
+        hide_tf = "tensorflow" not in sys.modules
+        if hide_tf:
+            sys.modules["tensorflow"] = None
         try:
             import mediapipe as mp
-        except ImportError:
-            raise SystemExit("mediapipe is not installed (pip install mediapipe; wheels need "
-                             "Python >= 3.9 on the Jetson's aarch64) -- needed for --on-hand")
+        except ImportError as exc:
+            raise SystemExit(f"could not import mediapipe ({exc}) -- needed for --on-hand "
+                             f"(pip install mediapipe; wheels need Python >= 3.9 on aarch64)")
+        finally:
+            if hide_tf:
+                sys.modules.pop("tensorflow", None)
         self._mp = mp
         self._t0 = time.monotonic()
         solutions = getattr(mp, "solutions", None)

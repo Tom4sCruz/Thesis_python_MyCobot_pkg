@@ -58,7 +58,7 @@ BIG_MARKER_CM = 7.6              # black square of the BASE / TARGET markers -- 
 # z is the TABLE height in the robot frame (the marker lies on the table);
 # config.GROUND_Z_MM puts the floor at -6 cm. Measure x/y from the J1 axis to
 # the marker centre; calibrate_base.py then corrects whatever is left.
-BASE_MARKER_POSE = (-12.0, 0.0, -6.0, -90.0)
+BASE_MARKER_POSE = (13.0, 0.0, -6.0, -90.0)
 
 BASE_CALIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "base_calib.json")
 CAMERA_CALIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_calib.npz")

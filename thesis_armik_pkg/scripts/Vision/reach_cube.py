@@ -134,7 +134,7 @@ ALIGN_YAW = True                 # False = always grab at PICK_ORIENTATION_DEG's
 # should close (L / R dots), the "+across" direction and the tip it will
 # command (white dot). If the real pads land off those dots, move them by
 # that much: along = toward R, across = along the arrow.
-GRASP_OFFSET_MM = (2.0, 0.0)
+GRASP_OFFSET_MM = (17.5, 0.0)
 PAD_LINE_AT_DEFAULT_DEG = 0.0    # pad-line direction (robot frame) at the default rz
 
 # Tilt when needed: a cube or target too far for a straight-down gripper is

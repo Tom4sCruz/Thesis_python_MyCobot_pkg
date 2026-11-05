@@ -52,8 +52,14 @@ PERCEPTION
     * the cube is fused from every visible face (_vision.cube_from_faces).
       A 3 cm marker's bearing is accurate but its range is not, so where
       each face is comes from --cube-z:
-        depth  (default with a RealSense) the depth stream at the marker --
-               no table needed, the cube can be held up in your hand;
+        depth  (default with a RealSense) the face's height above the table
+               from the depth stream -- measured against a table plane fitted
+               to depth on the BASE/TARGET markers, so the sensor's own bias
+               cancels -- then placed on its camera ray at that height, as
+               the table mode does (x/y from the colour image). The cube can
+               be held up in your hand; within TABLE_SNAP_CM of resting on
+               the table it is exactly the table mode. The overlay shows how
+               far depth and the BASE marker's range disagree;
         table  the cube rests on the table: each face is slid along its
                camera ray onto the height it must have (default with v4l2);
         marker the marker's own range (the old --vision-z);
@@ -242,16 +248,64 @@ class Scene:
         self.base_hist = deque(maxlen=BASE_LOCK_FRAMES)      # T_cam_base
         self.target_hist = deque(maxlen=BASE_LOCK_FRAMES)    # target (x, y) robot cm
         self.cube_hist = deque(maxlen=STABLE_FRAMES)         # (center, yaw)
+        self.plane_hist = deque(maxlen=BASE_LOCK_FRAMES)     # table plane (n, d) from depth
         self.T_robot_cam = None
         self.target_xy = None
+        self.table_plane = None          # depth mode: table plane in the camera frame (n, d)
+        self.base_depth_diff = None      # depth mode: BASE centre range, depth minus marker (cm)
         self.cube = None                                     # latest fused estimate
         self.markers = {}
 
     def relock(self):
         self.base_hist.clear()
         self.target_hist.clear()
+        self.plane_hist.clear()
         self.T_robot_cam = None
         self.target_xy = None
+        self.table_plane = None
+        self.base_depth_diff = None
+
+    # -- depth mode: heights above the table, measured inside the depth image --
+
+    def _update_table_plane(self, m):
+        """Fit the table plane (camera frame) to depth on the BASE (+ TARGET) marker."""
+        pts = V.marker_grid_points(m[V.BASE_ID], self.point_fn)
+        if V.TARGET_ID in m:
+            pts += V.marker_grid_points(m[V.TARGET_ID], self.point_fn)
+        plane = V.fit_plane(pts)
+        if plane is not None:
+            self.plane_hist.append(plane)
+            n = np.mean([pl[0] for pl in self.plane_hist], axis=0)
+            self.table_plane = (n / np.linalg.norm(n),
+                                float(np.mean([pl[1] for pl in self.plane_hist])))
+        c = V.marker_depth_point(m[V.BASE_ID], self.point_fn)
+        if c is not None:
+            T_cb = V.mean_pose(list(self.base_hist))
+            self.base_depth_diff = float(np.linalg.norm(c) - np.linalg.norm(T_cb[:3, 3]))
+
+    def _height(self, p_cam):
+        n, d = self.table_plane
+        return float(np.dot(n, p_cam) + d)
+
+    def marker_height(self, corners):
+        """Height (cm) of a marker's centre above the table, or None."""
+        if self.table_plane is None:
+            return None
+        p = V.marker_depth_point(corners, self.point_fn)
+        return None if p is None else self._height(p)
+
+    def locate(self, pixels):
+        """Robot-frame point (cm) for a blob of pixels (e.g. a palm): the median
+        depth height above the table, placed along the ray of their mean pixel
+        -- the same bias-free way as the cube. None without plane / depth."""
+        if self.table_plane is None or self.T_robot_cam is None:
+            return None
+        hs = [self._height(p) for p in (self.point_fn(*q) for q in pixels) if p is not None]
+        if len(hs) < 2:
+            return None
+        u, v = np.mean(np.asarray(pixels, dtype=float), axis=0)
+        return V.point_at_height(self.T_robot_cam, V.pixel_ray(u, v, self.K, self.dist),
+                                 self.table_z + float(np.median(hs)))
 
     @property
     def table_z(self):
@@ -266,6 +320,8 @@ class Scene:
                                                 self.K, self.dist))
             self.T_robot_cam = V.robot_from_camera(V.mean_pose(list(self.base_hist)), self.calib,
                                                    self.base_pose)
+            if self.args.cube_z == "depth":
+                self._update_table_plane(m)
         if self.T_robot_cam is None:
             self.cube = None
             return
@@ -281,8 +337,8 @@ class Scene:
         mode = self.args.cube_z
         self.cube = V.cube_from_faces(m, self.K, self.dist, self.T_robot_cam,
                                       side=V.CUBE_SIDE_CM, marker_len=self.args.cube_marker_cm,
-                                      table_z=self.table_z if mode == "table" else None,
-                                      point_fn=self.point_fn if mode == "depth" else None)
+                                      table_z=self.table_z if mode in ("table", "depth") else None,
+                                      height_fn=self.marker_height if mode == "depth" else None)
         if self.cube is not None:
             self.cube_hist.append((self.cube["center"].copy(), self.cube["yaw"]))
         else:
@@ -744,7 +800,7 @@ class HandWatch:
         self.landmarks = self.tracker.detect(frame)
         self.palm = None
         if self.landmarks is not None and scene.T_robot_cam is not None:
-            self.palm = H.palm_point(self.landmarks, scene.point_fn, scene.T_robot_cam)
+            self.palm = H.palm_point(self.landmarks, scene.locate)
         inside = False
         if self.landmarks is None:
             self.info = "hand: not seen"
@@ -862,6 +918,12 @@ def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable, hands=No
             else:
                 line(f"  bottom {z - V.CUBE_SIDE_CM / 2.0 - scene.table_z:+.1f} cm above the table "
                      f"({scene.args.cube_z})")
+        if scene.args.cube_z == "depth":
+            if scene.table_plane is None:
+                line("no depth on the BASE marker -- table plane unknown (marker range used)",
+                     (0, 140, 255))
+            elif scene.base_depth_diff is not None:
+                line(f"base: depth vs marker range differs by {scene.base_depth_diff:+.1f} cm")
         else:
             line("cube not seen", (0, 140, 255))
         if scene.target_xy is not None:

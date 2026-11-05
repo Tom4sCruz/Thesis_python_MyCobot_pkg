@@ -73,6 +73,7 @@ DEPTH_HEIGHT = 480
 DEPTH_MIN_M = 0.1                # search range when matching a colour pixel to a depth pixel
 DEPTH_MAX_M = 2.0
 DEPTH_WINDOW_PX = 5              # median of the valid depths in this square around the pixel
+TABLE_SNAP_CM = 1.0              # a depth height this close to "resting on the table" snaps to it
 
 # Two-solution pose ambiguity (IPPE): of the two candidate poses of a marker,
 # keep the one whose normal is closest to a robot axis (cube faces are flat or
@@ -404,17 +405,65 @@ def marker_depth_point(corners, point_fn):
     return np.median(np.array(pts), axis=0)
 
 
+def marker_grid_points(corners, point_fn, k=4):
+    """Depth points (camera frame, cm) on a k x k grid inside a marker quad;
+    pixels with no depth are dropped."""
+    tl, tr, br, bl = corners
+    out = []
+    for a in np.linspace(0.15, 0.85, k):
+        for b in np.linspace(0.15, 0.85, k):
+            q = (1 - a) * ((1 - b) * tl + b * tr) + a * ((1 - b) * bl + b * br)
+            p = point_fn(*q)
+            if p is not None:
+                out.append(p)
+    return out
+
+
+def fit_plane(points):
+    """Least-squares plane through camera-frame points: (n, d) with n . x + d = 0
+    and the unit normal n pointing toward the camera (the origin). None if
+    fewer than 4 points."""
+    if len(points) < 4:
+        return None
+    P = np.asarray(points, dtype=float)
+    c = P.mean(axis=0)
+    n = np.linalg.svd(P - c)[2][-1]
+    if np.dot(n, c) > 0:
+        n = -n
+    return n, -float(np.dot(n, c))
+
+
+def pixel_ray(u, v, K, dist):
+    """Unit ray (camera frame) through pixel (u, v)."""
+    x, y = cv2.undistortPoints(np.array([[[u, v]]], dtype=np.float64), K, dist).reshape(2)
+    r = np.array([x, y, 1.0])
+    return r / np.linalg.norm(r)
+
+
+def point_at_height(T_robot_cam, ray_cam, z):
+    """Robot-frame point where a camera-frame ray reaches robot height z, or
+    None if the ray is (nearly) horizontal."""
+    cam = T_robot_cam[:3, 3]
+    ray = T_robot_cam[:3, :3] @ np.asarray(ray_cam, dtype=float)
+    if abs(ray[2]) < 1e-3 * np.linalg.norm(ray):
+        return None
+    return cam + ray * ((z - cam[2]) / ray[2])
+
+
 def cube_from_faces(markers, K, dist, T_robot_cam, side=CUBE_SIDE_CM,
                     marker_len=CUBE_MARKER_CM, face_ids=CUBE_FACE_IDS, table_z=None,
-                    point_fn=None):
+                    height_fn=None):
     """Fuse every visible cube face into one estimate.
 
-    point_fn: a depth lookup (camera.point_at). If given, each face's marker
-    centre is taken from depth (marker_depth_point), which needs no table:
-    the cube can be held in the air. A face with no valid depth falls back
-    to table_z (if given), then to the marker's own range.
+    height_fn: depth mode. height_fn(corners) = the marker centre's height
+    above the table (cm, measured inside the depth image against a table
+    plane also fitted from depth, so the sensor's own bias cancels) or None.
+    Each face is then slid along its camera ray to table_z + that height --
+    as the table mode does, just at the measured height -- so the cube can
+    be held in the air. A height within TABLE_SNAP_CM of resting on the table
+    snaps to it. A face with no height falls back to its marker's own range.
 
-    table_z: if given, the cube is assumed to rest on the table. Each face's
+    table_z: if given (without height_fn), the cube is assumed to rest on the table. Each face's
     marker centre is then slid along its camera ray onto the height it must
     have (table + side for the top face, table + side/2 for a side face). The
     bearing from a small marker is accurate but its RANGE is not (a 3 px
@@ -440,14 +489,19 @@ def cube_from_faces(markers, K, dist, T_robot_cam, side=CUBE_SIDE_CM,
         R = T_rm[:3, :3]
         p = T_rm[:3, 3]
         raw_z.append(float(p[2] - (side / 2.0) * R[2, 2]))
-        p_cam = marker_depth_point(markers[mid], point_fn) if point_fn is not None else None
-        if p_cam is not None:
-            p = T_robot_cam[:3, :3] @ p_cam + T_robot_cam[:3, 3]
-        elif table_z is not None:
-            z_face = table_z + (side if abs(R[2, 2]) > 0.7 else side / 2.0)
-            ray = p - cam
-            if abs(ray[2]) > 1e-3 * np.linalg.norm(ray):
-                p = cam + ray * ((z_face - cam[2]) / ray[2])
+        z_face = None
+        if table_z is not None:
+            h_rest = side if abs(R[2, 2]) > 0.7 else side / 2.0
+            if height_fn is None:
+                z_face = table_z + h_rest
+            else:
+                h = height_fn(markers[mid])
+                if h is not None:
+                    z_face = table_z + (h_rest if abs(h - h_rest) <= TABLE_SNAP_CM else h)
+        if z_face is not None:
+            q = point_at_height(T_robot_cam, T_cam_robot[:3, :3] @ (p - cam), z_face)
+            if q is not None:
+                p = q
         center = p - (side / 2.0) * R[:, 2]
         # Weight: how squarely the face looks at the camera (cos of view angle).
         to_cam = T_cam_robot[:3, 3] - T_rm[:3, 3]

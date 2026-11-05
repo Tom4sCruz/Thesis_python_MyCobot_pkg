@@ -4,8 +4,9 @@ frame, the RealSense depth stream for the distance.
 
 MediaPipe only gives the 21 hand landmarks in PIXELS (its own z is relative
 to the wrist, not a range), so a landmark is just a ray from the camera. The
-depth stream (camera.point_at, _vision.py) gives the range along it, and the
-camera -> robot transform (the BASE marker) puts the point in the robot frame.
+depth stream gives its height above the table (Scene.locate, measured against
+a table plane fitted in the same depth image, so the sensor's bias cancels)
+and the point is placed on the ray at that height.
 
 MediaPipe is imported on first use, so nothing else needs it installed. The
 legacy `mp.solutions.hands` (model built in) is used when the installed
@@ -110,15 +111,11 @@ class HandTracker:
             self._tasks.close()
 
 
-def palm_point(landmarks, point_fn, T_robot_cam):
-    """Palm centre in the robot frame (cm): the median of the depth points at
-    the wrist and the knuckles (PALM_IDS). None if fewer than 2 have depth."""
-    pts = [point_fn(*landmarks[i]) for i in PALM_IDS]
-    pts = [p for p in pts if p is not None]
-    if len(pts) < 2:
-        return None
-    p_cam = np.median(np.array(pts), axis=0)
-    return T_robot_cam[:3, :3] @ p_cam + T_robot_cam[:3, 3]
+def palm_point(landmarks, locate_fn):
+    """Palm centre in the robot frame (cm) from the wrist and the knuckles
+    (PALM_IDS): locate_fn = reach_cube.Scene.locate (height above the table
+    from depth, x/y from the colour ray). None without depth."""
+    return locate_fn(landmarks[list(PALM_IDS)])
 
 
 def draw_hand(img, landmarks, color=(0, 200, 255)):

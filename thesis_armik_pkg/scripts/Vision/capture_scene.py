@@ -132,7 +132,7 @@ def main():
     ap.add_argument("--big-marker-cm", type=float, default=V.BIG_MARKER_CM)
     args = ap.parse_args()
     args.scene = V.check_out_path(args.scene, "--scene")
-    args.vision_z = False                     # Scene option: cube rests on the table
+    args.cube_z = "table"                    # Scene option: cube rests on the table
 
     cam = V.open_camera(args.source, args.camera, args.width, args.height)
     scene = None

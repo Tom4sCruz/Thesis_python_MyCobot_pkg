@@ -68,6 +68,11 @@ CAMERA_INDEX = 0                 # v4l2 only: /dev/videoN (a RealSense exposes s
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
+DEPTH_WIDTH = 848                # RealSense depth stream (848x480 is the D4xx's best-quality mode)
+DEPTH_HEIGHT = 480
+DEPTH_MIN_M = 0.1                # search range when matching a colour pixel to a depth pixel
+DEPTH_MAX_M = 2.0
+DEPTH_WINDOW_PX = 5              # median of the valid depths in this square around the pixel
 
 # Two-solution pose ambiguity (IPPE): of the two candidate poses of a marker,
 # keep the one whose normal is closest to a robot axis (cube faces are flat or
@@ -82,9 +87,10 @@ CUBE_FACE_MAX_TILT_DEG = 25.0    # a face whose normal is this far from every ro
 # =============================================================================
 
 class _RealSenseCamera:
-    """Colour stream of a RealSense through pyrealsense2 (any D4xx model)."""
+    """Colour stream of a RealSense through pyrealsense2 (any D4xx model),
+    plus the depth stream when depth=True (see point_at)."""
 
-    def __init__(self, width, height, fps):
+    def __init__(self, width, height, fps, depth=False):
         try:
             import pyrealsense2 as rs
         except ImportError:
@@ -95,16 +101,59 @@ class _RealSenseCamera:
         self._pipe = rs.pipeline()
         cfg = rs.config()
         cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        if depth:
+            cfg.enable_stream(rs.stream.depth, DEPTH_WIDTH, DEPTH_HEIGHT, rs.format.z16, fps)
         profile = self._pipe.start(cfg)
-        self._intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-        self.name = f"RealSense colour {width}x{height}@{fps}"
+        cprof = profile.get_stream(rs.stream.color).as_video_stream_profile()
+        self._intr = cprof.get_intrinsics()
+        self.has_depth = bool(depth)
+        self._depth = None                  # latest depth frame (same frameset as the colour)
+        self._depth_np = None
+        if depth:
+            dprof = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+            self._dintr = dprof.get_intrinsics()
+            self._d2c = dprof.get_extrinsics_to(cprof)
+            self._c2d = cprof.get_extrinsics_to(dprof)
+            self._scale = profile.get_device().first_depth_sensor().get_depth_scale()
+        self.name = (f"RealSense colour {width}x{height}@{fps}"
+                     + (f" + depth {DEPTH_WIDTH}x{DEPTH_HEIGHT}" if depth else ""))
 
     def read(self):
         frames = self._pipe.wait_for_frames(5000)
         color = frames.get_color_frame()
         if not color:
             return False, None
+        if self.has_depth:
+            d = frames.get_depth_frame()
+            self._depth = d if d else None
+            self._depth_np = np.asanyarray(d.get_data()) if d else None
         return True, np.asanyarray(color.get_data()).copy()
+
+    def point_at(self, u, v):
+        """Colour pixel (u, v) -> 3-D point in the colour camera's optical frame
+        (cm, same frame as K), from the depth stream; None if no valid depth.
+        Point by point (no full-frame align, too heavy for the Jetson): find the
+        depth pixel that sees the same spot, take the median of the valid depths
+        in a DEPTH_WINDOW_PX square around it, deproject, move to the colour frame."""
+        if self._depth is None:
+            return None
+        rs = self._rs
+        dpx = rs.rs2_project_color_pixel_to_depth_pixel(
+            self._depth.get_data(), self._scale, DEPTH_MIN_M, DEPTH_MAX_M,
+            self._dintr, self._intr, self._d2c, self._c2d, [float(u), float(v)])
+        x, y = int(round(dpx[0])), int(round(dpx[1]))
+        h, w = self._depth_np.shape
+        if not (0 <= x < w and 0 <= y < h):
+            return None
+        r = DEPTH_WINDOW_PX // 2
+        win = self._depth_np[max(0, y - r):y + r + 1, max(0, x - r):x + r + 1]
+        win = win[win > 0]
+        if win.size == 0:
+            return None
+        z = float(np.median(win)) * self._scale
+        p = rs.rs2_deproject_pixel_to_point(self._dintr, [float(dpx[0]), float(dpx[1])], z)
+        p = rs.rs2_transform_point_to_point(self._d2c, p)
+        return np.array(p, dtype=float) * 100.0
 
     def intrinsics(self):
         """Factory calibration: (K 3x3, dist (5,), (w, h))."""
@@ -125,9 +174,13 @@ class _V4L2Camera:
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self._cap.set(cv2.CAP_PROP_FPS, fps)
         self.name = f"/dev/video{index}"
+        self.has_depth = False
 
     def read(self):
         return self._cap.read()
+
+    def point_at(self, u, v):
+        return None
 
     def intrinsics(self):
         return None
@@ -137,10 +190,12 @@ class _V4L2Camera:
 
 
 def open_camera(source=CAMERA_SOURCE, index=CAMERA_INDEX,
-                width=CAMERA_WIDTH, height=CAMERA_HEIGHT, fps=CAMERA_FPS):
-    """A camera object with .read() -> (ok, bgr), .intrinsics() and .release()."""
+                width=CAMERA_WIDTH, height=CAMERA_HEIGHT, fps=CAMERA_FPS, depth=False):
+    """A camera object with .read() -> (ok, bgr), .intrinsics(), .point_at(u, v)
+    (3-D point from depth, or None), .has_depth and .release(). depth=True only
+    does something for a RealSense."""
     if source == "realsense":
-        return _RealSenseCamera(width, height, fps)
+        return _RealSenseCamera(width, height, fps, depth)
     if source == "v4l2":
         return _V4L2Camera(index, width, height, fps)
     raise SystemExit(f"unknown camera source {source!r} (realsense or v4l2)")
@@ -337,9 +392,27 @@ def pick_aligned_pose(candidates, T_robot_cam):
     return T, tilt
 
 
+def marker_depth_point(corners, point_fn):
+    """Camera-frame centre of a marker (cm) from a depth lookup point_fn(u, v):
+    the median over the marker centre and the 4 points halfway to its corners
+    (so a hole in the depth over the black ink doesn't matter), or None."""
+    c = corners.mean(axis=0)
+    pts = [point_fn(*q) for q in [c] + [c + 0.5 * (k - c) for k in corners]]
+    pts = [q for q in pts if q is not None]
+    if len(pts) < 2:
+        return None
+    return np.median(np.array(pts), axis=0)
+
+
 def cube_from_faces(markers, K, dist, T_robot_cam, side=CUBE_SIDE_CM,
-                    marker_len=CUBE_MARKER_CM, face_ids=CUBE_FACE_IDS, table_z=None):
+                    marker_len=CUBE_MARKER_CM, face_ids=CUBE_FACE_IDS, table_z=None,
+                    point_fn=None):
     """Fuse every visible cube face into one estimate.
+
+    point_fn: a depth lookup (camera.point_at). If given, each face's marker
+    centre is taken from depth (marker_depth_point), which needs no table:
+    the cube can be held in the air. A face with no valid depth falls back
+    to table_z (if given), then to the marker's own range.
 
     table_z: if given, the cube is assumed to rest on the table. Each face's
     marker centre is then slid along its camera ray onto the height it must
@@ -367,7 +440,10 @@ def cube_from_faces(markers, K, dist, T_robot_cam, side=CUBE_SIDE_CM,
         R = T_rm[:3, :3]
         p = T_rm[:3, 3]
         raw_z.append(float(p[2] - (side / 2.0) * R[2, 2]))
-        if table_z is not None:
+        p_cam = marker_depth_point(markers[mid], point_fn) if point_fn is not None else None
+        if p_cam is not None:
+            p = T_robot_cam[:3, :3] @ p_cam + T_robot_cam[:3, 3]
+        elif table_z is not None:
             z_face = table_z + (side if abs(R[2, 2]) > 0.7 else side / 2.0)
             ray = p - cam
             if abs(ray[2]) > 1e-3 * np.linalg.norm(ray):

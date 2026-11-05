@@ -107,7 +107,7 @@ def main():
     ap.add_argument("--big-marker-cm", type=float, default=V.BIG_MARKER_CM)
     args = ap.parse_args()
     args.out = V.check_out_path(args.out, "--out")
-    args.vision_z = False                     # Scene option: cube z from the table plane
+    args.cube_z = "table"                    # Scene option: cube z from the table plane
 
     cam = V.open_camera(args.source, args.camera, args.width, args.height)
     arm = Arm(connection=ArmConnection(args.port, mock=args.mock))

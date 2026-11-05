@@ -11,6 +11,7 @@ in armik's robot frame (cm). Nothing moves until you press SPACE.
     python3 scripts/Vision/reach_cube.py --mock                    # real camera, simulated arm
     python3 scripts/Vision/reach_cube.py --port /dev/ttyTHS1       # real arm (take_arm.sh first)
     python3 scripts/Vision/reach_cube.py --port /dev/ttyTHS1 --no-place   # grab + lift only
+    python3 scripts/Vision/reach_cube.py --port /dev/ttyTHS1 --on-hand    # drop it into your hand
 
 KEYS
     SPACE   idle    -> start (or resume) the pick-and-place
@@ -48,10 +49,15 @@ PERCEPTION
     * base and target poses are a running average of the last few frames
       while the arm is idle, and FROZEN while it moves (the arm hides the
       base marker) -- don't move the camera during a run;
-    * the cube is fused from every visible face (_vision.cube_from_faces);
-      it is assumed to rest on the table: each face is slid along its camera
-      ray onto the height it must have (see cube_from_faces -- a 3 cm
-      marker's bearing is accurate, its range is not) unless --vision-z;
+    * the cube is fused from every visible face (_vision.cube_from_faces).
+      A 3 cm marker's bearing is accurate but its range is not, so where
+      each face is comes from --cube-z:
+        depth  (default with a RealSense) the depth stream at the marker --
+               no table needed, the cube can be held up in your hand;
+        table  the cube rests on the table: each face is slid along its
+               camera ray onto the height it must have (default with v4l2);
+        marker the marker's own range (the old --vision-z);
+      a face with no valid depth falls back to the marker's own range;
     * SPACE only starts when the cube estimate has been steady for
       STABLE_FRAMES frames. The cube/target positions are snapshotted then
       and never updated mid-run;
@@ -74,6 +80,14 @@ GRASP POINT AND TILT
     outward about the pad line (pads stay flat on the cube), in
     TILT_STEP_DEG steps up to MAX_GRASP_TILT_DEG (~33 cm), and it may take
     the other pair of faces if that solves first. Same for the target.
+
+ON HAND (--on-hand)
+    Instead of the TARGET marker the cube is carried to DROP_POS_CM and held
+    there until a hand (MediaPipe Hands, _hands.py; its distance from the
+    depth stream) is held still under it: palm within HAND_XY_TOL_CM of the
+    cube's x/y, HAND_BELOW_CM below it, steady HAND_STABLE_S. After
+    HAND_DROP_DELAY_S (the hand must still be there) the gripper opens and
+    the arm goes home. Needs a RealSense with --cube-z depth.
 
 Every waypoint is IK-checked before the first command; an unreachable cube or
 target is refused with the reason and the arm does not move.
@@ -102,6 +116,7 @@ from armik import Arm, ArmConnection, ArmError, config, ik
 from armik.kinematics import (check_joint_limits, check_workspace_bounds, matrix_to_rpy,
                               pose_coords, rpy_to_matrix)
 import _vision as V
+import _hands as H
 
 
 # =============================================================================
@@ -166,6 +181,14 @@ GRIP_RESEND_MAX = 3              # re-sends when the reading shows the gripper d
 GRIP_MOVED_TOL = 8               # 0-100 scale: open = within this of the open value; closed =
                                  # at least 2x this below it (a cube stops the jaws early)
 
+# -- on hand (--on-hand) ----------------------------------------------------------
+DROP_POS_CM = (20.0, 0.0, 16.0)  # tip waits here (gripper down) for a hand underneath
+HAND_XY_TOL_CM = 6.0             # palm centre within this of the cube's x/y ...
+HAND_BELOW_CM = (3.0, 25.0)      # ... and this far below the cube's bottom (min, max) ...
+HAND_STABLE_TOL_CM = 2.0         # ... and still (within this radius) ...
+HAND_STABLE_S = 1.0              # ... for this long -> ready
+HAND_DROP_DELAY_S = 0.7          # then wait this long (hand still ready) before opening
+
 # -- perception -----------------------------------------------------------------
 BASE_LOCK_FRAMES = 15            # base / target pose = average of the last N idle sightings
 STABLE_FRAMES = 10               # cube estimate must be steady this many frames ...
@@ -205,10 +228,13 @@ class AbortableConnection(ArmConnection):
 class Scene:
     """Per-frame marker detection -> base lock, target and cube estimates."""
 
-    def __init__(self, K, dist, base_calib, args, base_pose=V.BASE_MARKER_POSE):
+    def __init__(self, K, dist, base_calib, args, base_pose=V.BASE_MARKER_POSE, point_fn=None):
         """base_pose: the BASE marker's pose in the robot frame (x, y, z cm, yaw deg);
-        capture_scene.py passes one with x = y = 0 (robot drawn on the marker)."""
+        capture_scene.py passes one with x = y = 0 (robot drawn on the marker).
+        point_fn: the camera's depth lookup (camera.point_at), used with
+        args.cube_z == "depth"."""
         self.K, self.dist = K, dist
+        self.point_fn = point_fn
         self.calib = base_calib
         self.args = args
         self.base_pose = base_pose
@@ -252,9 +278,11 @@ class Scene:
             self.target_hist.append(T[:2, 3].copy())
             self.target_xy = np.median(np.array(self.target_hist), axis=0)
 
+        mode = self.args.cube_z
         self.cube = V.cube_from_faces(m, self.K, self.dist, self.T_robot_cam,
                                       side=V.CUBE_SIDE_CM, marker_len=self.args.cube_marker_cm,
-                                      table_z=None if self.args.vision_z else self.table_z)
+                                      table_z=self.table_z if mode == "table" else None,
+                                      point_fn=self.point_fn if mode == "depth" else None)
         if self.cube is not None:
             self.cube_hist.append((self.cube["center"].copy(), self.cube["yaw"]))
         else:
@@ -416,9 +444,12 @@ def plan_orientation(build, yaw, seeds, toward_xy, what):
 class Runner:
     """Runs one pick-and-place in a worker thread; SPACE sets conn.abort."""
 
-    def __init__(self, arm: Arm, conn: AbortableConnection, no_place: bool):
+    def __init__(self, arm: Arm, conn: AbortableConnection, no_place: bool, on_hand: bool = False):
         self.arm, self.conn = arm, conn
         self.no_place = no_place
+        self.on_hand = on_hand
+        self.hand_ready = threading.Event()   # --on-hand: set by the main loop (HandWatch)
+        self.drop_cube = None                 # --on-hand: cube (x, y, bottom z) cm at DROP_POS_CM
         self.holding = False
         self.step = ""
         self.status = "IDLE"           # IDLE / RUNNING / STOPPED / DONE / HOLDING / FAILED
@@ -480,7 +511,20 @@ class Runner:
             yaw = grip_yaw_of(tip[3:6]) if down else PICK_ORIENTATION_DEG[2]
 
         target_plan, target_pts = None, []
-        if not self.no_place:
+        if self.on_hand:
+            dpx, dpy, dpz = (float(v) for v in DROP_POS_CM)
+            target_plan, why = plan_orientation(
+                lambda orient: [("drop", dpx, dpy, dpz)], yaw,
+                [cube_plan["q"]] if cube_plan else seeds, (dpx, dpy), "DROP_POS_CM")
+            if why:
+                return why
+            target_pts = [("drop", dpx, dpy, dpz)]
+            ox, oy = grasp_offset_xy(target_plan["orient"])   # tip = cube + offset
+            self.drop_cube = (dpx - ox, dpy - oy,
+                              dpz - GRASP_Z_OFFSET_CM - V.CUBE_SIDE_CM / 2.0)
+            if seed is None:
+                seed = target_plan["seed"]
+        elif not self.no_place:
             if target_xy is None:
                 return "TARGET marker not seen yet"
             tx, ty = float(target_xy[0]), float(target_xy[1])
@@ -514,7 +558,13 @@ class Runner:
             o_hold = target_plan["orient"] if target_plan else _down(yaw)
             steps.append(("rise", lambda: self._rise(carry_z, o_hold)))
 
-        if target_plan:
+        if target_plan and self.on_hand:
+            po = target_plan["orient"]
+            steps += [("drop pos", lambda: self._move(dpx, dpy, dpz, po)),
+                      ("wait for hand", self._wait_hand),
+                      ("release", self._release),
+                      ("home", self._home)]
+        elif target_plan:
             po = target_plan["orient"]
             _, px, py, _ = target_pts[0]
             steps += [("above target", lambda: self._move(px, py, carry_z, po)),
@@ -603,6 +653,22 @@ class Runner:
         """Abortable sleep: True if it ran out normally."""
         return not self.conn.abort.wait(seconds)
 
+    def _wait_hand(self):
+        """--on-hand: wait (abortable) until the main loop reports a steady hand
+        under the cube, then HAND_DROP_DELAY_S; if the hand has gone by then,
+        wait again."""
+        self.message = "hold your hand still under the cube"
+        while True:
+            while not self.hand_ready.wait(0.05):
+                if self.conn.abort.is_set():
+                    return False
+            if not self._wait(HAND_DROP_DELAY_S):
+                return False
+            if self.hand_ready.is_set():
+                self.message = "dropping the cube into the hand"
+                return True
+            print("[run]   hand moved away -- waiting again")
+
     def _gripper(self, deg, closing, on_sent=None):
         """Send the gripper to `deg` and check its reading; re-send if it didn't
         move (a dropped packet). on_sent() runs after the first send. False if
@@ -654,6 +720,64 @@ class Runner:
         return True
 
 
+class HandWatch:
+    """--on-hand: per frame, is a hand held still under the cube at DROP_POS_CM?
+
+    ready = the palm centre (_hands.palm_point, from depth) is within
+    HAND_XY_TOL_CM of the cube's x/y and HAND_BELOW_CM below its bottom, and
+    has stayed within HAND_STABLE_TOL_CM of where it first got there for
+    HAND_STABLE_S."""
+
+    WATCH_STEPS = ("drop pos", "wait for hand")    # MediaPipe only runs during these
+
+    def __init__(self, tracker):
+        self.tracker = tracker
+        self.reset()
+
+    def reset(self):
+        self.landmarks, self.palm = None, None
+        self.ready = False
+        self.info = ""
+        self._since = None               # (t, palm) when the palm got into the window
+
+    def update(self, frame, scene, drop_cube, now):
+        self.landmarks = self.tracker.detect(frame)
+        self.palm = None
+        if self.landmarks is not None and scene.T_robot_cam is not None:
+            self.palm = H.palm_point(self.landmarks, scene.point_fn, scene.T_robot_cam)
+        inside = False
+        if self.landmarks is None:
+            self.info = "hand: not seen"
+        elif self.palm is None:
+            self.info = "hand: seen, but no depth at the palm"
+        else:
+            off = math.hypot(self.palm[0] - drop_cube[0], self.palm[1] - drop_cube[1])
+            below = drop_cube[2] - self.palm[2]
+            inside = off <= HAND_XY_TOL_CM and HAND_BELOW_CM[0] <= below <= HAND_BELOW_CM[1]
+            self.info = f"hand {below:4.1f} cm below, {off:4.1f} cm off"
+        if not inside:
+            self._since = None
+        elif (self._since is None
+              or np.linalg.norm(self.palm - self._since[1]) > HAND_STABLE_TOL_CM):
+            self._since = (now, self.palm.copy())
+        held = 0.0 if self._since is None else now - self._since[0]
+        self.ready = held >= HAND_STABLE_S
+        if self.palm is not None:
+            self.info += (f", steady {min(held, HAND_STABLE_S):.1f}/{HAND_STABLE_S:.1f} s"
+                          + ("  READY" if self.ready else ""))
+        return self.ready
+
+    def draw(self, frame, scene, drop_cube):
+        T = scene.T_robot_cam
+        if T is not None and drop_cube is not None:
+            V.draw_point(frame, drop_cube, T, scene.K, scene.dist, (255, 200, 0), "cube", radius=4)
+        if self.landmarks is not None:
+            col = (0, 220, 0) if self.ready else (0, 140, 255)
+            H.draw_hand(frame, self.landmarks, col)
+            if self.palm is not None and T is not None:
+                V.draw_point(frame, self.palm, T, scene.K, scene.dist, col, "palm", radius=6)
+
+
 # =============================================================================
 # OVERLAY
 # =============================================================================
@@ -693,7 +817,7 @@ def draw_reach_circle(frame, T, K, dist, z, radius_cm, color):
     V.put_text(frame, f"reach {radius_cm:.0f} cm", V._pt(label + [6, -6]), color)
 
 
-def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable):
+def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable, hands=None):
     K, dist = scene.K, scene.dist
     if scene.markers:
         ids = np.array(list(scene.markers), dtype=np.int32).reshape(-1, 1)
@@ -730,10 +854,14 @@ def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable):
                  f"faces {c['faces']}  {'steady' if stable else 'settling'}")
             if stable and not runner.running and not runner.holding:
                 draw_grasp_preview(frame, c["center"], c["yaw"], T, K, dist)
-            dz = c["raw_z"] - (scene.table_z + V.CUBE_SIDE_CM / 2.0)
-            if abs(dz) > VISION_Z_WARN_CM and not scene.args.vision_z:
-                line(f"  seen z is {dz:+.1f} cm off the table plane (held? stacked? bad base pose?)",
-                     (0, 140, 255))
+            if scene.args.cube_z == "table":
+                dz = c["raw_z"] - (scene.table_z + V.CUBE_SIDE_CM / 2.0)
+                if abs(dz) > VISION_Z_WARN_CM:
+                    line(f"  seen z is {dz:+.1f} cm off the table plane (held? stacked? "
+                         f"bad base pose? try --cube-z depth)", (0, 140, 255))
+            else:
+                line(f"  bottom {z - V.CUBE_SIDE_CM / 2.0 - scene.table_z:+.1f} cm above the table "
+                     f"({scene.args.cube_z})")
         else:
             line("cube not seen", (0, 140, 255))
         if scene.target_xy is not None:
@@ -747,6 +875,9 @@ def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable):
     step = f" [{runner.step}]" if runner.running and runner.step else ""
     line(f"{runner.status}{step}   holding: {'YES' if runner.holding else 'no'}", col)
     line(runner.message, col)
+    if hands is not None and runner.running and runner.step in HandWatch.WATCH_STEPS:
+        hands.draw(frame, scene, runner.drop_cube)
+        line(hands.info, (0, 220, 0) if hands.ready else (0, 140, 255))
     h = frame.shape[0]
     V.put_text(frame, f"{fps:4.1f} fps", (10, h - 12))
 
@@ -768,21 +899,38 @@ def main():
                     help="measured black square of a cube-face marker")
     ap.add_argument("--big-marker-cm", type=float, default=V.BIG_MARKER_CM,
                     help="measured black square of the BASE / TARGET markers")
-    ap.add_argument("--vision-z", action="store_true",
-                    help="use the cube z seen by the camera instead of the table plane")
+    ap.add_argument("--cube-z", choices=("depth", "table", "marker"), default=None,
+                    help="where a cube face is: depth stream (default with a RealSense; the cube "
+                         "can be held up), table plane (default with v4l2), or the marker's range")
+    ap.add_argument("--on-hand", action="store_true",
+                    help="drop the cube into a hand held under DROP_POS_CM instead of the TARGET")
+    ap.add_argument("--hand-model", default=None,
+                    help="MediaPipe Tasks hand_landmarker.task (only if mp.solutions is missing)")
     ap.add_argument("--no-place", action="store_true",
                     help="stop after grasping and lifting (first tests)")
     args = ap.parse_args()
+    if args.cube_z is None:
+        args.cube_z = "depth" if args.source == "realsense" else "table"
+    if args.on_hand and args.no_place:
+        ap.error("--on-hand and --no-place don't go together")
+    if args.on_hand and args.cube_z != "depth":
+        ap.error("--on-hand needs the RealSense depth (--source realsense, --cube-z depth): "
+                 "without it the hand's distance is unknown")
+    if args.cube_z == "depth" and args.source != "realsense":
+        ap.error("--cube-z depth needs --source realsense")
 
     calib = V.load_base_calib(args.base_calib)
     print(f"base correction: {calib}"
           + ("" if _os.path.exists(args.base_calib or "") else "  (none -- run calibrate_base.py)"))
 
-    cam = V.open_camera(args.source, args.camera, args.width, args.height)
+    cam = V.open_camera(args.source, args.camera, args.width, args.height,
+                        depth=args.cube_z == "depth")
     conn = AbortableConnection(args.port, mock=args.mock)
     arm = Arm(connection=conn)
     arm.set_single_joint(0)                   # streamed moves only: those are what SPACE can stop
-    runner = Runner(arm, conn, args.no_place)
+    runner = Runner(arm, conn, args.no_place, on_hand=args.on_hand)
+    hands = (HandWatch(H.HandTracker(args.hand_model or H.HAND_MODEL_PATH))
+             if args.on_hand else None)
 
     scene = None
     tip, t_tip = None, 0.0
@@ -797,7 +945,7 @@ def main():
                 h, w = frame.shape[:2]
                 K, dist, how = V.camera_model(cam, w, h, args.calib)
                 print(f"camera {cam.name}: {w}x{h}, {how}")
-                scene = Scene(K, dist, calib, args)
+                scene = Scene(K, dist, calib, args, point_fn=cam.point_at)
 
             moving = runner.running
             scene.update(frame, frozen=moving)
@@ -814,9 +962,17 @@ def main():
                     tip = None
                 t_tip = now
 
+            if hands is not None:
+                if moving and runner.step in HandWatch.WATCH_STEPS and runner.drop_cube:
+                    ready = hands.update(frame, scene, runner.drop_cube, now)
+                else:
+                    hands.reset()
+                    ready = False
+                (runner.hand_ready.set if ready else runner.hand_ready.clear)()
+
             fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-6)
             t_prev = now
-            draw_overlay(frame, scene, runner, tip, fps, stable is not None)
+            draw_overlay(frame, scene, runner, tip, fps, stable is not None, hands)
             cv2.imshow(WINDOW, frame)
 
             key = cv2.waitKey(1) & 0xFF
@@ -851,6 +1007,8 @@ def main():
     finally:
         runner.stop()
         runner.join(timeout=3.0)
+        if hands is not None:
+            hands.tracker.close()
         cam.release()
         cv2.destroyAllWindows()
         arm.close()

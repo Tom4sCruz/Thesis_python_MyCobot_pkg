@@ -37,9 +37,12 @@ STATES
     from the arm's current pose: not holding -> detect the cube again and
     reach for it; holding -> skip straight to carrying it to the target.
     "holding" turns True as soon as the close command is sent (the gripper
-    finishes closing even if you stop the arm). The gripper's own reading
-    can't tell "closed on a cube" from "closed on nothing" at the cube-width
-    setting, so if the cube falls out press G.
+    finishes closing even if you stop the arm). The firmware now and then
+    drops a gripper command, so after each one the gripper's reading is
+    checked and the command re-sent (GRIP_RESEND_MAX); if it still hasn't
+    moved the step FAILS and the arm stays put. The reading can't tell
+    "closed on a cube" from "closed on nothing" at the cube-width setting,
+    so if the cube falls out press G.
 
 PERCEPTION
     * base and target poses are a running average of the last few frames
@@ -157,6 +160,11 @@ APPROACH_SPEED_CM_S = 3.0        # descend onto the cube / lower onto the target
 GRIP_OPEN_DEG = 120.0            # as the profiles
 GRIP_CLOSED_DEG = 65.0           # closed ON a 3.5 cm cube
 GRIP_WAIT_S = 1.2                # time given to the gripper to open / close
+GRIP_SETTLE_S = 0.15             # quiet time after a move before the gripper command (the
+                                 # firmware drops a command that lands right behind the stream)
+GRIP_RESEND_MAX = 3              # re-sends when the reading shows the gripper didn't move
+GRIP_MOVED_TOL = 8               # 0-100 scale: open = within this of the open value; closed =
+                                 # at least 2x this below it (a cube stops the jaws early)
 
 # -- perception -----------------------------------------------------------------
 BASE_LOCK_FRAMES = 15            # base / target pose = average of the last N idle sightings
@@ -416,6 +424,7 @@ class Runner:
         self.status = "IDLE"           # IDLE / RUNNING / STOPPED / DONE / HOLDING / FAILED
         self.message = "press SPACE to pick the cube"
         self.planned_points = []        # last run's waypoints (cm), set by start_pick
+        self._grip_unmoved = False      # last _gripper() failed because the reading never moved
         self._thread = None
 
     @property
@@ -594,20 +603,55 @@ class Runner:
         """Abortable sleep: True if it ran out normally."""
         return not self.conn.abort.wait(seconds)
 
+    def _gripper(self, deg, closing, on_sent=None):
+        """Send the gripper to `deg` and check its reading; re-send if it didn't
+        move (a dropped packet). on_sent() runs after the first send. False if
+        stopped, the send failed, or it still hasn't moved after the re-sends."""
+        self._grip_unmoved = False
+        if not self._wait(GRIP_SETTLE_S):
+            return False
+        open_v = round(GRIP_OPEN_DEG / config.MAX_GRIPPER_DEG * 100.0)
+        v = None
+        for attempt in range(1 + GRIP_RESEND_MAX):
+            if not self.arm.send_gripper(deg):
+                return False
+            if attempt == 0 and on_sent:
+                on_sent()
+            if not self._wait(GRIP_WAIT_S):
+                return False
+            v = self.arm.get_gripper_value()
+            if v is None:
+                print("[run]   gripper reading missed")
+            elif (v <= open_v - 2 * GRIP_MOVED_TOL) if closing else (v >= open_v - GRIP_MOVED_TOL):
+                return True
+            if attempt < GRIP_RESEND_MAX:
+                print(f"[run]   gripper didn't {'close' if closing else 'open'} "
+                      f"(value {v}), re-sending")
+        if v is None:
+            print("[run]   gripper never reported its value -- carrying on unchecked")
+            return True
+        self.arm.last_error = (f"gripper still at {v} (0-100) after {GRIP_RESEND_MAX} re-sends "
+                               f"-- SPACE to retry")
+        self._grip_unmoved = True
+        return False
+
     def _grip(self, deg):
-        return bool(self.arm.send_gripper(deg)) and self._wait(GRIP_WAIT_S)
+        return self._gripper(deg, closing=deg < GRIP_OPEN_DEG)
 
     def _grasp(self):
-        if not self.arm.send_gripper(GRIP_CLOSED_DEG):
-            return False
-        self.holding = True               # the gripper closes even if the arm is stopped now
-        return self._wait(GRIP_WAIT_S)
+        def sent():
+            self.holding = True           # the gripper closes even if the arm is stopped now
+        if self._gripper(GRIP_CLOSED_DEG, closing=True, on_sent=sent):
+            return True
+        if self._grip_unmoved:
+            self.holding = False          # seen still open: SPACE reaches for the cube again
+        return False
 
     def _release(self):
-        if not self.arm.send_gripper(GRIP_OPEN_DEG):
+        if not self._gripper(GRIP_OPEN_DEG, closing=False):
             return False
-        self.holding = False
-        return self._wait(GRIP_WAIT_S)
+        self.holding = False              # only once the gripper is seen open
+        return True
 
 
 # =============================================================================
@@ -638,6 +682,17 @@ def draw_grasp_preview(frame, center, yaw, T, K, dist):
     V.put_text(frame, "+across", V._pt(b + 4), (0, 255, 255), scale=0.4)
 
 
+def draw_reach_circle(frame, T, K, dist, z, radius_cm, color):
+    """Circle of radius_cm around the base axis at height z (the table)."""
+    a = np.linspace(0.0, 2.0 * math.pi, 73)[:-1]
+    ring = np.stack([radius_cm * np.cos(a), radius_cm * np.sin(a), np.full_like(a, z)], axis=1)
+    px = V.project_robot_points(ring, T, K, dist)
+    cv2.polylines(frame, [np.round(px).astype(np.int32).reshape(-1, 1, 2)], True, color, 2,
+                  cv2.LINE_AA)
+    label = V.project_robot_points([[radius_cm, 0.0, z]], T, K, dist)[0]
+    V.put_text(frame, f"reach {radius_cm:.0f} cm", V._pt(label + [6, -6]), color)
+
+
 def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable):
     K, dist = scene.K, scene.dist
     if scene.markers:
@@ -656,6 +711,12 @@ def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable):
         line(f"BASE marker (id {V.BASE_ID}) not seen -- no robot frame yet", (0, 0, 255))
     else:
         V.draw_robot_axes(frame, T, K, dist)
+        # red if any detected cube (the faces fuse into one) is beyond the reach, else blue
+        cubes = [scene.cube] if scene.cube is not None else []
+        outside = any(math.hypot(c["center"][0], c["center"][1]) > MAX_DOWN_REACH_CM
+                      for c in cubes)
+        draw_reach_circle(frame, T, K, dist, scene.table_z, MAX_DOWN_REACH_CM,
+                          (0, 0, 255) if outside else (255, 0, 0))
         if scene.target_xy is not None:
             p = [scene.target_xy[0], scene.target_xy[1], scene.table_z]
             V.draw_point(frame, p, T, K, dist, (255, 0, 255), "target")
@@ -664,7 +725,8 @@ def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable):
             V.draw_cube_box(frame, c["center"], c["yaw"], V.CUBE_SIDE_CM, T, K, dist,
                             (0, 220, 0) if stable else (0, 200, 255))
             x, yy, z = c["center"]
-            line(f"cube ({x:6.1f}, {yy:6.1f}, {z:5.1f}) cm  yaw {c['yaw']:5.1f}  "
+            line(f"cube ({x:6.1f}, {yy:6.1f}, {z:5.1f}) cm  r {math.hypot(x, yy):4.1f}  "
+                 f"yaw {c['yaw']:5.1f}  "
                  f"faces {c['faces']}  {'steady' if stable else 'settling'}")
             if stable and not runner.running and not runner.holding:
                 draw_grasp_preview(frame, c["center"], c["yaw"], T, K, dist)

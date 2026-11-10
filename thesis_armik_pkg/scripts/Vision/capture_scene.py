@@ -129,6 +129,8 @@ def main():
     ap.add_argument("--calib", default=None, help="camera .npz for THIS camera (default: rough guess)")
     ap.add_argument("--scene", default=SCENE_PATH, help="output JSON")
     ap.add_argument("--cube-marker-cm", type=float, default=V.CUBE_MARKER_CM)
+    ap.add_argument("--cube-id", type=int, default=0, choices=V.CUBE_IDS,
+                    help="which cube to use (cube k carries ArUco ID k on every face)")
     ap.add_argument("--big-marker-cm", type=float, default=V.BIG_MARKER_CM)
     args = ap.parse_args()
     args.scene = V.check_out_path(args.scene, "--scene")

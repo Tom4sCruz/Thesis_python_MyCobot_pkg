@@ -3,7 +3,10 @@ VISION helpers shared by make_markers.py, calibrate_camera.py,
 calibrate_base.py and reach_cube.py.
 
 Marker layout (DICT_4X4_50, printed by make_markers.py):
-  IDs 0-5   cube faces, 3.0 cm black square on a 3.4 cm white tile
+  IDs 0-3   cubes: cube k carries ID k on ALL six faces (cube_id == marker
+            ID), 2.85 cm black square on a 3.4 cm white tile. Cubes 0-1
+            are the robot's, 2-3 the participant's (ROBOT_CUBE_IDS /
+            HUMAN_CUBE_IDS).
   ID  10    BASE   -- flat on the table next to the robot, 8 cm
   ID  11    TARGET -- flat on the table where the cube goes, 8 cm
 
@@ -17,7 +20,7 @@ The camera -> robot transform comes from the BASE marker, whose pose in the
 robot frame is BASE_MARKER_POSE (a ruler-measured guess) refined by the
 teach-pairs correction in base_calib.json (calibrate_base.py).
 
-The cube's face IDs and how each tile is rotated when glued do not matter:
+Which face of a cube a tile goes on and how it is rotated when glued do not matter:
 the cube centre is (marker origin - side/2 * marker normal) from ANY face, and
 the gripper only needs the cube's yaw modulo 90 deg, which any face gives.
 
@@ -41,7 +44,9 @@ import numpy as np
 # =============================================================================
 
 ARUCO_DICT = "DICT_4X4_50"
-CUBE_FACE_IDS = (0, 1, 2, 3, 4, 5)
+CUBE_IDS = (0, 1, 2, 3)          # cube k = ArUco ID k on every face
+ROBOT_CUBE_IDS = (0, 1)          # cubes that belong to the robot
+HUMAN_CUBE_IDS = (2, 3)          # cubes that belong to the participant
 BASE_ID = 10
 TARGET_ID = 11
 
@@ -264,14 +269,34 @@ def make_detector(dict_name=ARUCO_DICT):
     return cv2.aruco.ArucoDetector(dictionary, params)
 
 
-def detect(detector, frame):
-    """{marker_id: (4, 2) corners} -- only the first sighting of each ID."""
+def cube_owner(cube_id):
+    """'robot', 'human', or None for an ID that is not a known cube."""
+    if cube_id in ROBOT_CUBE_IDS:
+        return "robot"
+    if cube_id in HUMAN_CUBE_IDS:
+        return "human"
+    return None
+
+
+def detect_all(detector, frame):
+    """{marker_id: [(4, 2) corners, ...]} -- EVERY sighting of each ID (a cube
+    shows the same ID on all its faces, so several can be visible at once)."""
     corners, ids, _ = detector.detectMarkers(frame)
     out = {}
     if ids is not None:
         for c, i in zip(corners, ids.flatten()):
-            out.setdefault(int(i), c.reshape(4, 2).astype(np.float64))
+            out.setdefault(int(i), []).append(c.reshape(4, 2).astype(np.float64))
     return out
+
+
+def first_sightings(all_markers):
+    """detect_all() result -> {marker_id: (4, 2) corners}, first sighting only."""
+    return {i: cs[0] for i, cs in all_markers.items()}
+
+
+def detect(detector, frame):
+    """{marker_id: (4, 2) corners} -- only the first sighting of each ID."""
+    return first_sightings(detect_all(detector, frame))
 
 
 def marker_object_points(length):
@@ -450,10 +475,24 @@ def point_at_height(T_robot_cam, ray_cam, z):
     return cam + ray * ((z - cam[2]) / ray[2])
 
 
-def cube_from_faces(markers, K, dist, T_robot_cam, side=CUBE_SIDE_CM,
-                    marker_len=CUBE_MARKER_CM, face_ids=CUBE_FACE_IDS, table_z=None,
-                    height_fn=None):
-    """Fuse every visible cube face into one estimate.
+def cubes_from_faces(all_markers, K, dist, T_robot_cam, cube_ids=CUBE_IDS, **kw):
+    """{cube_id: cube_from_faces() estimate} for every cube with a usable face.
+    all_markers is a detect_all() result; kw goes to cube_from_faces."""
+    out = {}
+    for cid in cube_ids:
+        if cid in all_markers:
+            est = cube_from_faces(all_markers[cid], K, dist, T_robot_cam, cube_id=cid, **kw)
+            if est is not None:
+                out[cid] = est
+    return out
+
+
+def cube_from_faces(face_corners, K, dist, T_robot_cam, side=CUBE_SIDE_CM,
+                    marker_len=CUBE_MARKER_CM, table_z=None, height_fn=None, cube_id=None):
+    """Fuse every visible face of ONE cube into one estimate.
+
+    face_corners: list of (4, 2) marker corners, one per visible face of this
+    cube (all faces of a cube carry the same ID -- see detect_all).
 
     height_fn: depth mode. height_fn(corners) = the marker centre's height
     above the table (cm, measured inside the depth image against a table
@@ -470,18 +509,17 @@ def cube_from_faces(markers, K, dist, T_robot_cam, side=CUBE_SIDE_CM,
     corner error on a 45 px marker is ~5 cm of range at 60 cm), and that
     error runs along the ray -- so x/y need the correction too, not just z.
 
-    Returns dict(center=(3,) robot cm, yaw=deg in [-45, 45), faces=[ids],
-    face_poses=[(id, T_cam_marker)], raw_z=cube z before the table
+    Returns dict(cube_id, center=(3,) robot cm, yaw=deg in [-45, 45),
+    faces=[marker id per used face], face_poses=[(id, T_cam_marker)], raw_z=cube z before the table
     correction) or None if no usable face is visible.
     yaw = direction of a cube side's normal in the robot xy plane, mod 90.
     """
     T_cam_robot = np.linalg.inv(T_robot_cam)
     cam = T_robot_cam[:3, 3]
     centers, weights, yaw_vecs, used, poses, raw_z = [], [], [], [], [], []
-    for mid in face_ids:
-        if mid not in markers:
-            continue
-        cands = marker_pose_candidates(markers[mid], marker_len, K, dist)
+    mid = cube_id
+    for corners in face_corners:
+        cands = marker_pose_candidates(corners, marker_len, K, dist)
         T_cm, tilt = pick_aligned_pose(cands, T_robot_cam)
         if tilt > CUBE_FACE_MAX_TILT_DEG:
             continue
@@ -495,7 +533,7 @@ def cube_from_faces(markers, K, dist, T_robot_cam, side=CUBE_SIDE_CM,
             if height_fn is None:
                 z_face = table_z + h_rest
             else:
-                h = height_fn(markers[mid])
+                h = height_fn(corners)
                 if h is not None:
                     z_face = table_z + (h_rest if abs(h - h_rest) <= TABLE_SNAP_CM else h)
         if z_face is not None:
@@ -520,7 +558,7 @@ def cube_from_faces(markers, K, dist, T_robot_cam, side=CUBE_SIDE_CM,
     center = (np.array(centers) * w[:, None]).sum(axis=0) / w.sum()
     v = np.sum(yaw_vecs, axis=0)
     yaw = math.degrees(math.atan2(v[1], v[0])) / 4.0     # in (-45, 45]
-    return {"center": center, "yaw": wrap90(yaw), "faces": used, "face_poses": poses,
+    return {"cube_id": cube_id, "center": center, "yaw": wrap90(yaw), "faces": used, "face_poses": poses,
             "raw_z": float(np.dot(raw_z, w) / w.sum())}
 
 

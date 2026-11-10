@@ -253,8 +253,10 @@ class Scene:
         self.target_xy = None
         self.table_plane = None          # depth mode: table plane in the camera frame (n, d)
         self.base_depth_diff = None      # depth mode: BASE centre range, depth minus marker (cm)
-        self.cube = None                                     # latest fused estimate
-        self.markers = {}
+        self.cube = None                                     # latest estimate of the tracked cube
+        self.cubes = {}                                      # {cube_id: estimate}, every visible cube
+        self.markers = {}                                    # {id: corners}, first sighting
+        self.all_markers = {}                                # {id: [corners, ...]}, every sighting
 
     def relock(self):
         self.base_hist.clear()
@@ -313,7 +315,8 @@ class Scene:
 
     def update(self, frame, frozen):
         """frozen=True while the arm moves: base/target locks are not updated."""
-        self.markers = V.detect(self.detector, frame)
+        self.all_markers = V.detect_all(self.detector, frame)
+        self.markers = V.first_sightings(self.all_markers)
         m = self.markers
         if not frozen and V.BASE_ID in m:
             self.base_hist.append(V.marker_pose(m[V.BASE_ID], self.args.big_marker_cm,
@@ -324,6 +327,7 @@ class Scene:
                 self._update_table_plane(m)
         if self.T_robot_cam is None:
             self.cube = None
+            self.cubes = {}
             return
 
         if not frozen and V.TARGET_ID in m:
@@ -335,10 +339,12 @@ class Scene:
             self.target_xy = np.median(np.array(self.target_hist), axis=0)
 
         mode = self.args.cube_z
-        self.cube = V.cube_from_faces(m, self.K, self.dist, self.T_robot_cam,
-                                      side=V.CUBE_SIDE_CM, marker_len=self.args.cube_marker_cm,
-                                      table_z=self.table_z if mode in ("table", "depth") else None,
-                                      height_fn=self.marker_height if mode == "depth" else None)
+        self.cubes = V.cubes_from_faces(
+            self.all_markers, self.K, self.dist, self.T_robot_cam,
+            side=V.CUBE_SIDE_CM, marker_len=self.args.cube_marker_cm,
+            table_z=self.table_z if mode in ("table", "depth") else None,
+            height_fn=self.marker_height if mode == "depth" else None)
+        self.cube = self.cubes.get(getattr(self.args, "cube_id", 0))
         if self.cube is not None:
             self.cube_hist.append((self.cube["center"].copy(), self.cube["yaw"]))
         else:
@@ -875,9 +881,10 @@ def draw_reach_circle(frame, T, K, dist, z, radius_cm, color):
 
 def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable, hands=None):
     K, dist = scene.K, scene.dist
-    if scene.markers:
-        ids = np.array(list(scene.markers), dtype=np.int32).reshape(-1, 1)
-        corners = [c.reshape(1, 4, 2).astype(np.float32) for c in scene.markers.values()]
+    if scene.all_markers:
+        sightings = [(i, c) for i, cs in scene.all_markers.items() for c in cs]
+        ids = np.array([i for i, _ in sightings], dtype=np.int32).reshape(-1, 1)
+        corners = [c.reshape(1, 4, 2).astype(np.float32) for _, c in sightings]
         cv2.aruco.drawDetectedMarkers(frame, corners, ids)
 
     y = 25
@@ -891,8 +898,8 @@ def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable, hands=No
         line(f"BASE marker (id {V.BASE_ID}) not seen -- no robot frame yet", (0, 0, 255))
     else:
         V.draw_robot_axes(frame, T, K, dist)
-        # red if any detected cube (the faces fuse into one) is beyond the reach, else blue
-        cubes = [scene.cube] if scene.cube is not None else []
+        # red if any detected cube is beyond the reach, else blue
+        cubes = list(scene.cubes.values())
         outside = any(math.hypot(c["center"][0], c["center"][1]) > MAX_DOWN_REACH_CM
                       for c in cubes)
         draw_reach_circle(frame, T, K, dist, scene.table_z, MAX_DOWN_REACH_CM,
@@ -900,6 +907,18 @@ def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable, hands=No
         if scene.target_xy is not None:
             p = [scene.target_xy[0], scene.target_xy[1], scene.table_z]
             V.draw_point(frame, p, T, K, dist, (255, 0, 255), "target")
+        tracked = getattr(scene.args, "cube_id", 0)
+        for cid, oc in sorted(scene.cubes.items()):
+            if cid == tracked:
+                continue
+            V.draw_cube_box(frame, oc["center"], oc["yaw"], V.CUBE_SIDE_CM, T, K, dist,
+                            (160, 160, 160))
+            V.draw_point(frame, oc["center"], T, K, dist, (160, 160, 160),
+                         f"cube {cid} ({V.cube_owner(cid)})", radius=2)
+        if scene.cubes:
+            line("cubes seen: " + ", ".join(f"{cid} ({V.cube_owner(cid)})"
+                                            for cid in sorted(scene.cubes))
+                 + f"   tracking cube {tracked}")
         if scene.cube is not None:
             c = scene.cube
             V.draw_cube_box(frame, c["center"], c["yaw"], V.CUBE_SIDE_CM, T, K, dist,
@@ -918,14 +937,14 @@ def draw_overlay(frame, scene: Scene, runner: Runner, tip, fps, stable, hands=No
             else:
                 line(f"  bottom {z - V.CUBE_SIDE_CM / 2.0 - scene.table_z:+.1f} cm above the table "
                      f"({scene.args.cube_z})")
+        else:
+            line(f"cube {tracked} not seen", (0, 140, 255))
         if scene.args.cube_z == "depth":
             if scene.table_plane is None:
                 line("no depth on the BASE marker -- table plane unknown (marker range used)",
                      (0, 140, 255))
             elif scene.base_depth_diff is not None:
                 line(f"base: depth vs marker range differs by {scene.base_depth_diff:+.1f} cm")
-        else:
-            line("cube not seen", (0, 140, 255))
         if scene.target_xy is not None:
             line(f"target ({scene.target_xy[0]:6.1f}, {scene.target_xy[1]:6.1f}) cm")
         else:
@@ -959,6 +978,9 @@ def main():
                     help="teach-pairs correction from calibrate_base.py (skipped if missing)")
     ap.add_argument("--cube-marker-cm", type=float, default=V.CUBE_MARKER_CM,
                     help="measured black square of a cube-face marker")
+    ap.add_argument("--cube-id", type=int, default=0, choices=V.CUBE_IDS,
+                    help="which cube to track / pick (cube k carries ArUco ID k on every face; "
+                         f"robot's: {V.ROBOT_CUBE_IDS}, participant's: {V.HUMAN_CUBE_IDS})")
     ap.add_argument("--big-marker-cm", type=float, default=V.BIG_MARKER_CM,
                     help="measured black square of the BASE / TARGET markers")
     ap.add_argument("--cube-z", choices=("depth", "table", "marker"), default=None,

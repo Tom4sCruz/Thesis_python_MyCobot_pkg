@@ -104,6 +104,8 @@ def main():
     ap.add_argument("--calib", default=None, help="camera .npz; default: RealSense factory intrinsics")
     ap.add_argument("--out", default=V.BASE_CALIB_PATH)
     ap.add_argument("--cube-marker-cm", type=float, default=V.CUBE_MARKER_CM)
+    ap.add_argument("--cube-id", type=int, default=0, choices=V.CUBE_IDS,
+                    help="which cube to use (cube k carries ArUco ID k on every face)")
     ap.add_argument("--big-marker-cm", type=float, default=V.BIG_MARKER_CM)
     args = ap.parse_args()
     args.out = V.check_out_path(args.out, "--out")

@@ -4,10 +4,10 @@ VISION: printable marker sheet -> markers_sheet.pdf (one A4 page)
 =================================================================
 
 Everything on ONE A4 page, drawn at exactly 300 dpi:
-  * six cube-face tiles (IDs 0-5): a 3.0 cm marker centred on a 3.4 cm white
-    tile -- cut along the dashed lines and glue one tile, centred, on each face
-    of the 3.5 cm cube. Which face gets which ID, and how each tile is rotated,
-    does not matter (see _vision.py).
+  * six cube-face tiles for cube 0 (all ID 0): a 2.85 cm marker centred on a
+    3.4 cm white tile -- cut along the dashed lines and glue one tile, centred,
+    on each face of the 3.5 cm cube. Every face of cube k carries ID k; how
+    each tile is rotated does not matter (see _vision.py).
   * BASE (ID 10) and TARGET (ID 11): 8 cm markers, each with a 1 cm white
     border inside its dashed cut line.
   * a 10 cm scale bar.
@@ -28,6 +28,10 @@ light background.
 
     python3 scripts/Vision/make_markers.py              # -> markers_sheet.pdf
     python3 scripts/Vision/make_markers.py --png        # also markers_sheet.png
+    python3 scripts/Vision/make_markers.py --cubes-only # -> cube_markers_sheet.pdf:
+                                                        #    cube tiles only, one column
+                                                        #    per cube 0-3 (ID k on all
+                                                        #    six tiles of cube k)
 
 Needs Pillow (for the PDF) and OpenCV.
 """
@@ -123,16 +127,18 @@ def base_arrow(page, x_cm, y_cm, big_cm):
 
 
 def cube_tiles(page, dictionary, cube_cm, tile_cm):
-    """2 columns x 3 rows of tiles, IDs 0-5."""
+    """2 columns x 3 rows of tiles: the six faces of cube 0."""
     tile, side = px(tile_cm), px(cube_cm)
     pad = (tile - side) // 2
-    for k, marker_id in enumerate(V.CUBE_FACE_IDS):
+    marker_id = V.CUBE_IDS[0]
+    for k in range(6):
         col, row = k % 2, k // 2
         x0 = px(TILE_COL_X_CM + col * (tile_cm + TILE_GAP_X_CM))
         y0 = px(TOP_Y_CM + row * (tile_cm + TILE_GAP_Y_CM))
         paste_marker(page, marker_image(dictionary, marker_id, side), x0 + pad, y0 + pad)
         dashed_rect(page, x0, y0, x0 + tile, y0 + tile)
-        text(page, f"cube id {marker_id}", x0, y0 + tile + px(0.6), scale=1.1, thick=2)
+        text(page, f"cube {marker_id}  id {marker_id}", x0, y0 + tile + px(0.6),
+             scale=1.1, thick=2)
     y_end = TOP_Y_CM + 3 * (tile_cm + TILE_GAP_Y_CM)
     text(page, f"tiles: {tile_cm:g} cm,", px(TILE_COL_X_CM), px(y_end + 0.4), scale=1.1, thick=2)
     text(page, f"marker {cube_cm:g} cm", px(TILE_COL_X_CM), px(y_end + 0.95), scale=1.1, thick=2)
@@ -163,11 +169,45 @@ def render_page(cube_cm, tile_cm, big_cm):
     return page
 
 
-def self_check(page):
+CUBES_OUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cube_markers_sheet.pdf")
+CUBES_TOP_Y_CM = 2.4                       # top of the first tile row (title above)
+CUBES_GAP_X_CM = 1.0                       # gap between cube columns
+CUBES_GAP_Y_CM = 0.9                       # room for the label under each tile
+
+
+def cubes_layout_width(tile_cm, n_sets):
+    return n_sets * tile_cm + (n_sets - 1) * CUBES_GAP_X_CM
+
+
+def render_cubes_page(cube_cm, tile_cm, n_sets):
+    """Cube-face tiles only: one column per cube k, six tiles all with ID k."""
+    page = np.full((px(PAGE_H_CM), px(PAGE_W_CM)), 255, np.uint8)
+    dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, V.ARUCO_DICT))
+    left_cm = (PAGE_W_CM - cubes_layout_width(tile_cm, n_sets)) / 2.0
+    text(page, f"armik cube markers  {V.ARUCO_DICT}   print at 100 % (Actual size), A4",
+         px(left_cm), px(1.2), scale=1.3, grey=0)
+    text(page, f"tile {tile_cm:g} cm, marker {cube_cm:g} cm -- measure after printing",
+         px(left_cm), px(1.8), scale=1.1, thick=2)
+    tile, side = px(tile_cm), px(cube_cm)
+    pad = (tile - side) // 2
+    for c in range(n_sets):
+        marker_id = V.CUBE_IDS[c]
+        for r in range(6):
+            x0 = px(left_cm + c * (tile_cm + CUBES_GAP_X_CM))
+            y0 = px(CUBES_TOP_Y_CM + r * (tile_cm + CUBES_GAP_Y_CM))
+            paste_marker(page, marker_image(dictionary, marker_id, side), x0 + pad, y0 + pad)
+            dashed_rect(page, x0, y0, x0 + tile, y0 + tile)
+            text(page, f"cube {marker_id}  {V.cube_owner(marker_id)}", x0, y0 + tile + px(0.5),
+                 scale=0.9, thick=2)
+    return page
+
+
+def self_check(page, want=None):
     """Detect every marker in the rendered page (downscaled ~ a camera view)."""
     small = cv2.resize(page, None, fx=0.35, fy=0.35, interpolation=cv2.INTER_AREA)
     found = set(V.detect(V.make_detector(), cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)))
-    want = set(V.CUBE_FACE_IDS) | {V.BASE_ID, V.TARGET_ID}
+    if want is None:
+        want = {V.CUBE_IDS[0], V.BASE_ID, V.TARGET_ID}
     missing = sorted(want - found)
     if missing:
         print(f"SELF-CHECK FAIL: markers not detected in the rendered page: {missing}")
@@ -182,7 +222,14 @@ def self_check(page):
 
 def main():
     ap = argparse.ArgumentParser(description="Write the A4 ArUco marker sheet (PDF, 300 dpi).")
-    ap.add_argument("--out", default=OUT_PATH, help="output PDF")
+    ap.add_argument("--out", default=None,
+                    help="output PDF (default markers_sheet.pdf, or cube_markers_sheet.pdf "
+                         "with --cubes-only)")
+    ap.add_argument("--cubes-only", action="store_true",
+                    help="only the cube-face tiles (no BASE / TARGET), several cubes' worth")
+    ap.add_argument("--cube-sets", type=int, default=len(V.CUBE_IDS),
+                    help="with --cubes-only: how many cubes (0..N-1) to print "
+                         f"(default {len(V.CUBE_IDS)}, at most {len(V.CUBE_IDS)})")
     ap.add_argument("--png", action="store_true", help="also write a PNG next to the PDF")
     ap.add_argument("--cube-marker-cm", type=float, default=V.CUBE_MARKER_CM)
     ap.add_argument("--tile-cm", type=float, default=V.CUBE_TILE_CM)
@@ -191,23 +238,36 @@ def main():
 
     if args.cube_marker_cm >= args.tile_cm:
         ap.error("--cube-marker-cm must be smaller than --tile-cm (the white border is needed)")
-    tile_block_right = TILE_COL_X_CM + 2 * args.tile_cm + TILE_GAP_X_CM
-    big_right = LEFT_X_CM + args.big_marker_cm + 2 * BIG_BORDER_CM
-    if big_right > TILE_COL_X_CM - 0.5 or tile_block_right > PAGE_W_CM - 0.5:
-        ap.error("these sizes do not fit the A4 layout")
+    if args.cubes_only:
+        rows_bottom = CUBES_TOP_Y_CM + 6 * (args.tile_cm + CUBES_GAP_Y_CM)
+        if not 1 <= args.cube_sets <= len(V.CUBE_IDS):
+            ap.error(f"--cube-sets must be 1..{len(V.CUBE_IDS)} (add IDs to _vision.CUBE_IDS)")
+        if (rows_bottom > PAGE_H_CM - 0.5
+                or cubes_layout_width(args.tile_cm, args.cube_sets) > PAGE_W_CM - 1.0):
+            ap.error("these sizes / --cube-sets do not fit the A4 layout")
+        out = args.out or CUBES_OUT_PATH
+        page = render_cubes_page(args.cube_marker_cm, args.tile_cm, args.cube_sets)
+        want = set(V.CUBE_IDS[:args.cube_sets])
+    else:
+        tile_block_right = TILE_COL_X_CM + 2 * args.tile_cm + TILE_GAP_X_CM
+        big_right = LEFT_X_CM + args.big_marker_cm + 2 * BIG_BORDER_CM
+        if big_right > TILE_COL_X_CM - 0.5 or tile_block_right > PAGE_W_CM - 0.5:
+            ap.error("these sizes do not fit the A4 layout")
+        out = args.out or OUT_PATH
+        page = render_page(args.cube_marker_cm, args.tile_cm, args.big_marker_cm)
+        want = None
 
-    page = render_page(args.cube_marker_cm, args.tile_cm, args.big_marker_cm)
     try:
         from PIL import Image
     except ImportError:
         raise SystemExit("Pillow is needed for the PDF: pip install Pillow")
-    Image.fromarray(page).save(args.out, "PDF", resolution=DPI)
-    print(f"Wrote {args.out}  (A4, {DPI} dpi). Print at 100 % / Actual size.")
+    Image.fromarray(page).save(out, "PDF", resolution=DPI)
+    print(f"Wrote {out}  (A4, {DPI} dpi). Print at 100 % / Actual size.")
     if args.png:
-        png = os.path.splitext(args.out)[0] + ".png"
+        png = os.path.splitext(out)[0] + ".png"
         Image.fromarray(page).save(png, dpi=(DPI, DPI))
         print(f"Wrote {png}")
-    return 0 if self_check(page) else 1
+    return 0 if self_check(page, want) else 1
 
 
 if __name__ == "__main__":

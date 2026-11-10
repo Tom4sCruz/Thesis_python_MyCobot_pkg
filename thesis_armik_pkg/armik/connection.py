@@ -28,6 +28,13 @@ Everything that touches the serial port goes through here, for three reasons:
    port, ArmConnection checks that no other process has it open and refuses,
    naming that process (see _port_users; scripts/diag_port.py digs deeper).
 
+6. The port may be a NETWORK one: "socket://host:port" (or "tcp://...").
+   The bytes then travel over TCP to scripts/arm_bridge.py on the Jetson,
+   which pipes them unchanged to and from its serial port -- so a faster
+   computer (the laptop) can do all the planning while the Jetson only
+   relays. pymycobot gets a pyserial socket in place of its serial port
+   (_open_mycobot); its protocol and the no-wait writes are untouched.
+
 Anything this module does not wrap is still reachable through `.raw`, which is
 the live pymycobot object, under the same lock.
 """
@@ -52,6 +59,44 @@ log = logging.getLogger(__name__)
 
 class ArmError(RuntimeError):
     pass
+
+
+def _is_network_port(port) -> bool:
+    return isinstance(port, str) and port.startswith(("socket://", "tcp://"))
+
+
+_SERIAL_PATCH_LOCK = threading.Lock()
+
+
+def _open_mycobot(cls, port: str, baudrate: int):
+    """cls(port, baudrate) on a TCP socket instead of a serial port.
+
+    pymycobot builds its port with `serial.Serial()` inside __init__ and has
+    no hook to pass another one, so for that one call pyserial's own
+    `serial.Serial` is swapped for its socket:// class (same read / write /
+    in_waiting / reset_input_buffer API) and restored right after. TCP_NODELAY
+    is set so the small no-wait setpoint writes are not held back by Nagle."""
+    import socket
+    import serial
+    from serial.urlhandler.protocol_socket import Serial as SocketSerial
+
+    url = "socket://" + port.split("://", 1)[1]
+    with _SERIAL_PATCH_LOCK:
+        real = serial.Serial
+        serial.Serial = SocketSerial
+        try:
+            mc = cls(url, baudrate)
+        except Exception as exc:
+            raise ArmError(f"could not connect to {url} ({exc}) -- is scripts/arm_bridge.py "
+                           f"running on the Jetson, and is the cable link up?") from exc
+        finally:
+            serial.Serial = real
+    sp = getattr(mc, "_serial_port", None)
+    if not isinstance(sp, SocketSerial):
+        raise ArmError(f"this pymycobot ({cls.__module__}) did not open {url} as a socket -- "
+                       f"armik's network port support needs updating for it")
+    sp._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return mc
 
 
 def _port_users(port: str) -> list[tuple[int, str]]:
@@ -145,14 +190,17 @@ class ArmConnection:
                         "pymycobot is not installed. `pip install pymycobot`, or "
                         "construct ArmConnection(mock=True) to work offline."
                     ) from exc
-            others = _port_users(port)
+            others = [] if _is_network_port(port) else _port_users(port)
             if others:
                 who = "; ".join(f"PID {pid}: {cmd[:120]}" for pid, cmd in others)
                 raise ArmError(
                     f"{port} is already open by another process ({who}). It would eat the "
                     f"arm's replies and break up the setpoint stream -- stop it first "
                     f"(`sudo python3 scripts/diag_port.py` shows how it was started).")
-            self._mc = MyCobot280(port, baudrate)
+            if _is_network_port(port):
+                self._mc = _open_mycobot(MyCobot280, port, baudrate)
+            else:
+                self._mc = MyCobot280(port, baudrate)
             time.sleep(0.1)
 
         # No-wait writes (see point 4 in the module docstring). Detected once:

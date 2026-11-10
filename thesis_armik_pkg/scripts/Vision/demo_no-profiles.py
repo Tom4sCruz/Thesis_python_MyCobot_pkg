@@ -265,6 +265,16 @@ class DemoScene(RC.Scene):
 # MOTION
 # =============================================================================
 
+def _timed(name, fn):
+    """fn, printing how long it took (each step's own moves include their planning)."""
+    def run():
+        t0 = time.monotonic()
+        ok = fn()
+        print(f"[run]   {name} took {time.monotonic() - t0:.2f} s")
+        return ok
+    return run
+
+
 class DemoRunner(RC.Runner):
     """RC.Runner with one planner: pick a cube (unless held) and set it down at
     a table spot or hand it over at DROP_POS_CM."""
@@ -279,6 +289,7 @@ class DemoRunner(RC.Runner):
     def start_transfer(self, cube_center, cube_yaw, dest, table_z):
         """dest = ("table", x, y) or ("hand",). Plans from the current pose and
         starts the run; returns an error string (nothing moves) or None."""
+        t_plan = time.monotonic()
         q0 = np.array(self.arm.get_angles(), dtype=float)
         tip = self.arm.get_coords()
         down = RC._pointing_down(tip)
@@ -366,10 +377,11 @@ class DemoRunner(RC.Runner):
                   + ")")
             steps.insert(0, ("home", self._home))
 
+        steps = [(n, _timed(n, fn)) for n, fn in steps]
         self.conn.abort.clear()
         self.status, self.step = "RUNNING", ""
-        print(f"[run] {'carry' if self.holding else 'pick'} -> {dest}; "
-              f"steps: {', '.join(n for n, _ in steps)}")
+        print(f"[run] {'carry' if self.holding else 'pick'} -> {dest}; planned in "
+              f"{time.monotonic() - t_plan:.2f} s; steps: {', '.join(n for n, _ in steps)}")
         self._thread = threading.Thread(target=self._run, args=(steps,), daemon=True)
         self._thread.start()
         return None

@@ -25,6 +25,14 @@ python3 scripts/test_arm.py --port /dev/ttyTHS1      # 3. does it actually move?
 
 The Jetson is shared: another student's robot server, `shared-growth-workstation.service`, starts at boot and keeps `/dev/ttyTHS1` open, so armik's reads fail and streamed moves stutter while it runs. Run `scripts/take_arm.sh` before a hardware session (stops it, checks the port is free) and `scripts/release_arm.sh` after (starts it again). armik's `ArmConnection` also refuses to open a port another process holds, and `sudo python3 scripts/diag_port.py` reports who holds it and how it was started.
 
+**Laptop as the brain.** The Jetson is slow at planning, so the laptop can run any armik script while the Jetson only relays the serial port. On the Jetson, `scripts/arm_bridge.py` pipes TCP ⇄ `/dev/ttyTHS1` byte for byte. It listens on the direct-cable address `192.168.50.2:9000`, with the laptop at `192.168.50.1` through a USB Ethernet adapter. `ArmConnection` accepts `socket://host:port` (or `tcp://`) ports and hands pymycobot a pyserial socket with `TCP_NODELAY` set (`_open_mycobot` in `connection.py`), so the protocol and no-wait writes are unchanged. The RealSense plugs into the laptop, and `scripts/Vision/base_calib.json` must be copied there from the Jetson. Two wrapper scripts do everything; run each with `--setup` once first:
+- `jetson_bridge.sh` sets up the static cable address, then runs `take_arm.sh` → `arm_bridge.py` → `release_arm.sh` (the release always runs on exit).
+- `laptop_demo.sh` sets up a Python 3.12 venv at `~/.venv-py/armik312` (pyrealsense2 / mediapipe have no 3.14 wheels), the RealSense udev rules and the `jetson-link` nmcli profile. It checks for `base_calib.json`, waits up to 30 s for the bridge, then runs the demo. Extra arguments go to the demo.
+```bash
+./scripts/jetson_bridge.sh               # on the Jetson (Ctrl-C when done)
+./scripts/laptop_demo.sh [--on-hand]     # on the laptop
+```
+
 There is no pytest/unittest suite and no CI. Validation is done by standalone, self-contained scripts in `scripts/` (`test_arm.py`, `test_lock.py`, `test_path.py`, `test_gripper_tcp.py`, `verify_fk.py`, ...), each printing its own PASS/FAIL stage banners; most support `--mock` (no hardware) and `--yes` (skip the confirmation prompt). There's no "run a single test" — each script *is* one suite; run the whole script.
 
 Movement-profile scripts (the current focus of thesis work) live in `scripts/Profiles/` and run the same way:

@@ -82,7 +82,7 @@ import reach_cube as RC
 
 # -- the exchange ---------------------------------------------------------------
 ROBOT_CUBE_IDS = (0, 1)          # the robot's cubes (ArUco ID = cube); picked in ascending order
-HUMAN_CUBE_IDS = (2,)            # the participant's cubes; they may hand them over in any order
+HUMAN_CUBE_IDS = (2, 3)            # the participant's cubes; they may hand them over in any order
 ROBOT_FIRST = True               # True: the robot exchanges first; False: the participant does
 
 # Target Area: two opposite corners (x, y) of a rectangle on the table, robot

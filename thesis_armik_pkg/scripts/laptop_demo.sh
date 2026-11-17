@@ -2,18 +2,20 @@
 # laptop_demo.sh -- run ON THE LAPTOP: the cube-exchange demo, driving the arm through the Jetson.
 #
 #   ./scripts/laptop_demo.sh                 # run the demo (scripts/jetson_bridge.sh must run on the Jetson)
-#   ./scripts/laptop_demo.sh --on-hand       # any other args go to demo_no-profiles.py
+#   ./scripts/laptop_demo.sh human           # Humanlike profile (demo_human.py)
+#   ./scripts/laptop_demo.sh robot           # Robotlike profile (demo_robot.py)
+#   ./scripts/laptop_demo.sh human --on-hand # any other args go to the demo script
+#                                            # (no profile word: demo_no-profiles.py)
 #   ./scripts/laptop_demo.sh --setup         # one-time: Python 3.12 venv, RealSense udev rules, cable link
 #
 # Settings (env vars): JETSON_IP (192.168.50.2), BRIDGE_PORT (9000),
-# ARMIK_VENV (~/.venv-py/armik312), JETSON_USER (for the scp hint).
+# ARMIK_VENV (~/.venv-py/armik312).
 set -euo pipefail
 
 JETSON_IP="${JETSON_IP:-192.168.50.2}"
 LAPTOP_IP="${LAPTOP_IP:-192.168.50.1}"
 BRIDGE_PORT="${BRIDGE_PORT:-9000}"
 ARMIK_VENV="${ARMIK_VENV:-$HOME/.venv-py/armik312}"
-JETSON_USER="${JETSON_USER:-<user>}"
 CON="jetson-link"
 UDEV_RULES=/etc/udev/rules.d/99-realsense-libusb.rules
 UDEV_URL=https://raw.githubusercontent.com/IntelRealSense/librealsense/master/config/99-realsense-libusb.rules
@@ -21,10 +23,6 @@ UDEV_URL=https://raw.githubusercontent.com/IntelRealSense/librealsense/master/co
 cd "$(dirname "$(readlink -f "$0")")/.."          # the package root (thesis_armik_pkg/)
 CALIB=scripts/Vision/base_calib.json
 
-calib_hint() {
-    echo "   copy it from the Jetson (the camera must not have moved since calibrate_base.py):"
-    echo "     scp $JETSON_USER@$JETSON_IP:<repo>/thesis_armik_pkg/$CALIB $PWD/$CALIB"
-}
 
 # =============================================================================
 # one-time setup
@@ -72,11 +70,6 @@ if [[ "${1:-}" == "--setup" ]]; then
     fi
     nmcli con up "$CON" || echo "!! '$CON' did not come up -- is the cable plugged in?"
 
-    if [[ ! -f "$CALIB" ]]; then
-        echo
-        echo "!! still missing: $CALIB"
-        calib_hint
-    fi
     echo
     echo "setup done -- run: $0"
     exit 0
@@ -85,6 +78,12 @@ fi
 # =============================================================================
 # run the demo
 # =============================================================================
+DEMO=demo_no-profiles.py
+case "${1:-}" in
+    human) DEMO=demo_human.py; shift ;;
+    robot) DEMO=demo_robot.py; shift ;;
+esac
+
 if [[ ! -x "$ARMIK_VENV/bin/python" ]]; then
     echo "!! no Python venv at $ARMIK_VENV -- run: $0 --setup"
     exit 1
@@ -92,10 +91,10 @@ fi
 # shellcheck disable=SC1091
 source "$ARMIK_VENV/bin/activate"
 
-if [[ ! -f "$CALIB" ]]; then
-    echo "!! $CALIB is missing (the camera -> robot correction)"
-    calib_hint
-    exit 1
+if [[ -f "$CALIB" ]]; then
+    echo "using $CALIB (teach-pairs correction)"
+else
+    echo "no $CALIB -- using the measured BASE_MARKER_POSE only"
 fi
 
 if [[ "$JETSON_IP" != 127.* ]] && ! ip -br addr | grep -qF " $LAPTOP_IP/"; then
@@ -128,5 +127,5 @@ then
 fi
 sleep 0.5        # the bridge goes back to listening after that probe connection
 
-echo "bridge up -- starting the demo"
-exec python3 scripts/Vision/demo_no-profiles.py --port "socket://$JETSON_IP:$BRIDGE_PORT" "$@"
+echo "bridge up -- starting $DEMO"
+exec python3 "scripts/Vision/$DEMO" --port "socket://$JETSON_IP:$BRIDGE_PORT" "$@"

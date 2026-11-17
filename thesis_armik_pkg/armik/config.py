@@ -92,7 +92,7 @@ EULER_CONVENTION = "xyz_fixed"
 # Do this ONLY here in Python. Do NOT also call the firmware's
 # set_tool_reference()/set_end_type() -- this package bypasses firmware
 # kinematics on purpose and doing both would double-count the offset.
-TOOL_OFFSET_MM = (0.0, 0.0, 90.0)
+TOOL_OFFSET_MM = (0.0, 0.0, 130.0)
 TOOL_RPY_DEG = (0.0, 0.0, -45.0)
 
 

@@ -301,6 +301,7 @@ class DemoRunner(RC.Runner):
         self.message = "press SPACE to start the exchange"
         self.at_rest = False             # the last run was a completed _rest()
         self.table_z = None              # table height of the last transfer / rest (cm)
+        self.next_turn_is_robot = False  # set by Exchange: the turn after this transfer is the robot's
 
     def _move(self, x, y, z, orient, speed=TRAVEL_SPEED_CM_S):
         return super()._move(x, y, z, orient, speed)
@@ -417,6 +418,16 @@ class DemoRunner(RC.Runner):
                       self._end_step()]
         return steps
 
+    def _lead_steps(self, t):
+        """Steps run before _steps(t): HOME first when the plan needs it."""
+        if not t["start_home"]:
+            return []
+        print("[run] starting from HOME ("
+              + ("gripper not pointing down" if not t["down"]
+                 else "no plan from the current pose")
+              + ")")
+        return [("home", self._home)]
+
     def _end_step(self):
         """The last step of a transfer: HOME, or the rest pose."""
         if self.REST_WHILE_WAITING:
@@ -442,13 +453,7 @@ class DemoRunner(RC.Runner):
         t, why = self._plan_transfer(cube_center, cube_yaw, dest, table_z)
         if why:
             return why
-        steps = self._steps(t)
-        if t["start_home"]:
-            print("[run] starting from HOME ("
-                  + ("gripper not pointing down" if not t["down"]
-                     else "no plan from the current pose")
-                  + ")")
-            steps.insert(0, ("home", self._home))
+        steps = self._lead_steps(t) + self._steps(t)
         print(f"[run] {'carry' if self.holding else 'pick'} -> {dest}; planned in "
               f"{time.monotonic() - t_plan:.2f} s; steps: {', '.join(n for n, _ in steps)}")
         self._start(steps)
@@ -557,6 +562,8 @@ class Exchange:
             print("[demo] FINISHED")
 
     def _go(self, center, yaw, dest, scene):
+        nxt = self.turns[self.i + 1] if self.i + 1 < len(self.turns) else None
+        self.runner.next_turn_is_robot = nxt is not None and nxt[0] == "robot"
         err = self.runner.start_transfer(center, yaw, dest, scene.table_z)
         if err:
             self.phase = "FAILED"

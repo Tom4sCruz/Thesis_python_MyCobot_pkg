@@ -92,7 +92,7 @@ EULER_CONVENTION = "xyz_fixed"
 # Do this ONLY here in Python. Do NOT also call the firmware's
 # set_tool_reference()/set_end_type() -- this package bypasses firmware
 # kinematics on purpose and doing both would double-count the offset.
-TOOL_OFFSET_MM = (0.0, 0.0, 130.0)
+TOOL_OFFSET_MM = (0.0, 5.0, 90.0)
 TOOL_RPY_DEG = (0.0, 0.0, -45.0)
 
 
@@ -320,8 +320,18 @@ MIN_COMMAND_GAP_S = 0.012
 # opening ANGLE and maps [0, MAX_GRIPPER_DEG] linearly onto that 0-100 value:
 #   send_gripper(0)               -> closed
 #   send_gripper(MAX_GRIPPER_DEG) -> fully open
-MAX_GRIPPER_DEG = 120.0
-GRIPPER_DEFAULT_SPEED = 60   # pymycobot gripper speed, integer 1-100
+MAX_GRIPPER_DEG = 120 #120.0
+GRIPPER_DEFAULT_SPEED = 80   # pymycobot gripper speed, integer 1-100
+
+# WHICH gripper is mounted -- sent with every gripper command and read-back, so
+# the firmware maps the 0-100 value with that gripper's own calibration:
+#   1 = Adaptive gripper (the firmware's default when no type is sent)
+#   3 = Parallel gripper
+#   4 = Flexible gripper (red / blue fingers)
+#   None = send no type (firmware default, i.e. Adaptive)
+# A wrong type maps some openings past the gripper's real travel: the servo
+# then stalls / hunts there and buzzes even after it has arrived.
+GRIPPER_TYPE = 1
 
 # ---------------------------------------------------------------------------
 # Cartesian API defaults

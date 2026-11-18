@@ -13,12 +13,18 @@ the way HighH-LowR.py / HighH-HighR.py move:
     -- and levels out to the grasp orientation (straight down, turned to meet
     the cube) over the last GAZE_EASE_OUT_S of the arc. The jaws come in at
     an angle and finish perpendicular, so they don't catch a cube's edge;
+    While carrying, the gripper tilts toward the landing spot by at most
+    CARRY_MAX_TILT_DEG from straight down (0 = never tilts);
   * each arc ends FINAL_DESCENT_CM above the grasp / place height, and the
     last bit is a short, slow straight descent;
+  * the gripper is shut whenever the arm only looks, OPENS GRADUALLY during
+    the reach (sent mid-move at GRIP_MOVING_SPEED, as HighH-LowR.py) and
+    CLOSES GRADUALLY on the way back to rest after a release;
   * while the participant is due the arm RESTS in the look configuration
     (IDLE_CONFIG_J123_DEG, as the profiles' LOOK_CONFIG_J123_DEG), its head
     turned toward the Target Area and the gripper nearly shut
-    (GRIP_IDLE_DEG). The next reach starts straight from there.
+    (GRIP_IDLE_DEG). Every pick starts there: (go to rest,) LOOK at the
+    cube with the wrist, then reach for it.
 
     python3 scripts/Vision/demo_human.py --mock                  # real camera, simulated arm
     python3 scripts/Vision/demo_human.py --port /dev/ttyTHS1     # real arm (take_arm.sh first)
@@ -37,6 +43,7 @@ from __future__ import annotations
 import math
 import os as _os
 import sys as _sys
+import threading
 
 # the gaze helpers live with the movement profiles (scripts/Profiles/_gaze.py)
 _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
@@ -47,6 +54,7 @@ import numpy as np
 import _demo
 import reach_cube as RC
 import _gaze
+from armik import config
 from armik.kinematics import matrix_to_rpy, rpy_to_matrix
 
 
@@ -77,6 +85,10 @@ GAZE_STRENGTHS = (1.0, 0.6, 0.3) # tried in turn: 1 = look straight at the targe
                                  # tried before giving up on the gaze for that arc
 GAZE_MAX_JOINT_DPS = 110.0       # ... and a gazing arc that needs a joint faster than this is
                                  # dropped the same way (the wrist whips near the edge of reach)
+CARRY_MAX_TILT_DEG = 30.0        # while carrying a cube, the gripper tilts at most this far from
+                                 # straight down toward the landing spot: 90 = no limit (but never
+                                 # past horizontal, i.e. never looking up), 0 = stays perpendicular
+                                 # to the floor (no tilt toward the target at all)
 
 # -- the ends of an arc -------------------------------------------------------------
 FINAL_DESCENT_CM = 2.0           # arc ends this far above the grasp / place height; the
@@ -85,6 +97,17 @@ LIFT_CM = 2.0                    # straight lift off the table after grasping, b
 RETREAT_CM = 4.0                 # straight up after releasing, before going to rest
 APPROACH_SPEED_CM_S = 3.0        # the final descent / lift / retreat
 LINE_SPEED_CM_S = 6.0            # straight-line fallback when an arc can't be planned
+
+# -- gripper while the arm moves (as HighH-LowR.py) --------------------------------
+GRIP_MOVING_SPEED = 20           # gripper speed (0-100) for the gradual open / close during a move
+GRIP_OPEN_DELAY_S = 0.0          # seconds after a reach STARTS that the gripper begins to open
+GRIP_CLOSE_DELAY_S = 0.6         # seconds after the move back to rest STARTS that it begins to close
+GRIP_MOVING_REPEATS = 2          # sends per command (a gripper packet is sometimes dropped)
+GRIP_MOVING_REPEAT_GAP_S = 0.1
+
+# -- looking at the cube before a reach -------------------------------------------
+LOOK_SPEED_DPS = 40.0            # wrist turn onto the cube: largest joint travel / time ...
+LOOK_MIN_S = 1.0                 # ... but never quicker than this
 
 # -- rest (waiting for the participant) ------------------------------------------
 IDLE_CONFIG_J123_DEG = (0.0, 50.0, -110.0)   # J1 (base), J2, J3 -- as the profiles' look config
@@ -160,6 +183,38 @@ def arc_durations(n_points, length):
     return np.maximum(np.diff(t_k), MIN_SEGMENT_S).tolist()
 
 
+def _tilt_deg(R):
+    """Angle between the tool axis (3rd column) and straight down."""
+    return math.degrees(math.acos(float(np.clip(-R[2, 2], -1.0, 1.0))))
+
+
+def _limit_tilt(base, orients, max_deg):
+    """Per waypoint, pull orients back toward base (both (rx_list, ry_list,
+    rz_list); base = the no-gaze orientations) just enough that the gripper
+    tilts at most max_deg (capped at 90) from straight down. Where base itself
+    tilts more than that, base is used."""
+    cap = float(np.clip(max_deg, 0.0, 90.0))
+    out = ([], [], [])
+    for b, g in zip(zip(*base), zip(*orients)):
+        Rb, Rg = rpy_to_matrix(*b), rpy_to_matrix(*g)
+        if _tilt_deg(Rg) <= cap + 1e-6:
+            R = Rg
+        elif _tilt_deg(Rb) >= cap:
+            R = Rb
+        else:
+            lo, hi = 0.0, 1.0                  # tilt(slerp(lo)) <= cap < tilt(slerp(hi))
+            for _ in range(20):
+                mid = 0.5 * (lo + hi)
+                if _tilt_deg(_gaze._slerp_matrix(Rb, Rg, mid)) <= cap:
+                    lo = mid
+                else:
+                    hi = mid
+            R = _gaze._slerp_matrix(Rb, Rg, lo)
+        for lst, v in zip(out, matrix_to_rpy(R)):
+            lst.append(float(v))
+    return out
+
+
 def _blend(base, gazed, s):
     """Per waypoint, slerp the no-gaze orientation `base` toward the gazing one
     by s (both are (rx_list, ry_list, rz_list)); s = 1 -> gazed exactly."""
@@ -177,6 +232,42 @@ def _blend(base, gazed, s):
 # MOTION
 # =============================================================================
 
+class _GripTimer(threading.Thread):
+    """One gripper command sent WHILE the arm moves (as HighH-LowR.py): started
+    right before a blocking move, it waits delay_s and sends from this thread
+    (ArmConnection serialises the writes, so it lands between setpoints).
+    finish() -- once the move is over -- sends at once if it hasn't yet."""
+
+    def __init__(self, arm, deg, delay_s, label):
+        super().__init__(daemon=True)
+        self.arm, self.deg, self.delay_s, self.label = arm, float(deg), float(delay_s), label
+        self._now = threading.Event()
+
+    def run(self):
+        self._now.wait(max(self.delay_s, 0.0))
+        print(f"[run]   gripper -> {self.deg:.0f} deg ({self.label}, while moving)")
+        for i in range(max(int(GRIP_MOVING_REPEATS), 1)):
+            if i:
+                threading.Event().wait(GRIP_MOVING_REPEAT_GAP_S)
+            self.arm.send_gripper(self.deg, speed=GRIP_MOVING_SPEED)
+
+    def finish(self):
+        self._now.set()
+        self.join()
+
+
+def _with_grip(arm, grip, move):
+    """move(), with grip = (deg, delay_s, label) sent during it (None = no grip)."""
+    if grip is None:
+        return move()
+    timer = _GripTimer(arm, *grip)
+    timer.start()
+    try:
+        return move()
+    finally:
+        timer.finish()
+
+
 class HumanRunner(_demo.DemoRunner):
     """Gazing arcs between the cube and the spot; rests looking at the Target Area."""
 
@@ -184,7 +275,39 @@ class HumanRunner(_demo.DemoRunner):
 
     def _seeds(self, q0, down, home_q):
         # the rest pose is not gripper-down, but a reach starts right from it
-        return [q0, home_q] if (down or self.at_rest) else [home_q]
+        if self.at_rest:
+            return [q0, home_q]
+        if not self.holding:                     # a pick goes to rest first (_lead_steps)
+            return [np.asarray(self.rest_pose(q0)[0], dtype=float), home_q]
+        return [q0, home_q] if down else [home_q]
+
+    def _lead_steps(self, t):
+        """A pick starts at rest and looks at the cube first."""
+        if t["holding"]:
+            return super()._lead_steps(t)
+        steps = [] if self.at_rest else [("rest", self._rest_step)]
+        cube = t["cube_center"]
+        return steps + [("look at cube", lambda: self._look_at(cube))]
+
+    # -- the gripper while moving ---------------------------------------------------
+
+    def _grip_reached(self, v, deg):
+        """reach_cube's open / closed check on a 0-100 reading."""
+        open_v = round(RC.GRIP_OPEN_DEG / config.MAX_GRIPPER_DEG * 100.0)
+        target_v = round(deg / config.MAX_GRIPPER_DEG * 100.0)
+        if deg >= RC.GRIP_OPEN_DEG:
+            return v >= open_v - RC.GRIP_MOVED_TOL
+        close_by = max(1.0, min(2.0 * RC.GRIP_MOVED_TOL, (open_v - target_v) / 2.0))
+        return v <= open_v - close_by
+
+    def _grip_check(self, deg):
+        """After a move that sent the gripper to deg: fine if the reading says
+        so, else the checked (re-sending) gripper command."""
+        v = self.arm.get_gripper_value()
+        if v is not None and self._grip_reached(v, deg):
+            return True
+        print(f"[run]   gripper not at {deg:.0f} deg yet (value {v}) -- checked command")
+        return self._grip(deg)
 
     # -- moves --------------------------------------------------------------------
 
@@ -194,9 +317,11 @@ class HumanRunner(_demo.DemoRunner):
             return True
         return self._move(x, y, z, orient, speed)
 
-    def _arc(self, end, gaze_target, level_orient, label):
+    def _arc(self, end, gaze_target, level_orient, label, max_tilt=None, grip=None):
         """One arc from the live pose to `end` (x, y, z), looking at gaze_target
-        (None = no gaze) and arriving at level_orient."""
+        (None = no gaze) and arriving at level_orient. max_tilt: the most the
+        gripper may tilt from straight down (None = no limit). grip = (deg,
+        delay_s, label): a gripper command sent during the move."""
         tip = self.arm.get_coords()
         start = tuple(float(v) for v in tip[:3])
         if math.dist(start, end) < 0.5:
@@ -219,7 +344,10 @@ class HumanRunner(_demo.DemoRunner):
                                                     GAZE_EASE_IN_S, GAZE_EASE_OUT_S)
             why = None
             for s in GAZE_STRENGTHS:
-                pl = plan(_blend(eased, gazed, s))
+                orients = _blend(eased, gazed, s)
+                if max_tilt is not None:
+                    orients = _limit_tilt(eased, orients, max_tilt)
+                pl = plan(orients)
                 if pl.ok and pl.peak_joint_dps > GAZE_MAX_JOINT_DPS:
                     why = f"a joint would need {pl.peak_joint_dps:.0f} deg/s"
                     pl = None
@@ -235,8 +363,9 @@ class HumanRunner(_demo.DemoRunner):
             pl = plan(eased)
         if not pl.ok:
             print(f"[run]   {label}: arc refused ({pl.error}) -- straight line instead")
-            return self._move(*end, level_orient, LINE_SPEED_CM_S)
-        ex = self.arm._execute(pl)
+            return _with_grip(self.arm, grip,
+                              lambda: self._move(*end, level_orient, LINE_SPEED_CM_S))
+        ex = _with_grip(self.arm, grip, lambda: self.arm._execute(pl))
         self.arm.last_plan, self.arm.last_execution = pl, ex
         if not ex.ok:
             self.arm.last_error = ex.error
@@ -252,24 +381,27 @@ class HumanRunner(_demo.DemoRunner):
             o, gx, gy = t["o"], t["gx"], t["gy"]
             grasp_z = t["grasp_z"]
             cube = t["cube_center"]
-            steps += [("open gripper", lambda: self._grip(RC.GRIP_OPEN_DEG)),
-                      ("reach", lambda: self._arc((gx, gy, grasp_z + FINAL_DESCENT_CM), cube, o,
-                                                  "reach")),
+            opening = (RC.GRIP_OPEN_DEG, GRIP_OPEN_DELAY_S, "open")
+            steps += [("reach", lambda: self._arc((gx, gy, grasp_z + FINAL_DESCENT_CM), cube, o,
+                                                  "reach", grip=opening)
+                       and self._grip_check(RC.GRIP_OPEN_DEG)),
                       ("descend", lambda: self._line(gx, gy, grasp_z, o)),
                       ("grasp", self._grasp),
                       ("lift", lambda: self._line(gx, gy, grasp_z + LIFT_CM, o))]
         look = t["dest_center"] if CARRY_GAZE_ENABLED else None
+        tilt = CARRY_MAX_TILT_DEG
         if t["dest"][0] == "hand":
             dpx, dpy, dpz = t["dpx"], t["dpy"], t["dpz"]
             # step names match RC.HandWatch.WATCH_STEPS
-            steps += [("drop pos", lambda: self._arc((dpx, dpy, dpz), look, po, "carry")),
+            steps += [("drop pos", lambda: self._arc((dpx, dpy, dpz), look, po, "carry",
+                                                         max_tilt=tilt)),
                       ("wait for hand", self._wait_hand),
                       ("release", self._release),
                       self._end_step()]
         else:
             px, py = t["px"], t["py"]
             steps += [("carry", lambda: self._arc((px, py, place_z + FINAL_DESCENT_CM), look, po,
-                                                  "carry")),
+                                                  "carry", max_tilt=tilt)),
                       ("lower", lambda: self._line(px, py, place_z, po)),
                       ("release", self._release),
                       ("retreat", lambda: self._line(px, py, place_z + RETREAT_CM, po)),
@@ -278,15 +410,18 @@ class HumanRunner(_demo.DemoRunner):
 
     # -- rest -----------------------------------------------------------------------
 
-    def rest_pose(self, q_now):
-        """(q, aim_error_deg | None): the look configuration, head on the Target
-        Area centre (HOME's wrist if no head pose can aim there)."""
+    def rest_pose(self, q_now, target=None):
+        """(q, aim_error_deg | None): the look configuration, head on `target`
+        (x, y, z; default the Target Area centre), HOME's wrist if no head pose
+        can aim there."""
         tz = self.table_z if self.table_z is not None else 0.0
         q = [float(v) for v in q_now]
         q[:3] = [float(v) for v in IDLE_CONFIG_J123_DEG]
         q[5] = float(RC.HOME[5])                 # J6 always the same at rest
-        ax, ay = _demo.area_center()
-        q_look, err = _gaze.wrist_look_angles(q, (ax, ay, tz + IDLE_LOOK_HEIGHT_CM),
+        if target is None:
+            ax, ay = _demo.area_center()
+            target = (ax, ay, tz + IDLE_LOOK_HEIGHT_CM)
+        q_look, err = _gaze.wrist_look_angles(q, tuple(float(v) for v in target),
                                               tz + IDLE_MIN_TIP_Z_CM)
         if q_look is not None:
             return q_look, err
@@ -299,9 +434,26 @@ class HumanRunner(_demo.DemoRunner):
         travel = float(np.max(np.abs(np.asarray(q) - np.asarray(q0))))
         print(f"[run]   rest: " + (f"looking at the Target Area (aim error {err:.1f} deg)"
                                    if err is not None else "no head pose aims at the area"))
-        if travel > 0.5 and not self.arm.move_joints(q, max(REST_MIN_S, travel / REST_SPEED_DPS)):
+        if travel <= 0.5:
+            return self._grip(GRIP_IDLE_DEG)
+        closing = (GRIP_IDLE_DEG, GRIP_CLOSE_DELAY_S, "close")
+        if not _with_grip(self.arm, closing,
+                          lambda: self.arm.move_joints(q, max(REST_MIN_S, travel / REST_SPEED_DPS))):
             return False
-        return self._grip(GRIP_IDLE_DEG)
+        return self._grip_check(GRIP_IDLE_DEG)
+
+    def _look_at(self, cube):
+        """From the rest pose, turn the head (wrist only) onto the cube."""
+        q0 = self.arm.get_angles()
+        q, err = self.rest_pose(q0, cube)
+        if err is None:
+            print("[run]   look: no head pose aims at the cube -- reaching without the look")
+            return True
+        travel = float(np.max(np.abs(np.asarray(q) - np.asarray(q0))))
+        print(f"[run]   look: at the cube (aim error {err:.1f} deg)")
+        if travel <= 0.5:
+            return True
+        return bool(self.arm.move_joints(q, max(LOOK_MIN_S, travel / LOOK_SPEED_DPS)))
 
 
 if __name__ == "__main__":

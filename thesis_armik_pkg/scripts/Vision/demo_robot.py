@@ -15,7 +15,10 @@ like LowH-HighR_v2.py moves:
     joint move HOME -- stops dead and continues at JERK_STREAM_STOPS random
     points (armik's stop-and-go stream stutter, config.STUTTER_TYPE = 0; each
     stop lasts config.JERK_SUBSTEP_DWELL_S). JERK_ENABLED = False -> clean;
-  * between turns, and while the participant is due, the arm waits at HOME.
+  * between turns, and while the participant is due, the arm waits at HOME --
+    except when the next turn is the robot's own (SKIP_HOME_BEFORE_ROBOT_TURN):
+    after putting a cube away it stays at the transition height and swings
+    straight across to above its next cube.
 
     python3 scripts/Vision/demo_robot.py --mock                  # real camera, simulated arm
     python3 scripts/Vision/demo_robot.py --port /dev/ttyTHS1     # real arm (take_arm.sh first)
@@ -48,6 +51,9 @@ JERK_STREAM_STOPS = 4            # stops per streamed move (each leg, the move H
 TRAVEL_SPEED_CM_S = 6.0          # up / across / down legs
 APPROACH_SPEED_CM_S = 3.0        # the last descent onto a cube / lowering it onto the table
 PHASE_DELAY_S = 0.3              # hold at each hand-over between a vertical and a horizontal leg
+SKIP_HOME_BEFORE_ROBOT_TURN = True   # True: when the next turn is the robot's, don't go HOME
+                                 # after this transfer -- the next pick swings across from here,
+                                 # at the transition (carry) height
 
 
 # =============================================================================
@@ -108,6 +114,12 @@ class RobotRunner(_demo.DemoRunner):
             return True
         return self._move(x, y, z, orient, speed)
 
+    def _end(self):
+        """The last step: HOME -- or none, when the robot's next pick follows."""
+        if SKIP_HOME_BEFORE_ROBOT_TURN and self.next_turn_is_robot:
+            return []
+        return [self._end_step()]
+
     def _steps(self, t):
         steps = []
         carry_z, place_z, po = t["carry_z"], t["place_z"], t["po"]
@@ -129,16 +141,14 @@ class RobotRunner(_demo.DemoRunner):
             steps += [("drop pos", lambda: self._across(dpx, dpy, dpz, po)
                        and self._down(dpx, dpy, dpz, po)),
                       ("wait for hand", self._wait_hand),
-                      ("release", self._release),
-                      self._end_step()]
+                      ("release", self._release)] + self._end()
         else:
             px, py = t["px"], t["py"]
             steps += [("above spot", lambda: self._across(px, py, carry_z, po)
                        and self._down(px, py, carry_z, po) and self._hold()),
                       ("lower", lambda: self._down(px, py, place_z, po, APPROACH_SPEED_CM_S)),
                       ("release", self._release),
-                      ("retreat", lambda: self._up(carry_z, po)),
-                      self._end_step()]
+                      ("retreat", lambda: self._up(carry_z, po))] + self._end()
         return steps
 
 

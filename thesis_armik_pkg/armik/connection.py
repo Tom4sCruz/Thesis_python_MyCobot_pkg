@@ -424,7 +424,8 @@ class ArmConnection:
     ):
         """
         Set the gripper opening: `value` 0-100 (0 closed, 100 open), `speed` an
-        integer 1-100. Thin wrapper over pymycobot's set_gripper_value under the
+        integer 1-100, `gripper_type` which gripper (default
+        config.GRIPPER_TYPE). Thin wrapper over pymycobot's set_gripper_value under the
         shared serial lock. The return value is whatever pymycobot returns
         (often None on real hardware) -- success is the absence of an exception,
         not a truthy result.
@@ -433,6 +434,8 @@ class ArmConnection:
         command is written WITHOUT waiting for a reply, so it can be fired
         while a stream is running without stalling it; returns None then.
         """
+        if gripper_type is None:
+            gripper_type = config.GRIPPER_TYPE      # which gripper is mounted
         value = int(value)
         if not 0 <= value <= 100:
             raise ValueError(f"gripper value must be 0-100, got {value}")
@@ -467,7 +470,10 @@ class ArmConnection:
     def get_gripper_value(self, gripper_type: int | None = None) -> int | None:
         """Current gripper opening 0-100 (0 closed, 100 open), or None if the
         device did not report one. Thin wrapper over pymycobot's
-        get_gripper_value under the shared serial lock."""
+        get_gripper_value under the shared serial lock. gripper_type defaults
+        to config.GRIPPER_TYPE."""
+        if gripper_type is None:
+            gripper_type = config.GRIPPER_TYPE
         with self._lock:
             self._settle()
             try:

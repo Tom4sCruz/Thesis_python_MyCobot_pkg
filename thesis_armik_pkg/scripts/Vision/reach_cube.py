@@ -178,8 +178,8 @@ TRAVEL_SPEED_CM_S = 6.0
 APPROACH_SPEED_CM_S = 3.0        # descend onto the cube / lower onto the target
 
 # -- gripper ---------------------------------------------------------------------
-GRIP_OPEN_DEG = 120.0            # as the profiles
-GRIP_CLOSED_DEG = 65.0           # closed ON a 3.5 cm cube
+GRIP_OPEN_DEG = 100.0            # as the profiles
+GRIP_CLOSED_DEG = 15.0           # closed ON a 3.5 cm cube
 GRIP_WAIT_S = 1.2                # time given to the gripper to open / close
 GRIP_SETTLE_S = 0.15             # quiet time after a move before the gripper command (the
                                  # firmware drops a command that lands right behind the stream)
@@ -739,6 +739,11 @@ class Runner:
         if not self._wait(GRIP_SETTLE_S):
             return False
         open_v = round(GRIP_OPEN_DEG / config.MAX_GRIPPER_DEG * 100.0)
+        target_v = round(deg / config.MAX_GRIPPER_DEG * 100.0)
+        # "closed" = at least 2 x GRIP_MOVED_TOL below open -- or, when open and
+        # the target are closer together than that (a small GRIP_OPEN_DEG),
+        # at least halfway from open to the target (a cube stops the jaws early)
+        close_by = max(1.0, min(2.0 * GRIP_MOVED_TOL, (open_v - target_v) / 2.0))
         v = None
         for attempt in range(1 + GRIP_RESEND_MAX):
             if not self.arm.send_gripper(deg):
@@ -750,7 +755,7 @@ class Runner:
             v = self.arm.get_gripper_value()
             if v is None:
                 print("[run]   gripper reading missed")
-            elif (v <= open_v - 2 * GRIP_MOVED_TOL) if closing else (v >= open_v - GRIP_MOVED_TOL):
+            elif (v <= open_v - close_by) if closing else (v >= open_v - GRIP_MOVED_TOL):
                 return True
             if attempt < GRIP_RESEND_MAX:
                 print(f"[run]   gripper didn't {'close' if closing else 'open'} "

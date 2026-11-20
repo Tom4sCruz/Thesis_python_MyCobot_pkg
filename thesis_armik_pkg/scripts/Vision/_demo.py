@@ -78,6 +78,7 @@ import cv2
 import numpy as np
 
 from armik import Arm, config
+from armik.connection import ArmConnection
 import _vision as V
 import _hands as H
 import reach_cube as RC
@@ -99,11 +100,13 @@ TARGET_AREA_CM = [(16.0, -6.0), (24.0, 6.0)]
 
 # Where the robot puts each participant's cube it took: one table-level (x, y)
 # robot-frame cm per HUMAN_CUBE_IDS entry, in the same order.
-HUMAN_PUTAWAY_CM = [(8.0, -20.0), (8.0, -14.0)]
+HUMAN_PUTAWAY_CM = [(8.0, -20.0), (8.0, -12.0)]
 
 PICKUP_DELAY_S = 2.0             # participant's cube steady in the area this long -> robot reaches
 
 # -- overlay ----------------------------------------------------------------------
+TIMING_LOG = True                # print, at the start of every move, where the time since the
+                                 # last move went (serial reads, planning, gripper, waits)
 SHOW_REACH_CIRCLE = True         # draw the straight-down reach circle (RC.MAX_DOWN_REACH_CM)
 
 # -- motion -----------------------------------------------------------------------
@@ -302,9 +305,96 @@ class DemoRunner(RC.Runner):
         self.at_rest = False             # the last run was a completed _rest()
         self.table_z = None              # table height of the last transfer / rest (cm)
         self.next_turn_is_robot = False  # set by Exchange: the turn after this transfer is the robot's
+        self.is_last_turn = False        # set by Exchange: this transfer is the exchange's last turn
+        self._planner = None             # a simulated arm to plan from a predicted pose (planner())
+        self._tl = None
+        if TIMING_LOG:
+            self._install_timing_log()
 
     def _move(self, x, y, z, orient, speed=TRAVEL_SPEED_CM_S):
         return super()._move(x, y, z, orient, speed)
+
+    # -- planning from a predicted pose -------------------------------------------
+
+    def planner(self):
+        """A simulated arm (same kinematics and limits) used only to plan."""
+        if self._planner is None:
+            self._planner = Arm(connection=ArmConnection("mock", mock=True, quiet_mock=True))
+            self._planner.set_single_joint(0)
+            if self._tl is not None:
+                self._wrap(self._planner, "_plan", "planning")
+                self._wrap(self._planner, "_plan_path", "planning")
+        return self._planner
+
+    def plan_from(self, q, fn):
+        """fn(planner arm) with the planner arm standing at joint pose q --
+        e.g. lambda a: a.plan_path(...) plans as if the real arm were at q."""
+        a = self.planner()
+        prev = [float(v) for v in a.conn.get_angles()]
+        a.conn.raw.set_angles_directly([float(v) for v in q])
+        try:
+            return fn(a)
+        finally:
+            a.conn.raw.set_angles_directly(prev)      # (a rehearsal may be using it)
+
+    # -- timing log (TIMING_LOG) --------------------------------------------------------
+
+    def _install_timing_log(self):
+        """Wrap the arm / connection / runner calls so that, at the start of
+        every move, the time since the last move is split into serial reads,
+        planning, gripper handling and waits (runner thread only; nested calls
+        count once, under the outermost)."""
+        self._tl = {"depth": 0, "last_end": None, "since": "", "acc": {}, "n_reads": 0}
+        self._wrap(self.conn, "get_angles", "reads")
+        self._wrap(self.conn, "get_gripper_value", "reads")
+        self._wrap(self.arm, "_plan", "planning")
+        self._wrap(self.arm, "_plan_path", "planning")
+        self._wrap(self, "_gripper", "gripper")
+        self._wrap(self, "_wait", "waits")
+        self._wrap(self, "_wait_hand", "waits")
+        self._wrap(self.arm, "_execute", "move")
+
+    def _wrap(self, obj, name, cat):
+        f = getattr(obj, name)
+        tl = self._tl
+
+        def wrapped(*a, **k):
+            if threading.current_thread() is not getattr(self, "_thread", None):
+                return f(*a, **k)
+            outer = tl["depth"] == 0
+            t0 = time.perf_counter()
+            if outer and cat == "move":
+                self._log_gap(t0)
+            tl["depth"] += 1
+            try:
+                return f(*a, **k)
+            finally:
+                tl["depth"] -= 1
+                t1 = time.perf_counter()
+                if outer:
+                    if cat == "move":
+                        tl["last_end"], tl["since"] = t1, "the last move"
+                        tl["acc"], tl["n_reads"] = {}, 0
+                    else:
+                        tl["acc"][cat] = tl["acc"].get(cat, 0.0) + (t1 - t0)
+                        if cat == "reads":
+                            tl["n_reads"] += 1
+
+        setattr(obj, name, wrapped)
+
+    def _log_gap(self, now):
+        tl = self._tl
+        if tl["last_end"] is None:
+            return
+        gap = now - tl["last_end"]
+        acc = tl["acc"]
+        parts = [f"reads {acc.get('reads', 0.0):.2f} ({tl['n_reads']})"]
+        for cat in ("planning", "gripper", "waits"):
+            if acc.get(cat, 0.0) > 0.0:
+                parts.append(f"{cat} {acc[cat]:.2f}")
+        other = gap - sum(acc.values())
+        parts.append(f"other {max(other, 0.0):.2f}")
+        print(f"[gap]   {gap:.2f} s since {tl['since']} (step '{self.step}'): " + ", ".join(parts))
 
     # -- planning -----------------------------------------------------------------
 
@@ -472,6 +562,9 @@ class DemoRunner(RC.Runner):
 
     def _start(self, steps):
         steps = [(n, _timed(n, fn)) for n, fn in steps]
+        if self._tl is not None:
+            self._tl.update(last_end=time.perf_counter(), since="the run started", acc={},
+                            n_reads=0, depth=0)
         self.at_rest = False
         self.conn.abort.clear()
         self.status, self.step = "RUNNING", ""
@@ -564,6 +657,7 @@ class Exchange:
     def _go(self, center, yaw, dest, scene):
         nxt = self.turns[self.i + 1] if self.i + 1 < len(self.turns) else None
         self.runner.next_turn_is_robot = nxt is not None and nxt[0] == "robot"
+        self.runner.is_last_turn = nxt is None
         err = self.runner.start_transfer(center, yaw, dest, scene.table_z)
         if err:
             self.phase = "FAILED"
